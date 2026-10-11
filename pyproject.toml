@@ -25,7 +25,7 @@ ding = "ding:main"
 codex-session = "ding:main"
 
 [project.urls]
-Repository = "https://github.com/917Dhj/codex-session"
+Repository = "https://github.com/917Dhj/dkitchen"
 
 [tool.setuptools]
 py-modules = ["ding"]

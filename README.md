@@ -11,7 +11,7 @@ This is an independent project, not an official OpenAI tool. The package is `dki
 Requires Python 3.10 or later and a POSIX system. Tested on Linux with `codex-cli 0.162.0`. The CLI uses Unix sockets and `fcntl` locks.
 
 ```bash
-pipx install git+https://github.com/917Dhj/codex-session.git
+pipx install git+https://github.com/917Dhj/dkitchen.git
 pipx ensurepath
 ```
 
@@ -21,7 +21,7 @@ Without pipx, install into a virtual environment and add its bin directory to yo
 
 ```bash
 python3 -m venv ~/.local/share/dkitchen
-~/.local/share/dkitchen/bin/python -m pip install git+https://github.com/917Dhj/codex-session.git
+~/.local/share/dkitchen/bin/python -m pip install git+https://github.com/917Dhj/dkitchen.git
 export PATH="$HOME/.local/share/dkitchen/bin:$PATH"
 ```
 
