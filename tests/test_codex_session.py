@@ -122,6 +122,16 @@ def test_request_deadline(monkeypatch):
         ding.read_reply(ding.initialize(Connection([])), THREAD_ID)
 
 
+def test_rpc_deadline_restarts_for_each_call(monkeypatch):
+    elapsed = [0]
+    monkeypatch.setattr(ding.time, "monotonic", lambda: elapsed[0])
+    call = ding.initialize(Connection([{"result": {}}, {"result": {}}, {"result": {}}]))
+    elapsed[0] = 59
+    assert call("thread/read", {"threadId": THREAD_ID}) == {}
+    elapsed[0] = 118
+    assert call("thread/read", {"threadId": OTHER_ID}) == {}
+
+
 def test_socket_discovery(tmp_path):
     (tmp_path / "ordinary-file").touch()
     with pytest.raises(ValueError, match="Found 0"):
@@ -535,6 +545,28 @@ def test_issue_map_body_comments_and_optional_failure(monkeypatch):
     assert ding.issue_map() == {}
 
 
+def test_gh_allows_lookup_over_ten_seconds(monkeypatch):
+    def delayed_lookup(argv, *, capture_output, text, timeout):
+        if timeout < 12:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return subprocess.CompletedProcess(argv, 0, '{"nameWithOwner": "example/project"}')
+
+    monkeypatch.setattr(ding.subprocess, "run", delayed_lookup)
+    assert ding.github_repository() == "example/project"
+
+
+def test_issue_lookup_failure_is_visible(monkeypatch, capsys):
+    def failed_lookup():
+        raise subprocess.TimeoutExpired(["gh", "repo", "view"], 60)
+
+    monkeypatch.setattr(ding, "github_repository", failed_lookup)
+    assert ding.issue_map() == {}
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "issue" in captured.err.lower()
+    assert "fail" in captured.err.lower()
+
+
 @pytest.mark.parametrize("reply, expected", [
     ("状态: 完成\n在等: 无\n\nDetails", "状态: 完成\n在等: 无"),
     ("Summary\r\n \t\r\nDetails", "Summary"),
@@ -587,6 +619,30 @@ def test_board_malformed_reply_fails_without_partial_output(monkeypatch, capsys)
     captured = capsys.readouterr()
     assert not captured.out
     assert "Malformed App Server final reply" in captured.err
+
+
+def test_board_default_excludes_unloaded_threads(monkeypatch, tmp_path, capsys):
+    values = [thread(cwd=str(tmp_path)),
+              thread(OTHER_ID, "Unloaded", str(tmp_path), "notLoaded")]
+
+    def call(method, params):
+        if method == "thread/loaded/list":
+            return {"data": [THREAD_ID]}
+        if method == "thread/read":
+            return {"thread": values[0]}
+        if method == "thread/list":
+            return {"data": values}
+        assert method == "thread/turns/list"
+        return {"data": [{"items": [final("Ready")]}]}
+
+    monkeypatch.setattr(ding, "repository_roots", lambda: [tmp_path])
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--socket", "/test.sock"]) == 0
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 2
+    assert "Ready" in output
+    assert "Unloaded" not in output
 
 
 def test_repository_roots_include_linked_worktrees(monkeypatch, tmp_path):
