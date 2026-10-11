@@ -475,20 +475,20 @@ def test_thread_list_rejects_repeated_cursor():
         ding.list_threads(lambda *args: {"data": [], "nextCursor": "same"})
 
 
-def test_uuid_and_issue_targets_are_local(monkeypatch):
+def test_uuid_and_unambiguous_issue_targets_are_local(monkeypatch):
     monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
     monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not discover socket"))
     issues = []
 
-    def issue_session(number):
-        issues.append(number)
+    def issue_session(number, path=None):
+        issues.append((number, path))
         return OTHER_ID
 
     monkeypatch.setattr(ding, "issue_session", issue_session)
     assert ding.resolve_target(THREAD_ID.upper(), None, None) == THREAD_ID
-    assert ding.resolve_target("#42", None, None) == OTHER_ID
-    assert ding.resolve_target(None, 7, None) == OTHER_ID
-    assert issues == [42, 7]
+    assert ding.resolve_target("#42", None, "/test.sock") == OTHER_ID
+    assert ding.resolve_target(None, 7, "/other.sock") == OTHER_ID
+    assert issues == [(42, "/test.sock"), (7, "/other.sock")]
     with pytest.raises(ValueError, match="positive issue number"):
         ding.resolve_target("#zero", None, None)
 
@@ -512,7 +512,18 @@ def test_exact_name_target_and_candidates(monkeypatch, target, names, expected):
         assert OTHER_ID in str(exc.value)
 
 
-def test_issue_last_reference_across_all_comment_pages(monkeypatch):
+def test_issue_owner_precedes_later_session_comment(monkeypatch):
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {
+        "body": f"Codex owner: {THREAD_ID}\nCodex session: {THREAD_ID}",
+    })
+    monkeypatch.setattr(ding, "gh_records", lambda resource: [
+        {"body": f"Codex session: {OTHER_ID}"},
+    ])
+    assert ding.issue_session(42) == THREAD_ID
+
+
+def test_issue_latest_owner_across_all_comment_pages(monkeypatch):
     calls = []
 
     def gh(arguments):
@@ -520,16 +531,196 @@ def test_issue_last_reference_across_all_comment_pages(monkeypatch):
         if arguments[0] == "repo":
             return {"nameWithOwner": "example/project"}
         if "--paginate" not in arguments:
-            return {"body": f"Codex session: {THREAD_ID}\n"}
-        return [[{"body": "No session here"}], [{"body": f"Codex session: {OTHER_ID}\r\n"}]]
+            return {"body": f"Codex owner: {OTHER_ID}\nCodex owner: {THREAD_ID}\n"}
+        return [[{"body": "Codex owner: invalid"}], [
+            {"body": f"Codex owner: `{OTHER_ID}`\r\nCodex session: {THREAD_ID}\r\n"},
+            {"body": f"Codex session: {THREAD_ID}"},
+        ]]
 
     monkeypatch.setattr(ding, "gh_json", gh)
     assert ding.issue_session(42) == OTHER_ID
     assert "--slurp" in calls[-1]
     assert calls[-1][-1].endswith("/42/comments?per_page=100")
-    monkeypatch.setattr(ding, "gh_records", lambda *a: [{"body": "Codex session: invalid"}])
-    with pytest.raises(ValueError, match="last Codex session line"):
+    monkeypatch.setattr(ding, "gh_records", lambda *a: [{"body": "Codex owner: invalid"}])
+    with pytest.raises(ValueError, match="last Codex owner line"):
         ding.issue_session(42)
+
+
+@pytest.fixture
+def issue_data(monkeypatch):
+    issue = {"body": f"Codex session: {THREAD_ID}", "created_at": "2026-01-01T00:00:00Z",
+             "html_url": "https://github.com/example/project/issues/42"}
+    comments = []
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: issue)
+    monkeypatch.setattr(ding, "gh_records", lambda resource: comments)
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("unexpected App Server lookup"))
+    return issue, comments
+
+
+@pytest.mark.parametrize("body, comments, expected", [
+    (f"Codex owner: {OTHER_ID}", [], OTHER_ID),
+    (f"Codex session: invalid\nCodex owner: {THREAD_ID}",
+     [f"Codex session: {OTHER_ID}", "Codex session: invalid"], THREAD_ID),
+    (f"Codex owner: invalid\nCodex owner: {THREAD_ID}", [], THREAD_ID),
+    (f"Codex owner: {OTHER_ID}", [f"Codex owner: {THREAD_ID}",
+     f"Codex owner: {OTHER_ID}\nCodex owner: {THREAD_ID}", f"Codex session: {OTHER_ID}"], THREAD_ID),
+    ("Codex owner: `01234567-89AB-4CDE-8F01-23456789ABCD`", [],
+     "01234567-89ab-4cde-8f01-23456789abcd"),
+])
+def test_issue_owner_selection(issue_data, body, comments, expected):
+    issue, records = issue_data
+    issue["body"] = body
+    records.extend({"body": text} for text in comments)
+    assert ding.issue_session(42) == expected
+
+
+@pytest.mark.parametrize("value", ["", "invalid"])
+def test_latest_invalid_owner_refuses_without_session_fallback(issue_data, value):
+    issue, comments = issue_data
+    issue["body"] += f"\nCodex owner: {THREAD_ID}"
+    comments.append({"body": f"Codex owner: {value}\nCodex session: {OTHER_ID}"})
+    with pytest.raises(ValueError, match="last Codex owner line"):
+        ding.issue_session(42)
+
+
+@pytest.mark.parametrize("spellings", [
+    ["01234567-89ab-4cde-8f01-23456789abcd"],
+    ["01234567-89ab-4cde-8f01-23456789abcd", "01234567-89AB-4CDE-8F01-23456789ABCD",
+     "{01234567-89ab-4cde-8f01-23456789abcd}", "0123456789ab4cde8f0123456789abcd"],
+])
+def test_issue_unique_session_normalizes_repeated_mentions(issue_data, spellings):
+    issue, comments = issue_data
+    issue["body"] = f"Codex session: {spellings[0]}"
+    comments.extend({"body": f"Codex session: `{value}`"} for value in spellings)
+    assert ding.issue_session(42) == "01234567-89ab-4cde-8f01-23456789abcd"
+
+
+@pytest.mark.parametrize("body, comments, expected", [
+    ("No references", [], "No Codex session line"),
+    (f"Codex session: {THREAD_ID}", ["Codex session: invalid"], "not a valid UUID"),
+    ("Codex session: invalid", [f"Codex session: {THREAD_ID}"], "not a valid UUID"),
+    ("Codex session:", [], "not a valid UUID"),
+])
+def test_issue_without_owner_refuses_missing_or_malformed_references(issue_data, body, comments, expected):
+    issue, records = issue_data
+    issue["body"] = body
+    records.extend({"body": text} for text in comments)
+    with pytest.raises(ValueError, match=expected):
+        ding.issue_session(42)
+
+
+def test_issue_ambiguity_details_count_comments_and_use_created_at(issue_data, monkeypatch):
+    issue, comments = issue_data
+    issue["body"] += f"\nCodex session: {OTHER_ID}"
+    comments.extend([
+        {"body": f"Codex session: {OTHER_ID}\nCodex session: {{{OTHER_ID}}}",
+         "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-03-01T00:00:00Z",
+         "html_url": issue["html_url"] + "#issuecomment-1"},
+        {"body": f"Codex session: {OTHER_ID}", "created_at": "2026-01-03T00:00:00Z",
+         "updated_at": "2026-01-03T00:00:00Z", "html_url": issue["html_url"] + "#issuecomment-2"},
+    ])
+    name = 'Review\n"candidate"\t'
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        assert method == "thread/list"
+        return {"data": [thread(name=name), thread(OTHER_ID, "Other", status="notLoaded")]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    with pytest.raises(ValueError) as exc:
+        ding.issue_session(42, "/test.sock")
+    message = str(exc.value)
+    assert "2 different Codex sessions" in message
+    assert f"{THREAD_ID}\t{ding.display_cell(name)}\tidle\t0\t2026-01-01T00:00:00Z\t{issue['html_url']}" in message
+    assert f"{OTHER_ID}\tOther\tnotLoaded\t2\t2026-01-03T00:00:00Z\t{issue['html_url']}#issuecomment-2" in message
+    assert "2026-03-01" not in message
+    assert "session UUID or exact session name" in message
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["socket", "list_and_reads", "missing_one"])
+def test_issue_ambiguity_survives_unavailable_metadata(issue_data, monkeypatch, failure):
+    issue, comments = issue_data
+    comments.append({"body": f"Codex session: {OTHER_ID}", "created_at": "2026-01-02T00:00:00Z",
+                     "html_url": issue["html_url"] + "#issuecomment-1"})
+
+    def call(method, params):
+        if method == "thread/list" and failure == "missing_one":
+            return {"data": [thread()]}
+        raise ValueError("candidate metadata unavailable")
+
+    def unavailable(path):
+        raise OSError("socket unavailable")
+
+    monkeypatch.setattr(ding, "app_server", unavailable if failure == "socket"
+                        else lambda path: server_calls(call))
+    with pytest.raises(ValueError, match="2 different Codex sessions") as exc:
+        ding.issue_session(42, "/test.sock")
+    message = str(exc.value)
+    assert f"{OTHER_ID}\tunknown\tunknown\t1\t2026-01-02T00:00:00Z\t{issue['html_url']}#issuecomment-1" in message
+    assert THREAD_ID in message
+    assert "session UUID or exact session name" in message
+
+
+@pytest.mark.parametrize("returned_id, expected_name, expected_status", [
+    (OTHER_ID, "Archived", "notLoaded"),
+    (THREAD_ID, "unknown", "unknown"),
+    ("invalid", "unknown", "unknown"),
+])
+def test_issue_ambiguity_reads_metadata_missing_from_list(
+        issue_data, monkeypatch, returned_id, expected_name, expected_status):
+    issue, comments = issue_data
+    comments.append({"body": f"Codex session: {OTHER_ID}"})
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/list":
+            return {"data": [thread()]}
+        assert (method, params) == ("thread/read", {"threadId": OTHER_ID, "includeTurns": False})
+        return {"thread": thread(returned_id, "Archived", status="notLoaded")}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    with pytest.raises(ValueError) as exc:
+        ding.issue_session(42, "/test.sock")
+    assert f"{OTHER_ID}\t{expected_name}\t{expected_status}\t1\tunknown\tunknown" in str(exc.value)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("action", ["send", "run", "read", "status"])
+@pytest.mark.parametrize("target", [["#42"], ["--issue", "42"]])
+def test_ambiguous_issue_refuses_every_command_before_execution(
+        issue_data, monkeypatch, tmp_path, capsys, action, target):
+    issue, comments = issue_data
+    comments.append({"body": f"Codex session: {OTHER_ID}"})
+    paths = []
+
+    def server(path):
+        paths.append(path)
+        return server_calls(lambda method, params: {"data": [thread(), thread(OTHER_ID, "Other", status="active")]})
+
+    monkeypatch.setattr(ding, "app_server", server)
+    for function in ("queue_message", "task_exit_code", "run_task", "query"):
+        monkeypatch.setattr(ding, function, lambda *a, **kw: pytest.fail("ambiguous target must not execute"))
+    argv = [action, *target, "--socket", "/explicit.sock"]
+    record = tmp_path / "exit.jsonl"
+    if action in {"send", "run"}:
+        argv.extend(["--message", "must not be delivered"])
+    if action == "run":
+        argv.extend(["--record", str(record), "--", "must-not-start"])
+    assert ding.main(argv) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "2 different Codex sessions" in captured.err
+    assert THREAD_ID in captured.err and OTHER_ID in captured.err
+    assert paths == ["/explicit.sock"]
+    assert not record.exists()
+    if action == "send":
+        event, = records(tmp_path / "state/ding/sent.jsonl")
+        assert event["thread_id"] is None
+        assert event["outcome"] == "queue_failed"
 
 
 def test_issue_map_body_comments_and_optional_failure(monkeypatch):
@@ -547,6 +738,64 @@ def test_issue_map_body_comments_and_optional_failure(monkeypatch):
     assert ding.issue_map() == {THREAD_ID: {1}, OTHER_ID: {2}}
     monkeypatch.setattr(ding, "github_repository", lambda: (_ for _ in ()).throw(FileNotFoundError("gh")))
     assert ding.issue_map() == {}
+
+
+def test_issue_map_attributes_claimed_issues_only_to_latest_owner(monkeypatch):
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    issues = [
+        {"number": 1, "body": f"Codex owner: {THREAD_ID}\nCodex session: {OTHER_ID}"},
+        {"number": 2, "body": f"Codex session: {OTHER_ID}\nCodex session: {THREAD_ID}"},
+        {"number": 3, "body": "Codex owner: invalid"},
+        {"number": 4, "body": f"Codex owner: {THREAD_ID}", "pull_request": {}},
+    ]
+    comments = [
+        {"issue_url": "https://api.github.com/repos/example/project/issues/1",
+         "body": f"Codex session: {OTHER_ID}"},
+        {"issue_url": "https://api.github.com/repos/example/project/issues/3",
+         "body": f"Codex owner: {THREAD_ID}\nCodex owner: {{{OTHER_ID}}}"},
+        {"issue_url": "https://api.github.com/repos/example/project/issues/3",
+         "body": f"Codex session: {THREAD_ID}"},
+    ]
+    monkeypatch.setattr(ding, "gh_records", lambda resource:
+                        comments if "issues/comments" in resource else issues)
+    assert ding.issue_map() == {THREAD_ID: {1, 2}, OTHER_ID: {2, 3}}
+
+
+@pytest.mark.parametrize("owner", ["", "invalid"])
+def test_issue_map_omits_invalid_latest_owner_without_losing_other_issues(monkeypatch, capsys, owner):
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    issues = [
+        {"number": 1, "body": f"Codex owner: {THREAD_ID}"},
+        {"number": 2, "body": f"Codex owner: {OTHER_ID}\nCodex session: {OTHER_ID}"},
+        {"number": 3, "body": f"Codex session: {OTHER_ID}"},
+    ]
+    comments = [{"issue_url": "https://api.github.com/repos/example/project/issues/2",
+                 "body": f"Codex owner: {owner}\nCodex session: {THREAD_ID}"}]
+    monkeypatch.setattr(ding, "gh_records", lambda resource:
+                        comments if "issues/comments" in resource else issues)
+    assert ding.issue_map() == {THREAD_ID: {1}, OTHER_ID: {3}}
+    warning = capsys.readouterr().err
+    assert len(warning.splitlines()) == 1
+    assert "issue #2" in warning and "invalid Codex owner" in warning
+
+
+def test_board_issue_column_uses_owner_attribution(monkeypatch, capsys):
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    monkeypatch.setattr(ding, "gh_records", lambda resource: [] if "issues/comments" in resource else [
+        {"number": 42, "body": f"Codex owner: {THREAD_ID}\nCodex session: {OTHER_ID}"},
+    ])
+
+    def call(method, params):
+        if method == "thread/list":
+            return {"data": [thread(), thread(OTHER_ID, "Other")]}
+        assert method == "thread/turns/list"
+        return {"data": [{"items": [final("Ready")]}]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert [row.split("\t")[3] for row in captured.out.splitlines()[1:]] == ["#42", ""]
 
 
 def test_gh_allows_lookup_over_ten_seconds(monkeypatch):
