@@ -298,29 +298,84 @@ def github_repository() -> str:
     return repo
 
 
-def session_references(body: str | None) -> list[str]:
+def session_references(body: str | None, label: str = "session") -> list[str]:
     if body is None:
         return []
     if not isinstance(body, str):
         raise ValueError("Malformed gh issue body.")
-    return [value.strip().strip("`") for value in
-            re.findall(r"(?m)^[ \t]*Codex session:[ \t]*([^\r\n]*)$", body.replace("\r\n", "\n"))]
+    return [value.strip().strip("`") for value in re.findall(
+        rf"(?m)^[ \t]*Codex {re.escape(label)}:[ \t]*([^\r\n]*)$", body.replace("\r\n", "\n"))]
 
 
-def issue_session(number: int) -> str:
+def issue_references(issue: dict, comments: list[dict]) -> tuple[str | None, dict, bool]:
+    owner, candidates, malformed = None, {}, False
+    for index, record in enumerate([issue, *comments]):
+        owners = session_references(record.get("body"), "owner")
+        if owners:
+            owner = owners[-1]
+        references = set()
+        for value in session_references(record.get("body")):
+            try:
+                references.add(str(UUID(value)))
+            except ValueError:
+                malformed = True
+        for thread_id in references:
+            candidate = candidates.setdefault(thread_id, {"comments": 0})
+            if index:
+                candidate["comments"] += 1
+            candidate["timestamp"] = record.get("created_at")
+            candidate["url"] = record.get("html_url")
+    return owner, candidates, malformed
+
+
+def issue_session(number: int, path: str | None = None) -> str:
     repo = github_repository()
     issue = gh_json(["api", f"repos/{repo}/issues/{number}"])
     if not isinstance(issue, dict):
         raise ValueError("Malformed gh issue.")
-    references = session_references(issue.get("body"))
-    for comment in gh_records(f"repos/{repo}/issues/{number}/comments?per_page=100"):
-        references.extend(session_references(comment.get("body")))
-    if not references:
+    owner, candidates, malformed = issue_references(
+        issue, gh_records(f"repos/{repo}/issues/{number}/comments?per_page=100"))
+    if owner is not None:
+        try:
+            return str(UUID(owner))
+        except ValueError as exc:
+            raise ValueError(f"The last Codex owner line in issue #{number} is not a valid UUID.") from exc
+    if malformed:
+        raise ValueError(f"A Codex session line in issue #{number} is not a valid UUID.")
+    if not candidates:
         raise ValueError(f"No Codex session line in issue #{number}. Candidates: none.")
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    metadata = {}
     try:
-        return str(UUID(references[-1]))
-    except ValueError as exc:
-        raise ValueError(f"The last Codex session line in issue #{number} is not a valid UUID.") from exc
+        with app_server(socket_path(path)) as call:
+            try:
+                metadata = {thread["id"]: thread for thread in list_threads(call)}
+            except (OSError, ValueError):
+                pass
+            for thread_id in candidates:
+                if thread_id in metadata:
+                    continue
+                try:
+                    result = call("thread/read", {"threadId": thread_id, "includeTurns": False})
+                    thread = thread_metadata(result.get("thread"))
+                    if thread["id"] == thread_id:
+                        metadata[thread_id] = thread
+                except (OSError, ValueError):
+                    pass
+    except (OSError, ValueError):
+        pass
+    rows = ["  ID\tNAME\tSTATUS\tCOMMENTS\tLAST_COMMENT\tLINK"]
+    for thread_id, candidate in sorted(candidates.items()):
+        thread = metadata.get(thread_id, {})
+        cells = [thread_id, thread.get("name", "unknown"),
+                 thread.get("status", {}).get("type", "unknown"), str(candidate["comments"]),
+                 candidate["timestamp"], candidate["url"]]
+        rows.append("  " + "\t".join(display_cell(cell) if isinstance(cell, str) and cell
+                                  else "unknown" for cell in cells))
+    raise ValueError(
+        f"Issue #{number} references {len(candidates)} different Codex sessions without a Codex owner line. "
+        "Candidates:\n" + "\n".join(rows) + "\nSpecify a session UUID or exact session name instead.")
 
 
 def issue_map() -> dict[str, set[int]]:
@@ -328,21 +383,23 @@ def issue_map() -> dict[str, set[int]]:
         repo = github_repository()
         issues = gh_records(f"repos/{repo}/issues?state=all&per_page=100")
         comments = gh_records(f"repos/{repo}/issues/comments?per_page=100")
-        bodies = {issue["number"]: [issue.get("body")] for issue in issues
-                  if "pull_request" not in issue}
+        records = {issue["number"]: (issue, []) for issue in issues if "pull_request" not in issue}
         for comment in comments:
             number = int(comment["issue_url"].rsplit("/", 1)[-1])
-            if number in bodies:
-                bodies[number].append(comment.get("body"))
+            if number in records:
+                records[number][1].append(comment)
         mapping = {}
-        for number, texts in bodies.items():
-            for body in texts:
-                for reference in session_references(body):
-                    try:
-                        thread_id = str(UUID(reference))
-                    except ValueError:
-                        continue
-                    mapping.setdefault(thread_id, set()).add(number)
+        for number, (issue, comments) in records.items():
+            owner, candidates, _ = issue_references(issue, comments)
+            if owner is not None:
+                try:
+                    candidates = [str(UUID(owner))]
+                except ValueError:
+                    print(f"ding: issue #{number} has an invalid Codex owner; omitted from board.",
+                          file=sys.stderr)
+                    continue
+            for thread_id in candidates:
+                mapping.setdefault(thread_id, set()).add(number)
         return mapping
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired) as exc:
         print(f"ding: issue lookup failed: {' '.join(str(exc).split())}", file=sys.stderr)
@@ -355,7 +412,7 @@ def display_cell(text: str) -> str:
 
 def resolve_target(target: str | None, issue: int | None, path: str | None) -> str:
     if issue is not None:
-        return issue_session(issue)
+        return issue_session(issue, path)
     try:
         return str(UUID(target))
     except (ValueError, TypeError, AttributeError):
@@ -363,7 +420,7 @@ def resolve_target(target: str | None, issue: int | None, path: str | None) -> s
     if target and target.startswith("#"):
         if not re.fullmatch(r"#[1-9][0-9]*", target):
             raise ValueError("Issue target must be # followed by a positive issue number.")
-        return issue_session(int(target[1:]))
+        return issue_session(int(target[1:]), path)
     with app_server(socket_path(path)) as call:
         threads = list_threads(call)
     matches = [thread for thread in threads if display_cell(thread["name"]) == target]
@@ -532,7 +589,7 @@ def main(argv=None) -> int:
         sub = commands.add_parser(action)
         target = sub.add_mutually_exclusive_group(required=True)
         target.add_argument("thread_id", nargs="?", help="Session UUID, exact name, or quoted '#NUMBER'")
-        target.add_argument("--issue", type=int, help="Issue whose last Codex session line identifies the target")
+        target.add_argument("--issue", type=int, help="Issue's latest Codex owner, or its unique Codex session")
         sub.add_argument("--socket", help="Existing local App Server Unix socket path")
         if action == "read":
             sub.add_argument("--head", action="store_true", help="Print only the first paragraph of the final reply")
