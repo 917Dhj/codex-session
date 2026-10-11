@@ -5,6 +5,7 @@ import stat
 import socket
 import subprocess
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,12 +44,13 @@ class Connection:
         self.replies = iter(replies)
         self.requests = []
         self.closed = False
+        self.cont_frame = SimpleNamespace(skip_utf8_validation=False)
 
     def close(self):
         self.closed = True
 
     def settimeout(self, timeout):
-        assert 0 < timeout <= 15
+        assert 0 < timeout <= 60
 
     def send(self, message):
         self.requests.append(json.loads(message))
@@ -73,7 +75,6 @@ def test_latest_final_and_read_only_protocol():
     ws = Connection([
         {"result": {}},
         {"result": {"data": [
-            {"items": [{"type": "agentMessage", "phase": "commentary", "text": "busy"}]},
             {"items": [final("older"), final("answer"), {"type": "userMessage"},
                        {"type": "commandExecution"}]},
         ], "nextCursor": "unused"}},
@@ -84,14 +85,17 @@ def test_latest_final_and_read_only_protocol():
     ]
     assert ws.requests[0]["params"]["capabilities"] == {"experimentalApi": True}
     assert ws.requests[2]["params"] == {
-        "threadId": THREAD_ID, "limit": 10, "sortDirection": "desc", "itemsView": "full",
+        "threadId": THREAD_ID, "limit": 1, "sortDirection": "desc", "itemsView": "full",
     }
 
 
 def test_pagination():
-    ws = Connection([{"result": {}}, page([], "next"), page([final("answer")])])
+    ws = Connection([{"result": {}}, page([], "next"),
+                     page([{"type": "agentMessage", "phase": "commentary", "text": "busy"}], "older"),
+                     page([final("answer")])])
     assert ding.read_reply(ding.initialize(ws), THREAD_ID) == "answer"
-    assert ws.requests[-1]["params"]["cursor"] == "next"
+    assert ws.requests[-1]["params"]["cursor"] == "older"
+    assert all(request["params"]["limit"] == 1 for request in ws.requests[2:])
 
 
 @pytest.mark.parametrize("reply, message", [
@@ -591,7 +595,12 @@ def test_board_repo_worktree_scope_and_final_only(monkeypatch, tmp_path, capsys,
               thread(OTHER_ID, "Other", str(worktree / "src")),
               thread(third_id, "Outside", str(tmp_path / "repo-other"))]
     ws = Connection([
-        {"result": {}}, {"result": {"data": values}},
+        {"result": {}},
+        *([] if all_threads else [
+            {"result": {"data": [value["id"] for value in values]}},
+            *[{"result": {"thread": value}} for value in values],
+        ]),
+        {"result": {"data": values}},
         page([final("状态: 完成\n在等: 无\n\nLong details")]), page([]),
         *([page([final("Outside reply")])] if all_threads else []),
     ])
@@ -608,7 +617,8 @@ def test_board_repo_worktree_scope_and_final_only(monkeypatch, tmp_path, capsys,
     assert "Long details" not in output
     assert ("Outside" in output) == all_threads
     assert [request["method"] for request in ws.requests].count("initialize") == 1
-    assert all(request["method"] in {"initialize", "initialized", "thread/list", "thread/turns/list"}
+    assert all(request["method"] in {"initialize", "initialized", "thread/list", "thread/turns/list",
+                                                "thread/loaded/list", "thread/read"}
                for request in ws.requests)
 
 
@@ -794,3 +804,274 @@ def test_message_inputs_are_exclusive(tmp_path):
     with pytest.raises(SystemExit) as exc:
         ding.main(["send", THREAD_ID, "--message", "text", "--message-file", str(tmp_path / "file")])
     assert exc.value.code == 2
+
+
+def test_rpc_waits_over_fifteen_seconds_but_notifications_do_not_reset_deadline(monkeypatch):
+    elapsed = [0]
+    monkeypatch.setattr(ding.time, "monotonic", lambda: elapsed[0])
+
+    class DelayedConnection(Connection):
+        def settimeout(self, timeout):
+            self.timeout = timeout
+            super().settimeout(timeout)
+
+        def recv(self):
+            delay = 20
+            if self.timeout < delay:
+                raise TimeoutError("Timed out")
+            elapsed[0] += delay
+            return super().recv()
+
+    ws = DelayedConnection([{"result": {}}, {"result": {}},
+                            '{"method": "notice"}', '{"method": "notice"}',
+                            '{"method": "notice"}'])
+    call = ding.initialize(ws)
+    assert call("thread/read", {}) == {}
+    with pytest.raises(TimeoutError, match="Timed out"):
+        call("thread/read", {})
+    assert elapsed[0] == 100
+
+
+def test_thread_list_keeps_filters_on_every_page():
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        return {"data": [], "nextCursor": "next" if len(calls) == 1 else None}
+
+    assert ding.list_threads(call, cwd=["/repo/src"]) == []
+    assert len(calls) == 2
+    for method, params in calls:
+        assert method == "thread/list"
+        assert params["cwd"] == ["/repo/src"]
+        assert params["archived"] is False
+    assert calls[1][1]["cursor"] == "next"
+
+
+def test_board_loaded_pagination_raw_paths_and_current_rows(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    raw_cwd = str(alias / "src")
+    calls = []
+    new_id = "00000000-0000-4000-8000-000000000003"
+    values = [thread(new_id, "Newly loaded", raw_cwd, "active"),
+              thread(OTHER_ID, "Unloaded", raw_cwd, "notLoaded"),
+              thread(THREAD_ID, "Failed", raw_cwd, "systemError"),
+              thread("00000000-0000-4000-8000-000000000004", "Outside", str(tmp_path))]
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/loaded/list":
+            if "cursor" not in params:
+                return {"data": [THREAD_ID], "nextCursor": "next"}
+            assert params["cursor"] == "next"
+            return {"data": [THREAD_ID, OTHER_ID]}
+        if method == "thread/read":
+            assert params["includeTurns"] is False
+            return {"thread": thread(params["threadId"], cwd=raw_cwd, status="systemError")}
+        assert method == "thread/list"
+        assert params["cwd"] == [raw_cwd]
+        assert params["archived"] is False
+        return {"data": values}
+
+    assert ding.board_threads(call, [repo]) == [ding.thread_metadata(values[0])]
+    assert [params["threadId"] for method, params in calls if method == "thread/read"] == [
+        THREAD_ID, OTHER_ID,
+    ]
+
+
+@pytest.mark.parametrize("loaded_page", [
+    {}, {"data": None}, {"data": [None]}, {"data": [12]}, {"data": ["invalid"]},
+    {"data": [], "nextCursor": ""}, {"data": [], "nextCursor": 1},
+    {"data": [], "nextCursor": "repeated"},
+])
+def test_board_rejects_bad_loaded_pages(loaded_page, tmp_path):
+    with pytest.raises(ValueError, match="Malformed App Server"):
+        ding.board_threads(lambda *args: loaded_page, [tmp_path])
+
+
+@pytest.mark.parametrize("metadata", [
+    None, thread(OTHER_ID), thread(name=5), thread(cwd="relative"), thread(status=None),
+])
+def test_board_rejects_bad_loaded_metadata(metadata, tmp_path):
+    def call(method, params):
+        if method == "thread/loaded/list":
+            return {"data": [THREAD_ID]}
+        assert method == "thread/read"
+        return {"thread": metadata}
+
+    with pytest.raises(ValueError, match="Malformed App Server|different thread ID"):
+        ding.board_threads(call, [tmp_path])
+
+
+@pytest.mark.parametrize("case", ["roots", "loaded", "outside"])
+def test_empty_board_never_falls_back_to_global_list(case, tmp_path):
+    def call(method, params):
+        if method == "thread/loaded/list":
+            return {"data": [] if case == "loaded" else [THREAD_ID]}
+        assert method == "thread/read"
+        return {"thread": thread(cwd="/outside")}
+
+    assert ding.board_threads(call, [] if case == "roots" else [tmp_path]) == []
+
+
+@pytest.mark.parametrize("name", ['Quoted "name"', "Line\nbreak", "Back\\slash", "世界"])
+def test_displayed_name_matches_globally(monkeypatch, name):
+    calls = []
+
+    def call(method, params):
+        calls.append(params)
+        assert method == "thread/list"
+        assert "searchTerm" not in params
+        assert "cwd" not in params
+        return {"data": [thread(name=name)]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.resolve_target(ding.display_cell(name), None, "/test.sock") == THREAD_ID
+    assert len(calls) == 1
+
+
+def test_name_search_preserves_global_ambiguity(monkeypatch):
+    def call(method, params):
+        assert "searchTerm" not in params
+        assert "cwd" not in params
+        if "cursor" not in params:
+            return {"data": [thread()], "nextCursor": "next"}
+        return {"data": [thread(OTHER_ID, cwd="/other-repo")]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    with pytest.raises(ValueError, match="Found 2") as exc:
+        ding.resolve_target("Build", None, "/test.sock")
+    assert OTHER_ID in str(exc.value)
+
+
+@pytest.mark.parametrize("target", ["Missing", r"Invalid\q"])
+def test_name_search_fallback_keeps_global_candidates(monkeypatch, target):
+    calls = []
+
+    def call(method, params):
+        calls.append(params)
+        return {"data": [] if "searchTerm" in params else [thread()]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    with pytest.raises(ValueError, match="Found 0") as exc:
+        ding.resolve_target(target, None, "/test.sock")
+    assert THREAD_ID in str(exc.value)
+    assert "searchTerm" not in calls[-1]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("gh"), ValueError("bad JSON\nmore detail"),
+                                  subprocess.TimeoutExpired(["gh"], 60)])
+def test_board_issue_failure_warns_and_still_succeeds(monkeypatch, capsys, error):
+    def fail():
+        raise error
+
+    monkeypatch.setattr(ding, "github_repository", fail)
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *a: {"data": []}))
+    assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
+    output = capsys.readouterr()
+    assert output.out == "NAME\tCWD\tSTATUS\tISSUE\tHEAD\n"
+    assert len(output.err.splitlines()) == 1
+    assert output.err.startswith("ding: issue lookup failed:")
+
+
+@pytest.mark.parametrize("all_threads", [False, True])
+def test_board_all_includes_unloaded_errors_and_outside(monkeypatch, tmp_path, capsys, all_threads):
+    values = [thread(cwd=str(tmp_path)),
+              thread(OTHER_ID, "Unloaded", str(tmp_path), "notLoaded"),
+              thread("00000000-0000-4000-8000-000000000003", "Error", str(tmp_path), "systemError"),
+              thread("00000000-0000-4000-8000-000000000004", "Outside", "/outside")]
+    replies = []
+
+    def call(method, params):
+        if method == "thread/loaded/list":
+            assert not all_threads
+            return {"data": [THREAD_ID]}
+        if method == "thread/read":
+            assert not all_threads
+            return {"thread": values[0]}
+        if method == "thread/list":
+            assert params["archived"] is False
+            assert ("cwd" in params) is not all_threads
+            return {"data": values}
+        assert method == "thread/turns/list"
+        replies.append(params["threadId"])
+        return {"data": []}
+
+    monkeypatch.setattr(ding, "repository_roots", lambda: [tmp_path])
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--socket", "/test.sock", *(["--all"] if all_threads else [])]) == 0
+    assert replies == ([value["id"] for value in values] if all_threads else [THREAD_ID])
+    assert len(capsys.readouterr().out.splitlines()) == (5 if all_threads else 2)
+
+
+@pytest.mark.parametrize("returncode, stdout, stderr", [
+    (1, "", "authentication failed"), (0, "invalid json", ""),
+])
+def test_gh_failure_leaves_issue_map_empty_with_warning(monkeypatch, capsys, returncode, stdout, stderr):
+    def run(argv, *, capture_output, text, timeout):
+        assert argv[:3] == ["gh", "repo", "view"]
+        assert capture_output and text
+        assert timeout == 60
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    monkeypatch.setattr(ding.subprocess, "run", run)
+    assert ding.issue_map() == {}
+    assert capsys.readouterr().err.startswith("ding: issue lookup failed:")
+
+
+@pytest.mark.parametrize("case", ["text", "fragmented", "invalid-text", "invalid-close"])
+def test_app_server_utf8_validation_and_fragments(tmp_path, monkeypatch, case):
+    websocket = pytest.importorskip("websocket")
+    frames = websocket.ABNF
+    response = json.dumps({"id": 2, "result": {"answer": "中文"}}, ensure_ascii=False).encode("utf-8")
+
+    def frame(data, opcode=frames.OPCODE_TEXT, fin=1):
+        return frames(fin=fin, opcode=opcode, mask_value=0, data=data).format()
+
+    if case == "fragmented":
+        split = response.index("中".encode("utf-8")) + 1
+        payload = frame(response[:split], fin=0) + frame(response[split:], frames.OPCODE_CONT)
+    elif case == "invalid-text":
+        payload = frame(b'\xff')
+    elif case == "invalid-close":
+        payload = frame(b'\x03\xe8\xff', frames.OPCODE_CLOSE)
+    else:
+        payload = frame(response)
+    payload = frame(b'{"id":1,"result":{}}') + payload + frame(b'\x03\xe8', frames.OPCODE_CLOSE)
+    path = str(tmp_path / "server")
+    peers = []
+    connections = []
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(path)
+        server.listen(1)
+
+        def connect(url, **kwargs):
+            peer, _ = server.accept()
+            peers.append(peer)
+            peer.sendall(payload)
+            ws = websocket.WebSocket()
+            ws.sock = kwargs["socket"]
+            ws.connected = True
+            connections.append(ws)
+            return ws
+
+        monkeypatch.setattr(websocket, "create_connection", connect)
+        try:
+            if case.startswith("invalid"):
+                with pytest.raises(ValueError, match="utf-8|Invalid close frame"):
+                    with ding.app_server(path) as call:
+                        call("thread/read", {})
+            else:
+                with ding.app_server(path) as call:
+                    assert call("thread/read", {}) == {"answer": "中文"}
+            assert connections[0].cont_frame.skip_utf8_validation is True
+            assert connections[0].frame_buffer.skip_utf8_validation is False
+            assert not connections[0].connected
+        finally:
+            for peer in peers:
+                peer.close()

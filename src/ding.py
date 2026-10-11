@@ -64,22 +64,22 @@ def discover_socket(directory: Path) -> str:
 
 
 def initialize(ws):
-    deadline = time.monotonic() + 60
     request_id = 0
 
     def call(method, params):
         nonlocal request_id
+        deadline = time.monotonic() + 60
         request_id += 1
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Timed out reading the Codex session.")
-        ws.settimeout(min(15, remaining))
+        ws.settimeout(remaining)
         ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out reading the Codex session.")
-            ws.settimeout(min(15, remaining))
+            ws.settimeout(remaining)
             raw = ws.recv()
             if not raw:
                 raise ValueError("App Server closed the connection before replying.")
@@ -117,7 +117,7 @@ def read_reply(call, thread_id: str) -> str:
     seen_cursors = set()
     while True:
         params = {
-            "threadId": thread_id, "limit": 10,
+            "threadId": thread_id, "limit": 1,
             "sortDirection": "desc", "itemsView": "full",
         }
         if cursor is not None:
@@ -157,6 +157,8 @@ def app_server(path: str):
             ws = websocket.create_connection(
                 "ws://localhost/", socket=sock, timeout=15, suppress_origin=True,
             )
+            # recv() strictly decodes text as UTF-8; keep frame validation for close reasons.
+            ws.cont_frame.skip_utf8_validation = True
             try:
                 yield initialize(ws)
             finally:
@@ -170,7 +172,22 @@ def query(thread_id: str, path: str, *, status_only: bool = False):
         return read_status(call, thread_id) if status_only else read_reply(call, thread_id)
 
 
-def list_threads(call) -> list[dict]:
+def thread_metadata(thread: object) -> dict:
+    if not isinstance(thread, dict):
+        raise ValueError("Malformed App Server thread.")
+    try:
+        thread_id = str(UUID(thread["id"]))
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Malformed App Server thread ID.") from exc
+    name, cwd, status = thread.get("name"), thread.get("cwd"), thread.get("status")
+    if (name is not None and not isinstance(name, str)
+            or not isinstance(cwd, str) or not os.path.isabs(cwd)
+            or not isinstance(status, dict) or not isinstance(status.get("type"), str)):
+        raise ValueError("Malformed App Server thread metadata.")
+    return {"id": thread_id, "name": name or thread_id, "cwd": cwd, "status": status}
+
+
+def list_threads(call, *, cwd: list[str] | None = None) -> list[dict]:
     threads = {}
     cursor = None
     seen_cursors = set()
@@ -185,30 +202,59 @@ def list_threads(call) -> list[dict]:
         }
         if cursor is not None:
             params["cursor"] = cursor
+        if cwd is not None:
+            params["cwd"] = cwd
         page = call("thread/list", params)
         if not isinstance(page.get("data"), list):
             raise ValueError("Malformed App Server threads page.")
         for thread in page["data"]:
-            if not isinstance(thread, dict):
-                raise ValueError("Malformed App Server thread.")
-            try:
-                thread_id = str(UUID(thread["id"]))
-            except (KeyError, ValueError, TypeError, AttributeError) as exc:
-                raise ValueError("Malformed App Server thread ID.") from exc
-            name, cwd, status = thread.get("name"), thread.get("cwd"), thread.get("status")
-            if (name is not None and not isinstance(name, str)
-                    or not isinstance(cwd, str) or not os.path.isabs(cwd)
-                    or not isinstance(status, dict) or not isinstance(status.get("type"), str)):
-                raise ValueError("Malformed App Server thread metadata.")
-            threads.setdefault(thread_id, {
-                "id": thread_id, "name": name or thread_id, "cwd": cwd, "status": status,
-            })
+            metadata = thread_metadata(thread)
+            threads.setdefault(metadata["id"], metadata)
         cursor = page.get("nextCursor")
         if cursor is None:
             return list(threads.values())
         if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
             raise ValueError("Malformed App Server pagination cursor.")
         seen_cursors.add(cursor)
+
+
+def board_threads(call, roots: list[Path]) -> list[dict]:
+    if not roots:
+        return []
+    loaded = {}
+    cursor = None
+    seen_cursors = set()
+    while True:
+        params = {"limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = call("thread/loaded/list", params)
+        if not isinstance(page.get("data"), list):
+            raise ValueError("Malformed App Server loaded threads page.")
+        for value in page["data"]:
+            try:
+                loaded[str(UUID(value))] = None
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("Malformed App Server loaded thread ID.") from exc
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            break
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise ValueError("Malformed App Server pagination cursor.")
+        seen_cursors.add(cursor)
+    directories = set()
+    for thread_id in loaded:
+        result = call("thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = thread_metadata(result.get("thread"))
+        if thread["id"] != thread_id:
+            raise ValueError("App Server returned a different thread ID.")
+        if any(Path(thread["cwd"]).resolve().is_relative_to(root) for root in roots):
+            directories.add(thread["cwd"])
+    if not directories:
+        return []
+    return [thread for thread in list_threads(call, cwd=sorted(directories))
+            if thread["status"]["type"] in {"idle", "active"} and any(
+                Path(thread["cwd"]).resolve().is_relative_to(root) for root in roots)]
 
 
 def repository_roots() -> list[Path]:
@@ -228,7 +274,7 @@ def repository_roots() -> list[Path]:
 
 
 def gh_json(arguments: list[str]):
-    result = subprocess.run(["gh", *arguments], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(["gh", *arguments], capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise ValueError(f"gh failed: {result.stderr.strip()}")
     return json.loads(result.stdout)
@@ -298,7 +344,8 @@ def issue_map() -> dict[str, set[int]]:
                         continue
                     mapping.setdefault(thread_id, set()).add(number)
         return mapping
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired) as exc:
+        print(f"ding: issue lookup failed: {' '.join(str(exc).split())}", file=sys.stderr)
         return {}
 
 
@@ -335,9 +382,7 @@ def reply_head(text: str) -> str:
 def show_board(path: str, *, all_threads: bool = False) -> None:
     roots = [] if all_threads else repository_roots()
     with app_server(path) as call:
-        threads = list_threads(call)
-        threads = [thread for thread in threads if all_threads or any(
-            Path(thread["cwd"]).resolve().is_relative_to(root) for root in roots)]
+        threads = list_threads(call) if all_threads else board_threads(call, roots)
         rows = []
         for thread in threads:
             try:
