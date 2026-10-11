@@ -3,9 +3,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codex-session"
+name = "dkitchen"
 version = "0.1.0"
-description = "Read and message Codex sessions, with conditional job-exit wakeups"
+description = "Message agent sessions and wake them after task completion"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -21,13 +21,14 @@ classifiers = [
 dev = ["pytest>=8"]
 
 [project.scripts]
-codex-session = "codex_session:main"
+ding = "ding:main"
+codex-session = "ding:main"
 
 [project.urls]
 Repository = "https://github.com/917Dhj/codex-session"
 
 [tool.setuptools]
-py-modules = ["codex_session"]
+py-modules = ["ding"]
 package-dir = {"" = "src"}
 
 [tool.pytest.ini_options]
