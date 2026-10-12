@@ -756,10 +756,40 @@ def is_run_wrapper(argv: list[str]) -> bool:
 
 
 def infrastructure_process(argv: list[str]) -> bool:
-    program, _ = process_command(argv)
+    program, arguments = process_command(argv)
     name = Path(program).name
+    if name == "ssh":
+        forwarding = False
+        no_session = False
+        destination = False
+        index = 0
+        while index < len(arguments):
+            value = arguments[index]
+            if value == "--":
+                return ((no_session and (destination or index + 1 < len(arguments)))
+                        or forwarding and index + (1 if destination else 2) == len(arguments))
+            if not value.startswith("-") or value == "-":
+                if destination:
+                    return no_session
+                destination = True
+                index += 1
+                continue
+            for offset, option in enumerate(value[1:], 2):
+                if option == "N":
+                    no_session = True
+                elif option in "BbcDEeFIiJLlmOopPQRSWw":
+                    forwarding |= option in "DLRW"
+                    if not value[offset:]:
+                        index += 1
+                        if index == len(arguments):
+                            return False
+                    break
+                elif option not in "46AaCfGgKkMNnqsTtVvXxYy":
+                    return False
+            index += 1
+        return (no_session or forwarding) and destination
     return (name.startswith("tmux:") or name in {
-        "tmux", "ssh", "sshd", "autossh", "cloudflared", "codex", "codex.js", "codex.py",
+        "tmux", "sshd", "autossh", "cloudflared", "codex", "codex.js", "codex.py",
         "claude", "claude.js", "code", "code-server", "vscode-server", "server-main.js",
         "vim", "nvim", "emacs", "zed", "sublime_text", "idea", "pycharm",
         "clangd", "gopls", "rust-analyzer", "pylsp", "pyright", "pyright-langserver",
@@ -793,13 +823,15 @@ def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
                         min_age: float, min_cpu: float, proc: Path = Path("/proc")) -> list[dict]:
     pane_ids = {pane["pane_id"]: pane for pane in panes.values()}
     findings = []
+    pane_findings = {}
     for pid, process in sorted(processes.items()):
         if (process["uid"] != os.geteuid() or process["state"] in {"Z", "X", "x"} or not process["argv"]
-                or process["age"] <= 0 or process["age"] < min_age or process["cpu"] < min_cpu
+                or process["age"] <= 0
                 or infrastructure_process(process["argv"])):
             continue
         ancestors, seen, current, wrapped, complete = [], set(), pid, False, False
         pane = None
+        pane_chain = []
         while current and current not in seen:
             seen.add(current)
             ancestor = processes.get(current)
@@ -811,14 +843,16 @@ def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
                 break
             if pane is None and current in panes:
                 pane = panes[current]
+                pane_chain = ancestors.copy()
             if current == 1 or ancestor["ppid"] == 0:
                 complete = True
                 break
             current = ancestor["ppid"]
         if wrapped or not complete:
             continue
+        fallback = pane is None
         if pane is None:
-            for ancestor_pid in ancestors:
+            for offset, ancestor_pid in enumerate(ancestors):
                 try:
                     environment = (proc / str(ancestor_pid) / "environ").read_bytes().split(b"\0")
                 except OSError:
@@ -826,13 +860,34 @@ def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
                 pane_id = next((value[len(b"TMUX_PANE="):].decode("utf-8", errors="replace")
                                 for value in environment if value.startswith(b"TMUX_PANE=")), None)
                 if pane_id in pane_ids:
-                    pane = pane_ids[pane_id]
-                    break
-        if pane is not None and pane["session"] == "ssh_tunnel":
-            continue
-        findings.append({**process, "session": pane["session"] if pane else "",
-                         "window": pane["window"] if pane else ""})
-    return findings
+                    if pane is None or pane["pane_id"] == pane_id:
+                        pane = pane_ids[pane_id]
+                        pane_chain = ancestors[:offset + 1]
+        if pane is not None:
+            if pane["session"] == "ssh_tunnel":
+                continue
+            for depth, ancestor_pid in enumerate(reversed(pane_chain)):
+                candidate = processes[ancestor_pid]
+                if (not candidate["argv"] or Path(candidate["argv"][0]).name.lstrip("-") in {
+                        "sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
+                        or infrastructure_process(candidate["argv"])):
+                    continue
+                process = candidate
+                break
+            else:
+                continue
+            if (process["uid"] != os.geteuid() or process["state"] in {"Z", "X", "x"}
+                    or process["age"] <= 0 or process["age"] < min_age):
+                continue
+            rank = (fallback, depth, process["pid"])
+            previous = pane_findings.get(pane["pane_id"])
+            if previous is None or rank < previous[0]:
+                pane_findings[pane["pane_id"]] = (rank, {**process, "session": pane["session"],
+                                                       "window": pane["window"]})
+        elif process["age"] >= min_age and process["cpu"] >= min_cpu:
+            findings.append({**process, "session": "", "window": ""})
+    findings.extend(row for _, row in pane_findings.values())
+    return sorted(findings, key=lambda row: row["pid"])
 
 
 def unwrapped_tasks(*, min_age: float = 600, min_cpu: float = 10) -> list[dict]:
@@ -1211,7 +1266,9 @@ def launch_task(args, command: list[str]) -> int:
                  "-n", args.name, "-c", str(Path.cwd())]
     for key, value in environment.items():
         arguments.extend(["-e", f"{key}={value}"])
-    arguments.extend(["-P", "-F", "#{session_name}\t#{window_name}", shlex.join(inner)])
+    prelude = (f'{shlex.quote(str(Path(tmux).absolute()))} set-option -p -t "$TMUX_PANE" '
+               f'remain-on-exit on && exec {shlex.join(inner)}')
+    arguments.extend(["-P", "-F", "#{session_name}\t#{window_name}", "/bin/sh", "-c", prelude])
     # tmux treats a trailing semicolon as a command separator even in argv values.
     arguments = [value[:-1] + r"\;" if value.endswith(";") else value for value in arguments]
     try:
@@ -1234,7 +1291,7 @@ def main(argv=None) -> int:
     board.add_argument("--min-age", type=nonnegative_number, default=600,
                        help="Minimum age in seconds for the local unwrapped process audit (default: 600)")
     board.add_argument("--min-cpu", type=nonnegative_number, default=10,
-                       help="Minimum lifetime CPU percent per core for the audit (default: 10)")
+                       help="Minimum lifetime CPU percent per core outside tmux panes (default: 10)")
     for action in ("read", "status", "send", "run", "launch"):
         sub = commands.add_parser(action)
         if action == "launch":

@@ -2240,7 +2240,10 @@ def test_launch_captures_caller_session_environment_command_and_paths(tmp_path, 
     assert forwarded == [f"CODEX_THREAD_ID={THREAD_ID}", r"PATH=/caller/bin\;",
                          r"HOME=/caller/home\;", "XDG_STATE_HOME=" + str(cwd / "caller-state") + r"\;",
                          "PYTHONPATH="]
-    inner = shlex.split(argv[-1])
+    assert argv[-3:-1] == ["/bin/sh", "-c"]
+    assert argv[-1].split(" && exec ", 1)[0] == (
+        '/fake/bin/tmux set-option -p -t "$TMUX_PANE" remain-on-exit on')
+    inner = shlex.split(argv[-1].split(" && exec ", 1)[1])
     assert inner[:4] == ["/venv/bin/python", str(Path(ding.__file__).resolve()), "run", THREAD_ID]
     assert inner[inner.index("--record") + 1] == str(cwd / "exit.jsonl")
     assert inner[inner.index("--socket") + 1] == str(cwd / "socket.sock")
@@ -2271,7 +2274,7 @@ def test_launch_materializes_message_once_and_defaults_to_unique_records(tmp_pat
         assert ding.main(["launch", "job", *arguments, "--", "task"]) == 0
     records_seen = []
     for argv, _ in fake_tmux:
-        inner = shlex.split(argv[-1])
+        inner = shlex.split(argv[-1].split(" && exec ", 1)[1])
         record = Path(inner[inner.index("--record") + 1])
         records_seen.append(record)
         materialized = Path(inner[inner.index("--message-file") + 1])
@@ -2430,7 +2433,7 @@ def test_audit_resolves_tmux_ancestry_and_pane_environment_and_excludes_tunnel(t
     (tmp_path / "30/environ").write_bytes(b"SECRET=do-not-print\0TMUX_PANE=%1\0")
     findings = ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path)
     assert [(row["pid"], row["session"], row["window"]) for row in findings] == [
-        (11, "work", "CPU"), (30, "work", "CPU")]
+        (11, "work", "CPU")]
     assert all("SECRET" not in repr(row) for row in findings)
 
 
@@ -2591,3 +2594,101 @@ def test_process_snapshot_skips_pid_reuse_during_metadata_read(tmp_path, monkeyp
 def test_task_arguments_do_not_turn_workload_into_editor_or_agent():
     assert ding.infrastructure_process(["node", "train.js", "/root/.vscode-server/train.js"]) is False
     assert ding.infrastructure_process(["node", "cli.js", "/root/@anthropic-ai/claude-code/cli.js"]) is False
+
+
+@pytest.mark.parametrize("arguments,tunnel", [
+    (["-N", "host"], True), (["-fN", "host"], True),
+    (["-L", "123:host:456", "host"], True),
+    (["-D1080", "host"], True), (["-P", "tag", "-D1080", "host"], True), (["-R123:host:456", "host"], True),
+    (["-p", "22", "-i", "key", "-o", "BatchMode=yes", "-L123:host:456", "host"], True),
+    (["-L123:host:456", "host", "python", "train.py"], False),
+    (["-L", "123:host:456", "host", "echo -N"], False),
+    (["-p22", "-i-N", "-oProxyCommand=echo -N", "host", "task"], False),
+    (["host", "-N"], True), (["host", "-fN"], True),
+    (["host", "-L123:host:456"], True), (["host", "-L", "123:host:456"], True),
+    (["host", "-p", "22", "-L123:host:456"], True),
+    (["host", "-i-N"], False), (["host", "-o", "ProxyCommand=echo -N"], False),
+    (["host", "echo", "-N"], False), (["host", "echo -N"], False),
+    (["host", "-L123:host:456", "echo", "-N"], False),
+    (["host", "--", "-N"], False), (["--", "host", "-N"], False),
+    (["-L123:host:456", "--", "host"], True),
+    (["host", "-L123:host:456", "--"], True),
+    (["host", "-N", "-Z"], False), (["host", "-N", "-L"], False),
+    (["-N"], False), (["-N", "host", "echo"], True),
+    (["-N", "host", "--", "echo"], True),
+    (["-N", "--", "host", "echo"], True),
+    (["host", "python", "train.py"], False),
+    (["-o", "ProxyCommand=ssh -N other", "host", "task"], False),
+    (["-L123:host:456", "--", "host", "task"], False),
+    (["-L"], False), (["-L123:host:456", "-Z", "host"], False),
+])
+def test_ssh_tunnel_filter_preserves_remote_work(arguments, tunnel, tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 2: audit_process(2, argv=["ssh", *arguments])}
+    assert ding.infrastructure_process(processes[2]["argv"]) is tunnel
+    assert [row["pid"] for row in ding.unwrapped_processes(
+        processes, {}, min_age=600, min_cpu=10, proc=tmp_path)] == ([] if tunnel else [2])
+
+
+def test_pane_audit_reports_old_zero_cpu_task_once_and_keeps_nonpane_cpu_gate(tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=["bash"], cpu=0),
+                 74816: audit_process(74816, ppid=10, argv=["python", "guard-workers16.py"], cpu=0),
+                 11: audit_process(11, ppid=74816, cpu=90),
+                 12: audit_process(12, ppid=74816, cpu=90),
+                 20: audit_process(20, cpu=0), 21: audit_process(21, cpu=10)}
+    panes = {10: {"pane_id": "%1", "session": "workers", "window": "guard"}}
+    findings = ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path)
+    assert [row["pid"] for row in findings] == [21, 74816]
+    assert findings[-1]["cpu"] == 0
+
+
+@pytest.mark.parametrize("root_argv,child,expected", [
+    (["bash"], None, []), (["-bash"], None, []),
+    (["python", "guard.py"], None, [10]),
+    (["bash"], ["python", "guard.py"], [11]),
+    (["codex"], ["python", "guard.py"], [11]),
+    (["node", "/root/.vscode-server/out/bootstrap-fork"], ["python", "guard.py"], [11]),
+    (["ding", "run", THREAD_ID], ["python", "guard.py"], []),
+])
+def test_pane_task_representative_ignores_shells_and_infrastructure(root_argv, child, expected, tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=root_argv, cpu=0)}
+    if child:
+        processes[11] = audit_process(11, ppid=10, argv=child, cpu=0)
+        processes[12] = audit_process(12, ppid=11)
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
+    assert [row["pid"] for row in ding.unwrapped_processes(
+        processes, panes, min_age=600, min_cpu=10, proc=tmp_path)] == expected
+
+
+@pytest.mark.parametrize("root_ppid,age", [(1, 599), (99, 1000), (11, 1000)])
+def test_pane_audit_retains_age_and_complete_ancestry_guards(root_ppid, age, tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, ppid=root_ppid, cpu=0, age=age),
+                 11: audit_process(11, ppid=10)}
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
+    assert ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path) == []
+
+
+def test_pane_environment_fallback_selects_topmost_task_once(tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 20: audit_process(20, argv=["bash"], cpu=0),
+                 30: audit_process(30, ppid=20, cpu=0),
+                 2: audit_process(2, ppid=30), 3: audit_process(3, ppid=30)}
+    for pid in (20, 30, 2, 3):
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "environ").write_bytes(b"TMUX_PANE=%1\0")
+    panes = {99: {"pane_id": "%1", "session": "work", "window": "task"}}
+    assert [row["pid"] for row in ding.unwrapped_processes(
+        processes, panes, min_age=600, min_cpu=10, proc=tmp_path)] == [30]
+
+
+def test_pane_representative_skips_empty_ancestor_command_and_breaks_ties_by_pid(tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0), 10: audit_process(10, cpu=0),
+                 12: audit_process(12, ppid=10, cpu=0),
+                 11: audit_process(11, ppid=10, cpu=0)}
+    processes[10]["argv"] = []
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
+    assert [row["pid"] for row in ding.unwrapped_processes(
+        processes, panes, min_age=600, min_cpu=10, proc=tmp_path)] == [11]
