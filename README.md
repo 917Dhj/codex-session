@@ -32,6 +32,7 @@ A compatible Codex App Server must already run under the same user. Notification
 ```bash
 ding board
 ding board --all
+ding board --status
 ding read UUID
 ding read --head 'Exact session name'
 ding status '#186'
@@ -42,7 +43,13 @@ printf '%s\n' 'Your message' | ding send UUID --message -
 ding run UUID --message 'Your message' --record exit.jsonl -- python task.py
 ```
 
-`board` prints one tab-separated row per non-archived session with its name, working directory, status, issue numbers, and the first paragraph of its latest final reply. By default, it includes only loaded sessions with `idle` or `active` status in directories under the current Git repository and its linked worktrees. Outside Git, it uses the current directory. `--all` includes all non-archived sessions in every directory, including unloaded sessions. With `gh` available, an issue with a `Codex owner: UUID` line is attributed only to its latest owner across the body and comments. Other issues are attributed to every valid `Codex session: UUID` reference. An invalid latest owner prints a warning and omits that issue. A failed lookup prints a warning to stderr and leaves that column blank. Sessions without a final reply have a blank summary.
+`board` prints tab-separated columns `NAME`, `CWD`, `STATUS`, `ISSUE`, `HEAD`, and `RUN`. `HEAD` contains the first paragraph of the latest final reply. Sessions without a final reply have a blank summary. `RUN` contains the most recently registered run's state, or is blank for sessions without a registered run.
+
+By default, `board` includes loaded sessions with `idle` or `active` status and registered run targets, including unloaded sessions. The scope is the current Git repository and its linked worktrees, or the current directory outside Git. Registered targets use the session's directory when available and the run's launch directory otherwise. `--all` includes all non-archived App Server sessions and registered targets in every directory. If the App Server is unavailable, registered targets still appear with their UUID, launch directory, and `unavailable` session status. The board only reads sessions and records. It never restores a session or retries a notification.
+
+With `gh` available, the board looks up issues in the current repository. An issue with a `Codex owner: UUID` line belongs only to its latest owner across the body and comments. Other issues belong to every valid `Codex session: UUID` reference. An invalid latest owner prints a warning and omits that issue. A failed lookup prints a warning to stderr and leaves `ISSUE` blank.
+
+`board --status` replaces `HEAD` with the latest matching executor comment's opening four lines, flattened into one cell. The lines must have nonempty values for `状态:`, `在等:`, `关键数字:`, and `下一步:` in that order. A comment's last `Codex owner` line takes precedence over its `Codex session` lines. Comments match canonical session UUIDs, and the newest comment across the session's mapped issues wins. If that comment has no complete status block, `HEAD` uses the final reply. Failed comment lookups or invalid matching timestamps also use the final reply with a warning. Each distinct visible issue gets one `gh issue view NUMBER --repo OWNER/REPO --json comments` call, with at most four calls at once. Ordinary `board` does not fetch individual issue comments.
 
 Every target (`send`, `run`, `read`, and `status`) accepts a UUID, an exact name displayed by `board`, a quoted `'#186'`, `--issue 186`, `OWNER/REPO#186`, or `https://github.com/OWNER/REPO/issues/186`. GitHub `/pull/186` links are treated as issues, and a trailing slash, query strings such as `?notification_referrer_id=...`, and fragments such as `#issuecomment-123` are ignored. Qualified issue numbers and links use their explicit repository regardless of the current directory; `'#186'` and `--issue 186` use the current directory's repository. Names are matched across all non-archived sessions. Missing or ambiguous names report candidates. Issue targets use the latest `Codex owner: UUID` line across the body and comments. Without an owner, all `Codex session: UUID` references must identify one session; repeated mentions of the same UUID are allowed. Multiple distinct sessions cause refusal before sending, starting a task, or querying a reply/status. The error lists each candidate's UUID, App Server name and status, comment count, and latest comment creation time and link. A body-only reference has zero comments and uses the issue's creation time and link. Unavailable session metadata is shown as `unknown`. An invalid latest owner or an owner-free invalid session reference also causes refusal. Specify a UUID or exact session name to resolve ambiguity. Quote `#186` so the shell does not treat it as a comment. A session without a name displays its UUID. Control characters and quotes are escaped in board cells and candidate details.
 
@@ -63,6 +70,18 @@ tmux new-session -d -s long-job ding run "$thread_id" \
 ```
 
 Keep the wrapped command in the foreground. `run` records the task's exit, message, and unique client message ID before checking the session. If its status is `active`, notification is skipped permanently, including when restoring an unloaded session reveals active work. An idle or restored session receives the same delivery and execution confirmation as `send`. A failed status check prevents delivery. The wrapper preserves the task's exit code regardless of notification success. Each invocation appends `task_exit` and `notification` JSONL records with a shared `run_id` and client message ID. The wrapper does not rerun the task.
+
+Before starting the command, `run` appends a `run_start` entry to `${XDG_STATE_HOME:-~/.local/state}/ding/runs.jsonl`. Failure to register prevents the command from starting. The registry has mode `0600`, and its `ding` directory has mode `0700`. Concurrent registrations serialize this durable append. Each line has this shape.
+
+```json
+{"event":"run_start","run_id":"UUID","thread_id":"CANONICAL_SESSION_UUID","record":"/absolute/exit.jsonl","pid":1234,"started_ns":1791799200000000000,"cwd":"/absolute/launch/directory"}
+```
+
+The registry stores one start event per invocation. `board` uses the last valid registration for each session, then matches `task_exit` and `notification` records by `run_id` and `thread_id`. Older records without a registry entry are not discovered. Invalid registry rows print warnings and are skipped.
+
+Each invocation holds a private lock at `ding/run-locks/RUN_ID.lock` until the wrapper exits after notification. The lock descriptor does not pass to the task. Process death or a reboot releases the lock, and PID reuse cannot make that invocation appear alive. The token files remain after exit so readers can probe the same invocation without creating or replacing files.
+
+`RUN` is `running` while the lock is held and no exit is recorded. It is `lost` when no exit is recorded and the lock is absent or released. After a recorded task exit, `exited(CODE)` means notification is still pending in a live wrapper, started, acknowledged behind active work, or skipped because the session was active. `notify_failed` means a failed or unconfirmed notification, including `queue_failed`, `failed`, `unknown`, or `queued`. A dead wrapper with an exit but no notification receipt also shows `notify_failed`. Missing or empty records provide no exit evidence. Unreadable records or corrupt complete events show `unknown` with a warning. An incomplete trailing JSON event is ignored with a warning, preserving earlier complete receipts.
 
 Wakeups use the existing App Server after the task exits. The wrapper adds at most one message and starts at most its own queue item once. It has no CLI fallback or automatic replay.
 
