@@ -10,6 +10,28 @@ import pytest
 import ding
 
 
+def test_run_marker_matches_registry_and_record_and_reaches_grandchild(tmp_path, monkeypatch):
+    thread_id = "00000000-0000-4000-8000-000000000001"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("DING_RUN_ID", "inherited-outer-run")
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "started", "error": None})
+    before = dict(os.environ)
+    observed = tmp_path / "child.json"
+    record = tmp_path / "exit.jsonl"
+    script = (
+        "import json, os, subprocess, sys\n"
+        "grandchild = subprocess.check_output([sys.executable, '-c', "
+        "\"import os; print(os.environ['DING_RUN_ID'])\"], text=True).strip()\n"
+        "with open(sys.argv[1], 'w') as f: json.dump([os.environ['DING_RUN_ID'], grandchild], f)\n"
+    )
+    assert ding.main(["run", thread_id, "--record", str(record), "--message", "done",
+                      "--socket", "/not-a-real-socket", "--", sys.executable, "-c", script, str(observed)]) == 0
+    run_id = ding.latest_runs()[thread_id]["run_id"]
+    assert json.loads(observed.read_text()) == [run_id, run_id]
+    assert {json.loads(line)["run_id"] for line in record.read_text().splitlines()} == {run_id}
+    assert dict(os.environ) == before
+
+
 def test_writer_excludes_other_process_and_releases_after_error(tmp_path):
     path = tmp_path / "nested" / "exit.jsonl"
     script = "import sys; from pathlib import Path; from ding import writer;\nwith writer(Path(sys.argv[1])): pass"
