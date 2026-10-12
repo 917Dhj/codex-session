@@ -19,6 +19,10 @@ from typing import Iterator
 import fcntl
 
 
+class AppServerError(ValueError):
+    pass
+
+
 class NoFinalReply(ValueError):
     pass
 
@@ -63,20 +67,20 @@ def discover_socket(directory: Path) -> str:
     return str(candidates[0])
 
 
-def initialize(ws):
+def initialize(ws, *, deadline: float | None = None):
     request_id = 0
 
     def call(method, params):
         nonlocal request_id
-        deadline = time.monotonic() + 60
+        call_deadline = min(time.monotonic() + 60, deadline) if deadline is not None else time.monotonic() + 60
         request_id += 1
-        remaining = deadline - time.monotonic()
+        remaining = call_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Timed out reading the Codex session.")
         ws.settimeout(remaining)
         ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = call_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out reading the Codex session.")
             ws.settimeout(remaining)
@@ -89,7 +93,11 @@ def initialize(ws):
             if response.get("id") != request_id:
                 continue
             if "error" in response:
-                raise ValueError(f"App Server error: {response['error']}")
+                error = response["error"]
+                if (not isinstance(error, dict) or type(error.get("code")) is not int
+                        or not isinstance(error.get("message"), str)):
+                    raise ValueError("Malformed App Server error.")
+                raise AppServerError(f"App Server error: {error}")
             result = response.get("result")
             if not isinstance(result, dict):
                 raise ValueError("Malformed App Server result.")
@@ -145,22 +153,25 @@ def read_reply(call, thread_id: str) -> str:
 
 
 @contextmanager
-def app_server(path: str):
+def app_server(path: str, *, deadline: float | None = None):
     try:
         import websocket
     except ImportError as exc:
         raise ValueError("Missing websocket-client; reinstall dkitchen with its dependencies.") from exc
     try:
         with socket.socket(socket.AF_UNIX) as sock:
-            sock.settimeout(15)
+            timeout = min(15, deadline - time.monotonic()) if deadline is not None else 15
+            if timeout <= 0:
+                raise TimeoutError("Timed out confirming message execution.")
+            sock.settimeout(timeout)
             sock.connect(path)
             ws = websocket.create_connection(
-                "ws://localhost/", socket=sock, timeout=15, suppress_origin=True,
+                "ws://localhost/", socket=sock, timeout=timeout, suppress_origin=True,
             )
             # recv() strictly decodes text as UTF-8; keep frame validation for close reasons.
             ws.cont_frame.skip_utf8_validation = True
             try:
-                yield initialize(ws)
+                yield initialize(ws, deadline=deadline)
             finally:
                 ws.close()
     except websocket.WebSocketException as exc:
@@ -459,11 +470,140 @@ def socket_path(explicit: str | None) -> str:
     return explicit or discover_socket(Path(f"/tmp/codex-daemon-{os.getuid()}"))
 
 
-def queue_message(thread_id: str, message: str, path: str | None) -> int:
-    return subprocess.run([
-        "codex", "queue", "--remote", f"unix://{path or ''}",
-        "--thread", thread_id, "--message", message,
-    ], timeout=60).returncode
+def same_message(inputs: object, message: str) -> bool:
+    return (isinstance(inputs, list) and len(inputs) == 1 and isinstance(inputs[0], dict)
+            and inputs[0].get("type") == "text" and inputs[0].get("text") == message
+            and inputs[0].get("text_elements", []) == [])
+
+
+def message_turn(turn: object, client_id: str, message: str) -> dict | None:
+    if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"]
+            or not isinstance(turn.get("status"), str)
+            or turn.get("status") not in {"inProgress", "completed", "interrupted", "failed"}
+            or not isinstance(turn.get("items"), list)):
+        raise ValueError("Malformed App Server turn.")
+    for item in turn["items"]:
+        if not isinstance(item, dict):
+            raise ValueError("Malformed App Server item.")
+        if item.get("type") == "userMessage" and item.get("clientId") == client_id:
+            if not same_message(item.get("content"), message):
+                raise ValueError("App Server returned different message content.")
+            return turn
+    return None
+
+
+def started_message(call, thread_id: str, client_id: str, message: str,
+                    *, after_turn_id: str | None = None) -> dict | None:
+    cursor = None
+    seen = set()
+    while True:
+        params = {"threadId": thread_id, "limit": 100, "sortDirection": "desc", "itemsView": "full"}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = call("thread/turns/list", params)
+        if not isinstance(page.get("data"), list):
+            raise ValueError("Malformed App Server turns page.")
+        for turn in page["data"]:
+            found = message_turn(turn, client_id, message)
+            if found is not None:
+                return found
+            if turn["id"] == after_turn_id:
+                return None
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError("Malformed App Server pagination cursor.")
+        seen.add(cursor)
+
+
+def delivery_status(call, thread_id: str, *, resume: bool = False) -> dict:
+    params = {"threadId": thread_id, **({"excludeTurns": True} if resume else {"includeTurns": False})}
+    result = call("thread/resume" if resume else "thread/read", params)
+    thread = result.get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        raise ValueError("App Server returned a different thread ID.")
+    status = thread.get("status")
+    if (not isinstance(status, dict) or not isinstance(status.get("type"), str)
+            or status["type"] not in {"notLoaded", "idle", "active"}):
+        raise ValueError("App Server session is not in a deliverable state.")
+    if resume and status["type"] == "notLoaded":
+        raise ValueError("App Server did not load the session.")
+    return status
+
+
+def deliver_message(thread_id: str, message: str, path: str, client_id: str,
+                    *, skip_active: bool = False, timeout: float = 60) -> dict:
+    result = {"outcome": "failed", "status": None, "error": None,
+              "queued_submission_id": None, "turn_id": None, "turn_status": None}
+    deadline = time.monotonic() + timeout
+    mutation = None
+    baseline = None
+
+    def confirm(turn):
+        result.update(outcome="started", turn_id=turn["id"], turn_status=turn["status"])
+        return result
+
+    try:
+        with app_server(path, deadline=deadline) as call:
+            result["status"] = delivery_status(call, thread_id)
+            if result["status"]["type"] == "notLoaded":
+                result["status"] = delivery_status(call, thread_id, resume=True)
+            if skip_active and result["status"]["type"] == "active":
+                result["outcome"] = "skipped_active"
+                return result
+            page = call("thread/turns/list", {
+                "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "full",
+            })
+            if not isinstance(page.get("data"), list):
+                raise ValueError("Malformed App Server turns page.")
+            if page["data"]:
+                message_turn(page["data"][0], client_id, message)
+                baseline = page["data"][0]["id"]
+            mutation = "add"
+            result["outcome"] = "unknown"
+            inputs = [{"type": "text", "text": message}]
+            submission = call("thread/queue/add", {
+                "threadId": thread_id, "clientUserMessageId": client_id, "input": inputs,
+            }).get("queuedSubmission")
+            if (not isinstance(submission, dict) or not isinstance(submission.get("id"), str)
+                    or not submission["id"] or submission.get("clientUserMessageId") != client_id
+                    or not same_message(submission.get("input"), message)):
+                raise ValueError("Malformed App Server queued submission.")
+            result.update(outcome="queued", queued_submission_id=submission["id"])
+            while time.monotonic() < deadline:
+                found = started_message(call, thread_id, client_id, message, after_turn_id=baseline)
+                if found is not None:
+                    return confirm(found)
+                result["status"] = delivery_status(call, thread_id)
+                if result["status"]["type"] == "idle" and mutation == "add":
+                    mutation = "start"
+                    result["outcome"] = "unknown"
+                    turn = call("thread/queue/start", {
+                        "threadId": thread_id, "queuedSubmissionId": submission["id"],
+                    }).get("turn")
+                    found = message_turn(turn, client_id, message)
+                    if found is not None:
+                        return confirm(found)
+                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as exc:
+        result["error"] = str(exc) or type(exc).__name__
+        if isinstance(exc, AppServerError):
+            result["outcome"] = "queued" if result["queued_submission_id"] is not None else "failed"
+        elif mutation is not None:
+            result["outcome"] = "unknown"
+        if mutation is not None and not isinstance(exc, KeyboardInterrupt) and time.monotonic() < deadline:
+            try:
+                # A lost acknowledgement cannot be retried safely on the same connection.
+                with app_server(path, deadline=deadline) as call:
+                    found = started_message(call, thread_id, client_id, message, after_turn_id=baseline)
+                    if found is not None:
+                        return confirm(found)
+            except (OSError, ValueError, RuntimeError, KeyboardInterrupt):
+                pass
+    if result["outcome"] in {"queued", "unknown"} and result["error"] is None:
+        result["error"] = "Timed out confirming message execution."
+    return result
 
 
 def message_text(message: str | None, message_file: str | None, sender: str | None) -> str:
@@ -486,37 +626,36 @@ def send_task(args) -> int:
     with writer(record, blocking=True):
         record.chmod(0o600)
     event = {
-        "sender": args.sender, "target": args.thread_id if args.issue is None else f"#{args.issue}",
-        "thread_id": None, "message": args.message, "outcome": "queue_failed",
-        "queue_exit_code": None, "error": None,
+        "event": "send_intent", "client_message_id": str(uuid4()), "sender": args.sender,
+        "target": args.thread_id if args.issue is None else f"#{args.issue}",
+        "thread_id": None, "message": args.message, "outcome": "failed", "error": None,
     }
-    code = 1
     try:
         event["thread_id"] = resolve_target(args.thread_id, args.issue, args.socket)
         path = socket_path(args.socket)
-        event["outcome"] = "unknown"
-        queue_code = queue_message(event["thread_id"], args.message, path)
-        event["queue_exit_code"] = queue_code
-        event["outcome"] = "queued" if queue_code == 0 else "queue_failed"
-        code = 128 - queue_code if queue_code < 0 else queue_code
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
-        event["error"] = ("codex queue timed out; delivery is unknown."
-                          if isinstance(exc, subprocess.TimeoutExpired) and event["outcome"] == "unknown"
-                          else str(exc) or type(exc).__name__)
-        if not isinstance(exc, (subprocess.TimeoutExpired, KeyboardInterrupt)):
-            event["outcome"] = "queue_failed"
-        if isinstance(exc, KeyboardInterrupt):
-            code = 130
-        print(f"ding: {event['error']}", file=sys.stderr)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        event["error"] = str(exc) or type(exc).__name__
+    if event["error"] is None:
+        event["outcome"] = "pending"
     event["timestamp_ns"] = time.time_ns()
+    with writer(record, blocking=True):
+        append_jsonl(record, event)
+    if event["error"]:
+        print(f"ding: {event['error']}", file=sys.stderr)
+        return 1
+    delivery = deliver_message(event["thread_id"], args.message, path, event["client_message_id"])
+    event.update(delivery, event="send_result", timestamp_ns=time.time_ns())
     try:
         with writer(record, blocking=True):
             append_jsonl(record, event)
     except OSError as exc:
-        print(f"ding: sent log failed ({record}); queue outcome: {event['outcome']}, "
-              f"exit code: {event['queue_exit_code']}: {exc}", file=sys.stderr)
+        print(f"ding: sent log failed ({record}); delivery outcome: {event['outcome']}; "
+              f"do not blindly resend: {exc}", file=sys.stderr)
         return 1
-    return code
+    warning = "; do not blindly resend" if event["outcome"] in {"queued", "unknown"} else ""
+    detail = f"; {event['error']}" if event["error"] else ""
+    print(f"ding: {event['outcome']}{warning}{detail}; record: {record}", file=sys.stderr)
+    return 0 if event["outcome"] == "started" else (130 if event["error"] == "KeyboardInterrupt" else 1)
 
 
 def task_exit_code(command: list[str]) -> tuple[int, str | None]:
@@ -542,40 +681,31 @@ def run_task(args, command: list[str]) -> int:
     run_id = str(uuid4())
     with writer(record):
         code, error = task_exit_code(command)
+        client_id = str(uuid4())
         append_jsonl(record, {
             "event": "task_exit", "run_id": run_id, "thread_id": args.thread_id,
-            "exit_code": code, "error": error,
-            "timestamp_ns": time.time_ns(),
+            "client_message_id": client_id, "message": args.message,
+            "exit_code": code, "error": error, "timestamp_ns": time.time_ns(),
         })
         notification = {
             "event": "notification", "run_id": run_id, "thread_id": args.thread_id,
-            "status": None, "status_error": None, "queue_exit_code": None,
-            "queue_error": None,
+            "client_message_id": client_id, "outcome": "failed", "error": None,
         }
-        path = args.socket
         try:
-            path = socket_path(path)
-            notification["status"] = query(args.thread_id, path, status_only=True)
+            path = socket_path(args.socket)
+            notification.update(deliver_message(args.thread_id, args.message, path, client_id,
+                                                skip_active=True))
         except (OSError, ValueError, KeyboardInterrupt) as exc:
-            notification["status_error"] = str(exc) or type(exc).__name__
-        status = notification["status"]
-        if isinstance(status, dict) and status.get("type") == "active":
-            notification["outcome"] = "skipped_active"
-        else:
-            try:
-                queue_code = queue_message(args.thread_id, args.message, path)
-                notification["queue_exit_code"] = queue_code
-                notification["outcome"] = "queued" if queue_code == 0 else "queue_failed"
-            except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
-                notification["queue_error"] = str(exc) or type(exc).__name__
-                notification["outcome"] = "queue_failed"
+            notification["error"] = str(exc) or type(exc).__name__
         notification["timestamp_ns"] = time.time_ns()
         try:
             append_jsonl(record, notification)
         except OSError as exc:
             print(f"ding: notification record failed ({record}): {exc}", file=sys.stderr)
             return code
-        print(f"ding: {notification['outcome']}; record: {record}", file=sys.stderr)
+        warning = "; do not blindly resend" if notification["outcome"] in {"queued", "unknown"} else ""
+        detail = f"; {notification['error']}" if notification["error"] else ""
+        print(f"ding: {notification['outcome']}{warning}{detail}; record: {record}", file=sys.stderr)
         return code
 
 
