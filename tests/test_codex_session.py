@@ -2651,7 +2651,7 @@ def test_pane_audit_reports_old_zero_cpu_task_once_and_keeps_nonpane_cpu_gate(tm
     (["node", "/root/.vscode-server/out/bootstrap-fork"], ["python", "guard.py"], [11]),
     (["ding", "run", THREAD_ID], ["python", "guard.py"], []),
 ])
-def test_pane_task_representative_ignores_shells_and_infrastructure(root_argv, child, expected, tmp_path):
+def test_pane_task_representative_ignores_interactive_shells_and_infrastructure(root_argv, child, expected, tmp_path):
     processes = {1: audit_process(1, ppid=0, cpu=0),
                  10: audit_process(10, argv=root_argv, cpu=0)}
     if child:
@@ -2660,6 +2660,74 @@ def test_pane_task_representative_ignores_shells_and_infrastructure(root_argv, c
     panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
     assert [row["pid"] for row in ding.unwrapped_processes(
         processes, panes, min_age=600, min_cpu=10, proc=tmp_path)] == expected
+
+
+@pytest.mark.parametrize("argv,interactive", [
+    (["bash"], True), (["-bash"], True), (["bash", "-l"], True),
+    (["bash", "-i"], True), (["zsh"], True), (["sh", "--"], True),
+    (["bash", "-o", "noclobber"], True), (["bash", "+o", "noclobber"], True),
+    (["bash", "-O", "checkwinsize"], True), (["bash", "+O", "checkwinsize"], True),
+    (["bash", "-loclobber"], True), (["bash", "--rcfile", "startup.rc"], True),
+    (["bash", "--init-file", "startup.rc", "-i"], True),
+    (["bash", "--rcfile=startup.rc", "-i"], True),
+    (["bash", "run.sh"], False), (["bash", "-l", "run.sh"], False),
+    (["bash", "--", "run.sh"], False), (["bash", "-c", "loop"], False),
+    (["bash", "-lc", "loop"], False), (["bash", "-ic", "loop"], False),
+    (["bash", "+c"], True),
+    (["bash", "-o", "noclobber", "-c", "loop"], False),
+    (["bash", "--rcfile", "startup.rc", "run.sh"], False),
+    (["python", "run.py"], False), ([], False),
+])
+def test_interactive_shell_filter_preserves_scripts_and_commands(argv, interactive):
+    assert ding.interactive_shell(argv) is interactive
+
+
+def test_pane_audit_reports_old_shell_loop_with_young_current_step(tmp_path):
+    loop = ["bash", "-c", "for b in 1 2 3; do python step.py $b; done"]
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=loop, age=1000, cpu=0),
+                 11: audit_process(11, ppid=10, argv=["python", "step.py", "1"], age=1, cpu=0)}
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "batch"}}
+    finding, = ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path)
+    assert (finding["pid"], finding["argv"], finding["age"]) == (10, loop, 1000)
+
+
+def test_pane_audit_reports_script_shell_beneath_interactive_shell(tmp_path):
+    script = ["bash", "run.sh"]
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=["bash"], cpu=0),
+                 11: audit_process(11, ppid=10, argv=script, age=1000, cpu=0),
+                 12: audit_process(12, ppid=11, age=1, cpu=0)}
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "batch"}}
+    finding, = ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path)
+    assert (finding["pid"], finding["argv"], finding["age"]) == (11, script, 1000)
+
+
+@pytest.mark.parametrize("argv", [["bash", "-c", "ding run target -- task"], ["bash", "run.sh"]])
+def test_pane_audit_omits_shell_waiting_only_for_run_wrappers(argv, tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=argv, cpu=0),
+                 11: audit_process(11, ppid=10, argv=["ding", "run", THREAD_ID], age=0, cpu=0),
+                 12: audit_process(12, ppid=11, cpu=0)}
+    for pid, state in enumerate(("Z", "X", "x"), 20):
+        processes[pid] = audit_process(pid, ppid=10, state=state)
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
+    assert ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path) == []
+
+
+@pytest.mark.parametrize("root_argv,other_child", [
+    (["bash", "-c", "ding run target -- task & python step.py; wait"], True),
+    (["python", "orchestrator.py"], False),
+])
+def test_pane_audit_keeps_mixed_shell_and_non_shell_orchestrators(root_argv, other_child, tmp_path):
+    processes = {1: audit_process(1, ppid=0, cpu=0),
+                 10: audit_process(10, argv=root_argv, cpu=0),
+                 11: audit_process(11, ppid=10, argv=["ding", "run", THREAD_ID], age=1, cpu=0)}
+    if other_child:
+        processes[12] = audit_process(12, ppid=10, age=1, cpu=0)
+    panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
+    finding, = ding.unwrapped_processes(processes, panes, min_age=600, min_cpu=10, proc=tmp_path)
+    assert (finding["pid"], finding["argv"], finding["age"]) == (10, root_argv, 1000)
 
 
 @pytest.mark.parametrize("root_ppid,age", [(1, 599), (99, 1000), (11, 1000)])

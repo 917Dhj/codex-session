@@ -25,6 +25,7 @@ import fcntl
 
 
 ISSUE_REPOSITORY = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+SHELL_PROGRAMS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
 
 
 class AppServerError(ValueError):
@@ -819,9 +820,37 @@ def tmux_panes() -> dict[int, dict]:
     return panes
 
 
+def interactive_shell(argv: list[str]) -> bool:
+    if not argv or Path(argv[0]).name.lstrip("-") not in SHELL_PROGRAMS:
+        return False
+    arguments = iter(argv[1:])
+    for value in arguments:
+        if value == "--":
+            return next(arguments, None) is None
+        if value in {"--rcfile", "--init-file"}:
+            next(arguments, None)
+        elif not value.startswith(("-", "+")) or value == "-":
+            return False
+        elif not value.startswith("--"):
+            for offset, option in enumerate(value[1:], 2):
+                if option == "c" and value.startswith("-"):
+                    return False
+                if option in "oO":
+                    if not value[offset:]:
+                        next(arguments, None)
+                    break
+    return True
+
+
 def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
                         min_age: float, min_cpu: float, proc: Path = Path("/proc")) -> list[dict]:
     pane_ids = {pane["pane_id"]: pane for pane in panes.values()}
+    wrapper_parents, other_parents = set(), set()
+    for child in processes.values():
+        if child["state"] not in {"Z", "X", "x"}:
+            parents = wrapper_parents if is_run_wrapper(child["argv"]) else other_parents
+            parents.add(child["ppid"])
+    wrapper_only_parents = wrapper_parents - other_parents
     findings = []
     pane_findings = {}
     for pid, process in sorted(processes.items()):
@@ -868,8 +897,9 @@ def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
                 continue
             for depth, ancestor_pid in enumerate(reversed(pane_chain)):
                 candidate = processes[ancestor_pid]
-                if (not candidate["argv"] or Path(candidate["argv"][0]).name.lstrip("-") in {
-                        "sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
+                if (not candidate["argv"] or interactive_shell(candidate["argv"])
+                        or (ancestor_pid in wrapper_only_parents
+                            and Path(candidate["argv"][0]).name.lstrip("-") in SHELL_PROGRAMS)
                         or infrastructure_process(candidate["argv"])):
                     continue
                 process = candidate
