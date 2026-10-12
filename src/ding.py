@@ -1070,7 +1070,7 @@ def delivery_status(call, thread_id: str, *, resume: bool = False) -> dict:
 
 
 def deliver_message(thread_id: str, message: str, path: str, client_id: str,
-                    *, skip_active: bool = False, timeout: float = 60) -> dict:
+                    *, timeout: float = 60) -> dict:
     result = {"outcome": "failed", "status": None, "error": None,
               "queued_submission_id": None, "turn_id": None, "turn_status": None}
     deadline = time.monotonic() + timeout
@@ -1086,9 +1086,6 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
             result["status"] = delivery_status(call, thread_id)
             if result["status"]["type"] == "notLoaded":
                 result["status"] = delivery_status(call, thread_id, resume=True)
-            if skip_active and result["status"]["type"] == "active":
-                result["outcome"] = "skipped_active"
-                return result
             if result["status"]["type"] == "idle":
                 page = call("thread/turns/list", {
                     "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "full",
@@ -1240,8 +1237,7 @@ def run_task(args, command: list[str]) -> int:
         }
         try:
             path = socket_path(args.socket)
-            notification.update(deliver_message(args.thread_id, args.message, path, client_id,
-                                                skip_active=True))
+            notification.update(deliver_message(args.thread_id, args.message, path, client_id))
         except (OSError, ValueError, KeyboardInterrupt) as exc:
             notification["error"] = str(exc) or type(exc).__name__
         notification["timestamp_ns"] = time.time_ns()
