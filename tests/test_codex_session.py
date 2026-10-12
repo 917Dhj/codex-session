@@ -498,23 +498,80 @@ def test_thread_list_rejects_repeated_cursor():
 def test_uuid_and_unambiguous_issue_targets_are_local(monkeypatch):
     monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
     monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not discover socket"))
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
     issues = []
 
-    def issue_session(number, path=None):
-        issues.append((number, path))
+    def issue_session(number, path=None, repo=None):
+        issues.append((number, path, repo))
         return OTHER_ID
 
     monkeypatch.setattr(ding, "issue_session", issue_session)
     assert ding.resolve_target(THREAD_ID.upper(), None, None) == THREAD_ID
     assert ding.resolve_target("#42", None, "/test.sock") == OTHER_ID
     assert ding.resolve_target(None, 7, "/other.sock") == OTHER_ID
-    assert issues == [(42, "/test.sock"), (7, "/other.sock")]
+    assert issues == [(42, "/test.sock", "example/project"), (7, "/other.sock", "example/project")]
     with pytest.raises(ValueError, match="positive issue number"):
         ding.resolve_target("#zero", None, None)
 
 
+@pytest.mark.parametrize("target", [
+    "example/project#42",
+    "https://github.com/example/project/issues/42",
+    "https://github.com/example/project/issues/42#issuecomment-123",
+    "https://github.com/example/project/pull/42",
+    "https://github.com/example/project/pull/42#issuecomment-123",
+])
+def test_explicit_issue_target_uses_its_repository(monkeypatch, tmp_path, target):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GH_REPO", "wrong/repository")
+    monkeypatch.setattr(ding, "github_repository", lambda: pytest.fail("must not discover repository"))
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    calls = []
+
+    def gh(arguments):
+        calls.append(arguments)
+        if "--paginate" in arguments:
+            return [[{"body": f"Codex owner: {THREAD_ID}"}]]
+        return {"body": f"Codex owner: {OTHER_ID}"}
+
+    monkeypatch.setattr(ding, "gh_json", gh)
+    assert ding.resolve_target(target, None, "/test.sock") == THREAD_ID
+    assert calls == [
+        ["api", "repos/example/project/issues/42"],
+        ["api", "--paginate", "--slurp", "repos/example/project/issues/42/comments?per_page=100"],
+    ]
+
+
+@pytest.mark.parametrize("target", [
+    "#0", "#-1", "#abc", "example/project#0", "example/project#-1",
+    "example/project#abc", "example/project#", "example/project#42#extra",
+    "example/project/extra#42", "example//project#42", "/project#42", "example/#42",
+    "example/..#42", "./project#42",
+    "éxample/project#42", "example/pro%2Fject#42",
+    "http://github.com/example/project/issues/42",
+    "https://example.com/example/project/issues/42",
+    "https://github.com.evil/example/project/issues/42",
+    "https://user@github.com/example/project/issues/42",
+    "https://github.com:443/example/project/issues/42",
+    "https://github.com/example/project/issues/0",
+    "https://github.com/example/project/issues/-1",
+    "https://github.com/example/project/issues/abc",
+    "https://github.com/example/project/issues/42/extra",
+    "https://github.com/example/project/issues/42?query=1",
+    "https://github.com/example/../issues/42",
+    "https://github.com/example/project/discussions/42",
+])
+def test_invalid_issue_targets_fail_before_lookup(monkeypatch, target):
+    for function in ("github_repository", "gh_json", "gh_records", "app_server"):
+        monkeypatch.setattr(ding, function, lambda *a, **kw: pytest.fail("invalid target must not look up"))
+    with pytest.raises(ValueError, match="Issue (target|URL)"):
+        ding.resolve_target(target, None, "/test.sock")
+
+
 @pytest.mark.parametrize("target, names, expected", [
     ("Build", ["Build", "Other"], THREAD_ID),
+    ("Build #42", ["Build #42", "Other"], THREAD_ID),
+    ("Review / Build #42", ["Review / Build #42", "Other"], THREAD_ID),
     ("Build", ["Build", "Build"], "Found 2"),
     ("Missing", ["Build", "Other"], "Found 0"),
     ("build", ["Build", "Other"], "Found 0"),
@@ -710,7 +767,11 @@ def test_issue_ambiguity_reads_metadata_missing_from_list(
 
 
 @pytest.mark.parametrize("action", ["send", "run", "read", "status"])
-@pytest.mark.parametrize("target", [["#42"], ["--issue", "42"]])
+@pytest.mark.parametrize("target", [
+    ["#42"], ["--issue", "42"], ["example/project#42"],
+    ["https://github.com/example/project/issues/42#issuecomment-123"],
+    ["https://github.com/example/project/pull/42"],
+])
 def test_ambiguous_issue_refuses_every_command_before_execution(
         issue_data, monkeypatch, tmp_path, capsys, action, target):
     issue, comments = issue_data
@@ -740,6 +801,79 @@ def test_ambiguous_issue_refuses_every_command_before_execution(
     if action == "send":
         event, = records(tmp_path / "state/ding/sent.jsonl")
         assert event["thread_id"] is None
+        assert event["outcome"] == "failed"
+        assert event["target"] == "example/project#42"
+
+
+@pytest.mark.parametrize("action", ["send", "run", "read", "status"])
+@pytest.mark.parametrize("target", [
+    ["#42"], ["--issue", "42"], ["example/project#42"],
+    ["https://github.com/example/project/issues/42#issuecomment-123"],
+    ["https://github.com/example/project/pull/42#discussion_r123"],
+])
+def test_issue_targets_work_for_every_command_and_log_canonical_target(
+        issue_data, monkeypatch, tmp_path, action, target):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GH_REPO", "wrong/repository")
+    discoveries, calls = [], []
+    monkeypatch.setattr(ding, "github_repository", lambda: discoveries.append(True) or "example/project")
+
+    def gh(arguments):
+        assert arguments == ["api", "repos/example/project/issues/42"]
+        return issue_data[0]
+
+    def comments(resource):
+        assert resource == "repos/example/project/issues/42/comments?per_page=100"
+        return issue_data[1]
+
+    def delivery(thread_id, message, path, client_id):
+        calls.append((thread_id, message, path))
+        return {"outcome": "started", "error": None}
+
+    def run(args, command):
+        calls.append((args.thread_id, args.message, args.socket))
+        assert command == ["fake-task"]
+        return 0
+
+    def query(thread_id, path, *, status_only=False):
+        calls.append((thread_id, path, status_only))
+        return {"type": "idle"} if status_only else "final reply"
+
+    monkeypatch.setattr(ding, "gh_json", gh)
+    monkeypatch.setattr(ding, "gh_records", comments)
+    monkeypatch.setattr(ding, "deliver_message", delivery)
+    monkeypatch.setattr(ding, "run_task", run)
+    monkeypatch.setattr(ding, "query", query)
+    argv = [action, *target, "--socket", "/test.sock"]
+    if action in {"send", "run"}:
+        argv.extend(["--message", "test message"])
+    if action == "run":
+        argv.extend(["--record", str(tmp_path / "exit.jsonl"), "--", "fake-task"])
+    assert ding.main(argv) == 0
+    assert discoveries == ([True] if target[0] in {"#42", "--issue"} else [])
+    assert calls == ([(THREAD_ID, "test message", "/test.sock")] if action in {"send", "run"}
+                     else [(THREAD_ID, "/test.sock", action == "status")])
+    if action == "send":
+        intent, result = records(tmp_path / "state/ding/sent.jsonl")
+        assert intent["target"] == result["target"] == "example/project#42"
+        assert intent["thread_id"] == result["thread_id"] == THREAD_ID
+
+
+@pytest.mark.parametrize("action", ["send", "run", "read", "status"])
+def test_invalid_explicit_issue_refuses_every_command(monkeypatch, tmp_path, action):
+    for function in ("github_repository", "gh_json", "gh_records", "app_server",
+                     "deliver_message", "run_task", "query"):
+        monkeypatch.setattr(ding, function, lambda *a, **kw: pytest.fail("invalid target must not execute"))
+    argv = [action, "example/project#0", "--socket", "/test.sock"]
+    if action in {"send", "run"}:
+        argv.extend(["--message", "must not deliver"])
+    if action == "run":
+        argv.extend(["--record", str(tmp_path / "exit.jsonl"), "--", "must-not-start"])
+    assert ding.main(argv) == 1
+    assert not (tmp_path / "exit.jsonl").exists()
+    if action == "send":
+        event, = records(tmp_path / "state/ding/sent.jsonl")
+        assert event["target"] == "example/project#0"
         assert event["outcome"] == "failed"
 
 

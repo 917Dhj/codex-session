@@ -19,6 +19,9 @@ from typing import Iterator
 import fcntl
 
 
+ISSUE_REPOSITORY = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+
+
 class AppServerError(ValueError):
     pass
 
@@ -339,8 +342,8 @@ def issue_references(issue: dict, comments: list[dict]) -> tuple[str | None, dic
     return owner, candidates, malformed
 
 
-def issue_session(number: int, path: str | None = None) -> str:
-    repo = github_repository()
+def issue_session(number: int, path: str | None = None, repo: str | None = None) -> str:
+    repo = repo if repo is not None else github_repository()
     issue = gh_json(["api", f"repos/{repo}/issues/{number}"])
     if not isinstance(issue, dict):
         raise ValueError("Malformed gh issue.")
@@ -421,17 +424,35 @@ def display_cell(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)[1:-1]
 
 
-def resolve_target(target: str | None, issue: int | None, path: str | None) -> str:
+def normalize_target(target: str | None, issue: int | None) -> str | None:
     if issue is not None:
-        return issue_session(issue, path)
+        target = f"#{issue}"
+    if target and target.startswith("#"):
+        if not re.fullmatch(r"#[1-9][0-9]*", target):
+            raise ValueError("Issue target must be # followed by a positive issue number.")
+        target = github_repository() + target
+    if target and ("://" in target or target.startswith(("http:", "https:"))):
+        match = re.fullmatch(
+            rf"https://github\.com/({ISSUE_REPOSITORY})/(?:issues|pull)/([1-9][0-9]*)(?:#[^\r\n]*)?",
+            target)
+        if not match:
+            raise ValueError("Issue URL must be https://github.com/OWNER/REPO/issues/NUMBER or /pull/NUMBER.")
+        target = f"{match[1]}#{match[2]}"
+    if target and re.match(r"[^\s/]*/", target) and "#" in target:
+        match = re.fullmatch(rf"({ISSUE_REPOSITORY})#([1-9][0-9]*)", target)
+        if not match or any(segment in {".", ".."} for segment in match[1].split("/")):
+            raise ValueError("Issue target must be OWNER/REPO# followed by a positive issue number.")
+    return target
+
+
+def resolve_target(target: str | None, issue: int | None, path: str | None) -> str:
+    target = normalize_target(target, issue)
     try:
         return str(UUID(target))
     except (ValueError, TypeError, AttributeError):
         pass
-    if target and target.startswith("#"):
-        if not re.fullmatch(r"#[1-9][0-9]*", target):
-            raise ValueError("Issue target must be # followed by a positive issue number.")
-        return issue_session(int(target[1:]), path)
+    if target and (match := re.fullmatch(rf"({ISSUE_REPOSITORY})#([1-9][0-9]*)", target)):
+        return issue_session(int(match[2]), path, repo=match[1])
     with app_server(socket_path(path)) as call:
         threads = list_threads(call)
     matches = [thread for thread in threads if display_cell(thread["name"]) == target]
@@ -638,7 +659,8 @@ def send_task(args) -> int:
         "thread_id": None, "message": args.message, "outcome": "failed", "error": None,
     }
     try:
-        event["thread_id"] = resolve_target(args.thread_id, args.issue, args.socket)
+        event["target"] = normalize_target(args.thread_id, args.issue)
+        event["thread_id"] = resolve_target(event["target"], None, args.socket)
         path = socket_path(args.socket)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         event["error"] = str(exc) or type(exc).__name__
@@ -726,7 +748,7 @@ def main(argv=None) -> int:
     for action in ("read", "status", "send", "run"):
         sub = commands.add_parser(action)
         target = sub.add_mutually_exclusive_group(required=True)
-        target.add_argument("thread_id", nargs="?", help="Session UUID, exact name, or quoted '#NUMBER'")
+        target.add_argument("thread_id", nargs="?", help="Session UUID, exact name, '#NUMBER', OWNER/REPO#NUMBER, or GitHub issue/pull URL")
         target.add_argument("--issue", type=int, help="Issue's latest Codex owner, or its unique Codex session")
         sub.add_argument("--socket", help="Existing local App Server Unix socket path")
         if action == "read":
