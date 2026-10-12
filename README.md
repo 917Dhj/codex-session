@@ -33,6 +33,7 @@ A compatible Codex App Server must already run under the same user. Notification
 ding board
 ding board --all
 ding board --status
+ding board --min-age 600 --min-cpu 10
 ding read UUID
 ding read --head 'Exact session name'
 ding status '#186'
@@ -41,6 +42,7 @@ ding status https://github.com/917Dhj/Human-centric-agents/issues/186
 ding send --issue 186 --message-file message.txt --from coordinator
 printf '%s\n' 'Your message' | ding send UUID --message -
 ding run UUID --message 'Your message' --record exit.jsonl -- python task.py
+ding launch training -- python task.py
 ```
 
 `board` prints tab-separated columns `NAME`, `CWD`, `STATUS`, `ISSUE`, `HEAD`, and `RUN`. `HEAD` contains the first paragraph of the latest final reply. Sessions without a final reply have a blank summary. `RUN` contains the most recently registered run's state, or is blank for sessions without a registered run.
@@ -50,6 +52,12 @@ By default, `board` includes loaded sessions with `idle` or `active` status and 
 With `gh` available, the board looks up issues in the current repository. An issue with a `Codex owner: UUID` line belongs only to its latest owner across the body and comments. Other issues belong to every valid `Codex session: UUID` reference. An invalid latest owner prints a warning and omits that issue. A failed lookup prints a warning to stderr and leaves `ISSUE` blank.
 
 `board --status` replaces `HEAD` with the latest matching executor comment's opening four lines, flattened into one cell. The lines must have nonempty values for `状态:`, `在等:`, `关键数字:`, and `下一步:` in that order. A comment's last `Codex owner` line takes precedence over its `Codex session` lines. Comments match canonical session UUIDs, and the newest comment across the session's mapped issues wins. If that comment has no complete status block, `HEAD` uses the final reply. Failed comment lookups or invalid matching timestamps also use the final reply with a warning. Each distinct visible issue gets one `gh issue view NUMBER --repo OWNER/REPO --json comments` call, with at most four calls at once. Ordinary `board` does not fetch individual issue comments.
+
+On Linux, every `board` invocation also checks local processes owned by the current effective user. When it finds unwrapped work, it appends a separate table with `UNWRAPPED_PID`, `CPU%`, `AGE_SECONDS`, `TMUX_SESSION`, `TMUX_WINDOW`, and `COMMAND`. This check covers the local host regardless of the session table's repository scope or `--all`. Findings remain visible if the session lookup fails; the command still returns that lookup's failure code.
+
+The default minimum process age is 600 seconds. Each tmux pane contributes at most one task, its root workload or the topmost workload beneath its root, regardless of CPU usage. Shells running a script or `-c` command count as workloads, with age measured from the shell's own start time. Shells whose live immediate children are all run wrappers are omitted. Interactive shells without a script or `-c` command are skipped, and idle shell panes are omitted. Processes outside tmux panes must also meet the default 10 percent lifetime CPU usage per core threshold. `--min-age SECONDS` and `--min-cpu PERCENT` accept finite nonnegative values, including CPU thresholds over 100 for multicore jobs. The check uses one `/proc` snapshot without a sampling delay. A process is wrapped when it or a verifiable ancestor is an actual `ding run` or `codex-session run` invocation, including older wrappers without an environment marker. A marker alone does not hide a process after its wrapper dies. Broken or cyclic ancestry, inaccessible processes, zombies, and known infrastructure processes are omitted. Infrastructure includes tmux servers, pure SSH tunnels (`-N`, or forwarding without a remote command), Codex, Claude, common editors, and language services; their workload children are checked independently. The entire `ssh_tunnel` tmux session is excluded. tmux context comes from the ancestor pane PID or a mapped `TMUX_PANE`; it is blank when unavailable. An unavailable `/proc` audit prints a warning.
+
+This is a conservative process heuristic, not a complete task inventory. Outside tmux panes it can miss GPU jobs that use little CPU and other low-utilization jobs. It also omits short jobs and processes whose ancestry cannot be read. It does not query GPUs or remote hosts.
 
 Every target (`send`, `run`, `read`, and `status`) accepts a UUID, an exact name displayed by `board`, a quoted `'#186'`, `--issue 186`, `OWNER/REPO#186`, or `https://github.com/OWNER/REPO/issues/186`. GitHub `/pull/186` links are treated as issues, and a trailing slash, query strings such as `?notification_referrer_id=...`, and fragments such as `#issuecomment-123` are ignored. Qualified issue numbers and links use their explicit repository regardless of the current directory; `'#186'` and `--issue 186` use the current directory's repository. Names are matched across all non-archived sessions. Missing or ambiguous names report candidates. Issue targets use the latest `Codex owner: UUID` line across the body and comments. Without an owner, all `Codex session: UUID` references must identify one session; repeated mentions of the same UUID are allowed. Multiple distinct sessions cause refusal before sending, starting a task, or querying a reply/status. The error lists each candidate's UUID, App Server name and status, comment count, and latest comment creation time and link. A body-only reference has zero comments and uses the issue's creation time and link. Unavailable session metadata is shown as `unknown`. An invalid latest owner or an owner-free invalid session reference also causes refusal. Specify a UUID or exact session name to resolve ambiguity. Quote `#186` so the shell does not treat it as a comment. A session without a name displays its UUID. Control characters and quotes are escaped in board cells and candidate details.
 
@@ -61,13 +69,22 @@ Both `send` and `run` require either `--message TEXT` or `--message-file PATH`. 
 
 ## Long tasks
 
-Run long jobs in tmux. Capture your own session ID before starting tmux and pass it to the wrapper explicitly.
+From the owning Codex session, use `launch` to start a wrapped long job in a dedicated detached tmux session.
 
 ```bash
-thread_id="${CODEX_THREAD_ID:?Run this from the owning Codex session}"
-tmux new-session -d -s long-job ding run "$thread_id" \
-  --message 'Your message' --record "$PWD/exit.jsonl" -- python task.py
+ding launch training -- python task.py
+ding launch evaluation --message 'Evaluation finished; inspect exit.jsonl' \
+  --record "$PWD/exit.jsonl" -- python evaluate.py
+tmux attach -t ding-training
 ```
+
+`launch NAME` creates tmux session `ding-NAME` and its first window `NAME` in the caller's current directory. Names contain 1-64 letters, digits, underscores, or hyphens and start with a letter or digit. Existing names cause an error; sessions are never reused or replaced. The new pane has `remain-on-exit` enabled before the task starts and remains available after the wrapper exits. After inspecting the output and records, the launching executor closes it with `tmux kill-session -t =ding-NAME`. A successful launch reports tmux creation and the absolute record path; it does not mean the task has finished. A launch timeout leaves creation unconfirmed and warns against retrying before inspecting tmux and records.
+
+`launch` reads and validates `CODEX_THREAD_ID` before invoking tmux, and passes the canonical UUID explicitly to `run`. It accepts `--message`, `--message-file`, `--from`, `--record`, and `--socket`. With no message option, the notification is `Task NAME exited; inspect ABSOLUTE_RECORD_PATH`. The default record is `${XDG_STATE_HOME:-~/.local/state}/ding/launch-records/LAUNCH_UUID.jsonl`. Input files, stdin, and the sender prefix are materialized once in the caller into a retained UTF-8 message file `LAUNCH_UUID.message.txt` in that directory, with mode `0600` and directory mode `0700`. Explicit record and socket paths are made absolute before entering tmux.
+
+The inner wrapper uses the current absolute Python interpreter and module file. Each new tmux session receives the caller's `CODEX_THREAD_ID`, `PATH` (or the system default when absent), `HOME`, effective absolute `XDG_STATE_HOME`, and `PYTHONPATH` (empty when absent). Global tmux environment settings are unchanged. Other variables may still come from tmux's environment; pass task-specific settings explicitly, for example `ding launch training -- env CUDA_VISIBLE_DEVICES=0 python train.py`.
+
+Direct `ding run UUID --message TEXT --record PATH -- COMMAND` remains available. Both forms export `DING_RUN_ID` to the wrapped child and its descendants, using the exact registry `run_id` and replacing any inherited outer marker. The caller's environment is unchanged.
 
 Keep the wrapped command in the foreground. `run` records the task's exit, message, and unique client message ID before checking the session. If its status is `active`, notification is skipped permanently, including when restoring an unloaded session reveals active work. An idle or restored session receives the same delivery and execution confirmation as `send`. A failed status check prevents delivery. The wrapper preserves the task's exit code regardless of notification success. Each invocation appends `task_exit` and `notification` JSONL records with a shared `run_id` and client message ID. The wrapper does not rerun the task.
 

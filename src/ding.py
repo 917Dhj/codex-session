@@ -3,8 +3,11 @@
 import argparse
 import ast
 import json
+import math
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -22,6 +25,7 @@ import fcntl
 
 
 ISSUE_REPOSITORY = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+SHELL_PROGRAMS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
 
 
 class AppServerError(ValueError):
@@ -657,6 +661,289 @@ def executor_comment_heads(mapping: dict[str, set[int]]) -> dict[str, str]:
     return heads
 
 
+def process_snapshot(proc: Path = Path("/proc")) -> dict[int, dict]:
+    try:
+        uptime = float((proc / "uptime").read_text().split()[0])
+        ticks = os.sysconf("SC_CLK_TCK")
+        directories = list(proc.iterdir())
+        if not math.isfinite(uptime) or uptime < 0 or ticks <= 0:
+            raise ValueError("invalid process clock")
+    except (OSError, ValueError, IndexError) as exc:
+        print(f"ding: local process audit unavailable ({proc}): {exc}", file=sys.stderr)
+        return {}
+    processes = {}
+    for directory in directories:
+        if not directory.name.isdecimal():
+            continue
+        try:
+            fields = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+            age = uptime - int(fields[19]) / ticks
+            cpu = (int(fields[11]) + int(fields[12])) / ticks / age * 100 if age > 0 else 0
+            raw = (directory / "cmdline").read_bytes()
+            parts = raw.split(b"\0") if raw else []
+            if parts and parts[-1] == b"":
+                parts.pop()
+            argv = [part.decode("utf-8", errors="replace") for part in parts]
+            uid = directory.stat().st_uid
+            current = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(current[19]) != int(fields[19]):
+                continue
+            processes[int(directory.name)] = {
+                "pid": int(directory.name), "ppid": int(fields[1]), "state": current[0],
+                "age": age, "cpu": cpu, "argv": argv, "uid": uid,
+            }
+        except (OSError, ValueError, IndexError, ArithmeticError):
+            continue
+    return processes
+
+
+def process_command(argv: list[str]) -> tuple[str, list[str]]:
+    if not argv:
+        return "", []
+    executable = Path(argv[0]).name
+    if re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?", executable):
+        index = 1
+        while index < len(argv):
+            value = argv[index]
+            if value == "--":
+                index += 1
+                break
+            if not value.startswith("-"):
+                break
+            if value == "-" or value.startswith("--"):
+                return argv[0], []
+            for offset, option in enumerate(value[1:], 2):
+                if option == "c":
+                    return argv[0], []
+                if option == "m":
+                    if value[offset:]:
+                        return value[offset:], argv[index + 1:]
+                    return (argv[index + 1], argv[index + 2:]) if index + 1 < len(argv) else (argv[0], [])
+                if option in {"W", "X"}:
+                    if not value[offset:]:
+                        index += 1
+                    break
+                if option not in "bBdEiIOPqRsSuvx":
+                    return argv[0], []
+            index += 1
+        if index < len(argv):
+            return argv[index], argv[index + 1:]
+    elif executable in {"node", "nodejs"}:
+        index = 1
+        while index < len(argv) and argv[index].startswith("-"):
+            value = argv[index]
+            if value == "--":
+                index += 1
+                break
+            if (value.split("=", 1)[0] in {"--eval", "--print"}
+                    or value.startswith(("-e", "-p"))):
+                return argv[0], []
+            if value in {"-r", "--require", "--loader", "--import", "--title"}:
+                index += 2
+            elif (value.startswith("-r") or value.split("=", 1)[0] in {
+                    "--require", "--loader", "--import", "--title", "--inspect", "--inspect-brk"}
+                  or value in {"--enable-source-maps", "--no-warnings", "--trace-warnings"}):
+                index += 1
+            else:
+                return argv[0], []
+        if index < len(argv):
+            return argv[index], argv[index + 1:]
+    return argv[0], argv[1:]
+
+
+def is_run_wrapper(argv: list[str]) -> bool:
+    program, arguments = process_command(argv)
+    return Path(program).name in {"ding", "ding.py", "codex-session"} and bool(arguments) and arguments[0] == "run"
+
+
+def infrastructure_process(argv: list[str]) -> bool:
+    program, arguments = process_command(argv)
+    name = Path(program).name
+    if name == "ssh":
+        forwarding = False
+        no_session = False
+        destination = False
+        index = 0
+        while index < len(arguments):
+            value = arguments[index]
+            if value == "--":
+                return ((no_session and (destination or index + 1 < len(arguments)))
+                        or forwarding and index + (1 if destination else 2) == len(arguments))
+            if not value.startswith("-") or value == "-":
+                if destination:
+                    return no_session
+                destination = True
+                index += 1
+                continue
+            for offset, option in enumerate(value[1:], 2):
+                if option == "N":
+                    no_session = True
+                elif option in "BbcDEeFIiJLlmOopPQRSWw":
+                    forwarding |= option in "DLRW"
+                    if not value[offset:]:
+                        index += 1
+                        if index == len(arguments):
+                            return False
+                    break
+                elif option not in "46AaCfGgKkMNnqsTtVvXxYy":
+                    return False
+            index += 1
+        return (no_session or forwarding) and destination
+    return (name.startswith("tmux:") or name in {
+        "tmux", "sshd", "autossh", "cloudflared", "codex", "codex.js", "codex.py",
+        "claude", "claude.js", "code", "code-server", "vscode-server", "server-main.js",
+        "vim", "nvim", "emacs", "zed", "sublime_text", "idea", "pycharm",
+        "clangd", "gopls", "rust-analyzer", "pylsp", "pyright", "pyright-langserver",
+        "pyright-langserver.js", "tsserver", "tsserver.js", "typescript-language-server",
+        "eslintServer.js", "vscode-json-languageserver", "yaml-language-server",
+    } or bool(re.fullmatch(r"codex-[A-Za-z0-9_-]+", name))
+        or (name == "cli.js" and "claude-code" in Path(program).parts)
+        or bool({".vscode-server", ".vscode-remote"}.intersection(Path(program).parts)))
+
+
+def tmux_panes() -> dict[int, dict]:
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return {}
+    try:
+        result = subprocess.run([tmux, "list-panes", "-a", "-F",
+                                 "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_name}"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    panes = {}
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) == 4 and fields[0].isdecimal():
+                panes[int(fields[0])] = {"pane_id": fields[1], "session": fields[2], "window": fields[3]}
+    return panes
+
+
+def interactive_shell(argv: list[str]) -> bool:
+    if not argv or Path(argv[0]).name.lstrip("-") not in SHELL_PROGRAMS:
+        return False
+    arguments = iter(argv[1:])
+    for value in arguments:
+        if value == "--":
+            return next(arguments, None) is None
+        if value in {"--rcfile", "--init-file"}:
+            next(arguments, None)
+        elif not value.startswith(("-", "+")) or value == "-":
+            return False
+        elif not value.startswith("--"):
+            for offset, option in enumerate(value[1:], 2):
+                if option == "c" and value.startswith("-"):
+                    return False
+                if option in "oO":
+                    if not value[offset:]:
+                        next(arguments, None)
+                    break
+    return True
+
+
+def unwrapped_processes(processes: dict[int, dict], panes: dict[int, dict], *,
+                        min_age: float, min_cpu: float, proc: Path = Path("/proc")) -> list[dict]:
+    pane_ids = {pane["pane_id"]: pane for pane in panes.values()}
+    wrapper_parents, other_parents = set(), set()
+    for child in processes.values():
+        if child["state"] not in {"Z", "X", "x"}:
+            parents = wrapper_parents if is_run_wrapper(child["argv"]) else other_parents
+            parents.add(child["ppid"])
+    wrapper_only_parents = wrapper_parents - other_parents
+    findings = []
+    pane_findings = {}
+    for pid, process in sorted(processes.items()):
+        if (process["uid"] != os.geteuid() or process["state"] in {"Z", "X", "x"} or not process["argv"]
+                or process["age"] <= 0
+                or infrastructure_process(process["argv"])):
+            continue
+        ancestors, seen, current, wrapped, complete = [], set(), pid, False, False
+        pane = None
+        pane_chain = []
+        while current and current not in seen:
+            seen.add(current)
+            ancestor = processes.get(current)
+            if ancestor is None:
+                break
+            ancestors.append(current)
+            if is_run_wrapper(ancestor["argv"]):
+                wrapped = True
+                break
+            if pane is None and current in panes:
+                pane = panes[current]
+                pane_chain = ancestors.copy()
+            if current == 1 or ancestor["ppid"] == 0:
+                complete = True
+                break
+            current = ancestor["ppid"]
+        if wrapped or not complete:
+            continue
+        fallback = pane is None
+        if pane is None:
+            for offset, ancestor_pid in enumerate(ancestors):
+                try:
+                    environment = (proc / str(ancestor_pid) / "environ").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                pane_id = next((value[len(b"TMUX_PANE="):].decode("utf-8", errors="replace")
+                                for value in environment if value.startswith(b"TMUX_PANE=")), None)
+                if pane_id in pane_ids:
+                    if pane is None or pane["pane_id"] == pane_id:
+                        pane = pane_ids[pane_id]
+                        pane_chain = ancestors[:offset + 1]
+        if pane is not None:
+            if pane["session"] == "ssh_tunnel":
+                continue
+            for depth, ancestor_pid in enumerate(reversed(pane_chain)):
+                candidate = processes[ancestor_pid]
+                if (not candidate["argv"] or interactive_shell(candidate["argv"])
+                        or (ancestor_pid in wrapper_only_parents
+                            and Path(candidate["argv"][0]).name.lstrip("-") in SHELL_PROGRAMS)
+                        or infrastructure_process(candidate["argv"])):
+                    continue
+                process = candidate
+                break
+            else:
+                continue
+            if (process["uid"] != os.geteuid() or process["state"] in {"Z", "X", "x"}
+                    or process["age"] <= 0 or process["age"] < min_age):
+                continue
+            rank = (fallback, depth, process["pid"])
+            previous = pane_findings.get(pane["pane_id"])
+            if previous is None or rank < previous[0]:
+                pane_findings[pane["pane_id"]] = (rank, {**process, "session": pane["session"],
+                                                       "window": pane["window"]})
+        elif process["age"] >= min_age and process["cpu"] >= min_cpu:
+            findings.append({**process, "session": "", "window": ""})
+    findings.extend(row for _, row in pane_findings.values())
+    return sorted(findings, key=lambda row: row["pid"])
+
+
+def unwrapped_tasks(*, min_age: float = 600, min_cpu: float = 10) -> list[dict]:
+    return unwrapped_processes(process_snapshot(), tmux_panes(), min_age=min_age, min_cpu=min_cpu)
+
+
+def show_unwrapped(findings: list[dict]) -> None:
+    if not findings:
+        return
+    print("\nUNWRAPPED_PID\tCPU%\tAGE_SECONDS\tTMUX_SESSION\tTMUX_WINDOW\tCOMMAND")
+    for process in findings:
+        cells = [str(process["pid"]), f"{process['cpu']:.1f}", f"{process['age']:.0f}",
+                 process["session"], process["window"], shlex.join(process["argv"])]
+        print("\t".join(display_cell(cell) for cell in cells))
+
+
+def nonnegative_number(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite nonnegative number") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite nonnegative number")
+    return number
+
+
 def show_board(path: str | None, *, all_threads: bool = False, status: bool = False) -> None:
     roots = [] if all_threads else repository_roots()
     runs = latest_runs()
@@ -917,9 +1204,9 @@ def send_task(args) -> int:
         130 if event["error"] == "KeyboardInterrupt" else 1)
 
 
-def task_exit_code(command: list[str]) -> tuple[int, str | None]:
+def task_exit_code(command: list[str], *, env: dict | None = None) -> tuple[int, str | None]:
     try:
-        child = subprocess.Popen(command)
+        child = subprocess.Popen(command, env=env)
     except OSError as exc:
         return (127 if isinstance(exc, FileNotFoundError) else 126), str(exc)
     try:
@@ -938,7 +1225,9 @@ def task_exit_code(command: list[str]) -> tuple[int, str | None]:
 def run_task(args, command: list[str]) -> int:
     record = Path(args.record)
     with writer(record), registered_run(args.thread_id, record) as run_id:
-        code, error = task_exit_code(command)
+        child_env = os.environ.copy()
+        child_env["DING_RUN_ID"] = run_id
+        code, error = task_exit_code(command, env=child_env)
         client_id = str(uuid4())
         append_jsonl(record, {
             "event": "task_exit", "run_id": run_id, "thread_id": args.thread_id,
@@ -967,44 +1256,113 @@ def run_task(args, command: list[str]) -> int:
         return code
 
 
+def launch_task(args, command: list[str]) -> int:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.name):
+        raise ValueError("launch name must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit")
+    try:
+        thread_id = str(UUID(os.environ.get("CODEX_THREAD_ID", "")))
+    except ValueError as exc:
+        raise ValueError("launch requires a valid CODEX_THREAD_ID in the calling session") from exc
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        raise ValueError("tmux executable not found in the caller's PATH")
+    launch_id = str(uuid4())
+    launch_records = (run_registry().parent / "launch-records").resolve()
+    record = (Path(args.record) if args.record else launch_records / f"{launch_id}.jsonl").resolve()
+    message = message_text(args.message if args.message is not None else
+                           f"Task {args.name} exited; inspect {record}", args.message_file, args.sender)
+    inner = [os.path.abspath(sys.executable), str(Path(__file__).resolve()), "run", thread_id,
+             "--record", str(record)]
+    launch_records.mkdir(parents=True, exist_ok=True, mode=0o700)
+    launch_records.chmod(0o700)
+    message_path = launch_records / f"{launch_id}.message.txt"
+    with os.fdopen(os.open(message_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+                   "w", encoding="utf-8", newline="") as handle:
+        handle.write(message)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(launch_records)
+    inner.extend(["--message-file", str(message_path)])
+    if args.socket is not None:
+        inner.extend(["--socket", str(Path(args.socket).resolve())])
+    inner.extend(["--", *command])
+    environment = {
+        "CODEX_THREAD_ID": thread_id, "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.environ.get("HOME") or str(Path.home()),
+        "XDG_STATE_HOME": str(run_registry().parent.parent.resolve()),
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+    }
+    arguments = [str(Path(tmux).absolute()), "new-session", "-d", "-s", f"ding-{args.name}",
+                 "-n", args.name, "-c", str(Path.cwd())]
+    for key, value in environment.items():
+        arguments.extend(["-e", f"{key}={value}"])
+    prelude = (f'{shlex.quote(str(Path(tmux).absolute()))} set-option -p -t "$TMUX_PANE" '
+               f'remain-on-exit on && exec {shlex.join(inner)}')
+    arguments.extend(["-P", "-F", "#{session_name}\t#{window_name}", "/bin/sh", "-c", prelude])
+    # tmux treats a trailing semicolon as a command separator even in argv values.
+    arguments = [value[:-1] + r"\;" if value.endswith(";") else value for value in arguments]
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("tmux launch timed out; task creation is unconfirmed; inspect tmux and run records before retrying") from exc
+    if result.returncode:
+        raise ValueError(f"tmux launch failed: {result.stderr.strip() or result.returncode}")
+    print(f"ding: created ding-{args.name}/{args.name}; record: {record}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ding", description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    board = commands.add_parser("board", help="List sessions and their final reply summaries")
+    board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
     board.add_argument("--status", action="store_true", help="Show the latest executor comment status block")
     board.add_argument("--socket", help="Existing local App Server Unix socket path")
-    for action in ("read", "status", "send", "run"):
+    board.add_argument("--min-age", type=nonnegative_number, default=600,
+                       help="Minimum age in seconds for the local unwrapped process audit (default: 600)")
+    board.add_argument("--min-cpu", type=nonnegative_number, default=10,
+                       help="Minimum lifetime CPU percent per core outside tmux panes (default: 10)")
+    for action in ("read", "status", "send", "run", "launch"):
         sub = commands.add_parser(action)
-        target = sub.add_mutually_exclusive_group(required=True)
-        target.add_argument("thread_id", nargs="?", help="Session UUID, exact name, '#NUMBER', OWNER/REPO#NUMBER, or GitHub issue/pull URL")
-        target.add_argument("--issue", type=int, help="Issue's latest Codex owner, or its unique Codex session")
+        if action == "launch":
+            sub.add_argument("name", help="Name of the dedicated ding-NAME tmux session and its first window")
+        else:
+            target = sub.add_mutually_exclusive_group(required=True)
+            target.add_argument("thread_id", nargs="?", help="Session UUID, exact name, '#NUMBER', OWNER/REPO#NUMBER, or GitHub issue/pull URL")
+            target.add_argument("--issue", type=int, help="Issue's latest Codex owner, or its unique Codex session")
         sub.add_argument("--socket", help="Existing local App Server Unix socket path")
         if action == "read":
             sub.add_argument("--head", action="store_true", help="Print only the first paragraph of the final reply")
-        if action in {"send", "run"}:
-            message = sub.add_mutually_exclusive_group(required=True)
+        if action in {"send", "run", "launch"}:
+            message = sub.add_mutually_exclusive_group(required=action != "launch")
             message.add_argument("--message", help="Message text, or '-' to read stdin")
             message.add_argument("--message-file", help="UTF-8 message file")
             sub.add_argument("--from", dest="sender", help="Prefix the message with '[from NAME]' on its own line")
-        if action == "run":
-            sub.add_argument("--record", required=True, help="Append-only local exit/notification JSONL")
-            sub.epilog = "Task command follows --, for example: run UUID --message TEXT --record exit.jsonl -- python task.py"
+        if action in {"run", "launch"}:
+            sub.add_argument("--record", required=action == "run", help="Append-only local exit/notification JSONL")
+            sub.epilog = ("Task command follows --, for example: launch NAME -- python task.py" if action == "launch" else
+                          "Task command follows --, for example: run UUID --message TEXT --record exit.jsonl -- python task.py")
     argv = list(sys.argv[1:] if argv is None else argv)
     command = []
-    if argv and argv[0] == "run" and "--" in argv:
+    if argv and argv[0] in {"run", "launch"} and "--" in argv:
         separator = argv.index("--")
         command = argv[separator + 1:]
         argv = argv[:separator]
     args = parser.parse_args(argv)
-    if args.action != "board" and args.issue is not None and args.issue <= 0:
+    if args.action not in {"board", "launch"} and args.issue is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
-    if args.action == "run" and not command:
-        parser.error("run requires a task command after --")
+    if args.action in {"run", "launch"} and not command:
+        parser.error(f"{args.action} requires a task command after --")
     try:
         if args.action == "board":
-            show_board(args.socket, all_threads=args.all, status=args.status)
+            findings = unwrapped_tasks(min_age=args.min_age, min_cpu=args.min_cpu)
+            try:
+                show_board(args.socket, all_threads=args.all, status=args.status)
+            finally:
+                show_unwrapped(findings)
             return 0
+        if args.action == "launch":
+            return launch_task(args, command)
         if args.action in {"send", "run"}:
             args.message = message_text(args.message, args.message_file, args.sender)
         if args.action == "send":
