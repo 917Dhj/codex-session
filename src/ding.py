@@ -13,7 +13,9 @@ import sys
 import time
 from uuid import UUID, uuid4
 
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
+from datetime import datetime
 from typing import Iterator
 
 import fcntl
@@ -23,6 +25,10 @@ ISSUE_REPOSITORY = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 
 
 class AppServerError(ValueError):
+    pass
+
+
+class AppServerUnavailable(ValueError):
     pass
 
 
@@ -89,7 +95,7 @@ def initialize(ws, *, deadline: float | None = None):
             ws.settimeout(remaining)
             raw = ws.recv()
             if not raw:
-                raise ValueError("App Server closed the connection before replying.")
+                raise AppServerUnavailable("App Server closed the connection before replying.")
             response = json.loads(raw)
             if not isinstance(response, dict):
                 raise ValueError("Malformed App Server response.")
@@ -178,7 +184,7 @@ def app_server(path: str, *, deadline: float | None = None):
             finally:
                 ws.close()
     except websocket.WebSocketException as exc:
-        raise ValueError(str(exc)) from exc
+        raise AppServerUnavailable(str(exc)) from exc
 
 
 def query(thread_id: str, path: str, *, status_only: bool = False):
@@ -474,23 +480,240 @@ def reply_head(text: str) -> str:
     return re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n"), maxsplit=1)[0].strip()
 
 
-def show_board(path: str, *, all_threads: bool = False) -> None:
-    roots = [] if all_threads else repository_roots()
-    with app_server(path) as call:
-        threads = list_threads(call) if all_threads else board_threads(call, roots)
-        rows = []
-        for thread in threads:
+def run_registry() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "ding/runs.jsonl"
+
+
+@contextmanager
+def registered_run(thread_id: str, record: Path) -> Iterator[str]:
+    registry = run_registry()
+    registry.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    registry.parent.chmod(0o700)
+    locks = registry.parent / "run-locks"
+    locks.mkdir(exist_ok=True, mode=0o700)
+    locks.chmod(0o700)
+    run_id = str(uuid4())
+    with writer(locks / f"{run_id}.lock"):
+        _fsync_directory(locks)
+        with writer(registry, blocking=True):
+            registry.chmod(0o600)
+            with registry.open("r+b") as handle:
+                if handle.seek(0, os.SEEK_END):
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+            append_jsonl(registry, {
+                "event": "run_start", "run_id": run_id, "thread_id": thread_id,
+                "record": str(record.resolve()), "pid": os.getpid(),
+                "started_ns": time.time_ns(), "cwd": str(Path.cwd()),
+            })
+        yield run_id
+
+
+def latest_runs() -> dict[str, dict]:
+    registry = run_registry()
+    try:
+        lines = registry.read_bytes().splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        print(f"ding: run registry unavailable ({registry}): {exc}", file=sys.stderr)
+        return {}
+    runs = {}
+    for number, line in enumerate(lines, 1):
+        try:
+            run = json.loads(line)
+            if (not isinstance(run, dict) or run.get("event") != "run_start"
+                    or any(not isinstance(run.get(key), str) for key in ("run_id", "thread_id", "record", "cwd"))
+                    or str(UUID(run["run_id"])) != run["run_id"]
+                    or str(UUID(run["thread_id"])) != run["thread_id"]
+                    or not Path(run["record"]).is_absolute() or not Path(run["cwd"]).is_absolute()
+                    or type(run.get("pid")) is not int or run["pid"] <= 0
+                    or type(run.get("started_ns")) is not int or run["started_ns"] <= 0):
+                raise ValueError("invalid run_start")
+        except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
+            print(f"ding: invalid run registry row {number} ({registry}): {exc}", file=sys.stderr)
+            continue
+        runs[run["thread_id"]] = run
+    return runs
+
+
+def run_state(run: dict) -> str:
+    try:
+        alive = False
+        try:
+            with (run_registry().parent / "run-locks" / f"{run['run_id']}.lock").open("r") as token:
+                try:
+                    fcntl.flock(token.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    alive = True
+        except FileNotFoundError:
+            pass
+        try:
+            raw = Path(run["record"]).read_bytes()
+        except FileNotFoundError:
+            raw = b""
+        lines = raw.splitlines()
+        task_exit, notification = None, None
+        for index, line in enumerate(lines):
             try:
-                head = reply_head(read_reply(call, thread["id"]))
-            except NoFinalReply:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError):
+                if index == len(lines) - 1 and not raw.endswith(b"\n"):
+                    print(f"ding: ignoring incomplete run record tail ({run['record']})", file=sys.stderr)
+                    break
+                raise
+            if (not isinstance(event, dict) or not isinstance(event.get("run_id"), str)
+                    or not event["run_id"] or not isinstance(event.get("event"), str)):
+                raise ValueError("invalid record event")
+            if event.get("run_id") != run["run_id"]:
+                continue
+            if event.get("thread_id") != run["thread_id"]:
+                raise ValueError("record thread_id does not match run")
+            if event.get("event") == "task_exit":
+                if type(event.get("exit_code")) is not int:
+                    raise ValueError("invalid task exit code")
+                task_exit = event
+            elif event.get("event") == "notification":
+                if not isinstance(event.get("outcome"), str) or event["outcome"] not in {
+                        "started", "queued_behind_active", "skipped_active", "queue_failed",
+                        "failed", "unknown", "queued"}:
+                    raise ValueError("invalid notification outcome")
+                notification = event
+        if task_exit is None:
+            if notification is not None:
+                raise ValueError("notification without task_exit")
+            return "running" if alive else "lost"
+        if notification is not None:
+            if notification["outcome"] in {"queue_failed", "failed", "unknown", "queued"}:
+                return "notify_failed"
+        elif not alive:
+            return "notify_failed"
+        return f"exited({task_exit['exit_code']})"
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"ding: run evidence unavailable ({run['record']}): {exc}", file=sys.stderr)
+        return "unknown"
+
+
+def executor_comment_heads(mapping: dict[str, set[int]]) -> dict[str, str]:
+    numbers = sorted({number for issues in mapping.values() for number in issues})
+    if not numbers:
+        return {}
+    try:
+        repo = github_repository()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"ding: executor comment lookup failed: {exc}", file=sys.stderr)
+        return {}
+
+    def fetch(number):
+        try:
+            result = gh_json(["issue", "view", str(number), "--repo", repo, "--json", "comments"])
+            comments = result.get("comments") if isinstance(result, dict) else None
+            if (not isinstance(comments, list) or any(not isinstance(comment, dict)
+                    or not isinstance(comment.get("body"), str) for comment in comments)):
+                raise ValueError("Malformed gh comments.")
+            return number, comments
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"ding: executor comment lookup failed for #{number}: {exc}", file=sys.stderr)
+            return number, None
+
+    latest, uncertain = {}, set()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for number, comments in pool.map(fetch, numbers):
+            if comments is None:
+                uncertain.update(thread_id for thread_id, issues in mapping.items() if number in issues)
+                continue
+            for ordinal, comment in enumerate(comments):
+                owners = session_references(comment["body"], "owner")
+                values = owners[-1:] if owners else session_references(comment["body"])
+                ids = set()
+                for value in values:
+                    try:
+                        ids.add(str(UUID(value)))
+                    except ValueError:
+                        continue
+                ids = {thread_id for thread_id in ids if number in mapping.get(thread_id, set())}
+                if not ids:
+                    continue
+                try:
+                    created = datetime.fromisoformat(comment.get("createdAt", "").replace("Z", "+00:00"))
+                    if created.tzinfo is None:
+                        raise ValueError("missing timezone")
+                    timestamp = created.timestamp()
+                except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                    print(f"ding: invalid executor comment timestamp for #{number}; using final reply", file=sys.stderr)
+                    uncertain.update(ids)
+                    continue
+                order = timestamp, ordinal, number
+                for thread_id in ids:
+                    if thread_id not in latest or order >= latest[thread_id][0]:
+                        latest[thread_id] = order, comment["body"]
+    heads = {}
+    for thread_id, (_, body) in latest.items():
+        lines = body.replace("\r\n", "\n").lstrip().splitlines()
+        if thread_id not in uncertain and len(lines) >= 4 and all(re.match(rf"^[ \t]*{label}:[ \t]*\S", line)
+                                  for label, line in zip(("状态", "在等", "关键数字", "下一步"), lines)):
+            heads[thread_id] = " ".join(line.strip() for line in lines[:4])
+    return heads
+
+
+def show_board(path: str | None, *, all_threads: bool = False, status: bool = False) -> None:
+    roots = [] if all_threads else repository_roots()
+    runs = latest_runs()
+    try:
+        server_path = socket_path(path)
+    except (OSError, ValueError) as exc:
+        if not runs:
+            raise
+        print(f"ding: App Server unavailable: {exc}", file=sys.stderr)
+        server_path = None
+    try:
+        with ExitStack() as stack:
+            call = stack.enter_context(app_server(server_path)) if server_path else None
+            threads = (list_threads(call) if all_threads else board_threads(call, roots)) if call else []
+            known = {thread["id"] for thread in threads}
+            for thread_id, run in runs.items():
+                if thread_id in known:
+                    continue
+                thread = {"id": thread_id, "name": thread_id, "cwd": run["cwd"],
+                          "status": {"type": "unavailable"}}
+                if call:
+                    try:
+                        thread = thread_metadata(call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread"))
+                        if thread["id"] != thread_id:
+                            raise ValueError("App Server returned a different thread ID.")
+                    except (AppServerError, OSError) as exc:
+                        print(f"ding: run session metadata unavailable ({thread_id}): {exc}", file=sys.stderr)
+                if all_threads or any(Path(thread["cwd"]).resolve().is_relative_to(root) for root in roots):
+                    threads.append(thread)
+            rows = []
+            for thread in threads:
                 head = ""
-            rows.append([thread["name"], thread["cwd"], thread["status"]["type"],
-                         thread["id"], " ".join(head.splitlines())])
+                if call:
+                    try:
+                        head = reply_head(read_reply(call, thread["id"]))
+                    except NoFinalReply:
+                        pass
+                    except (AppServerError, OSError) as exc:
+                        if thread["id"] not in runs:
+                            raise
+                        print(f"ding: run session reply unavailable ({thread['id']}): {exc}", file=sys.stderr)
+                rows.append([thread["name"], thread["cwd"], thread["status"]["type"],
+                             thread["id"], " ".join(head.splitlines())])
+    except (AppServerUnavailable, OSError) as exc:
+        if not runs:
+            raise
+        print(f"ding: App Server unavailable: {exc}", file=sys.stderr)
+        rows = [[thread_id, run["cwd"], "unavailable", thread_id, ""]
+                for thread_id, run in runs.items()
+                if all_threads or any(Path(run["cwd"]).resolve().is_relative_to(root) for root in roots)]
     mapping = issue_map()
-    print("NAME\tCWD\tSTATUS\tISSUE\tHEAD")
+    heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}) if status else {}
+    print("NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN")
     for name, cwd, status, thread_id, head in rows:
         issue = ",".join(f"#{number}" for number in sorted(mapping.get(thread_id, set())))
-        print("\t".join(display_cell(cell) for cell in [name, cwd, status, issue, head]))
+        state = run_state(runs[thread_id]) if thread_id in runs else ""
+        print("\t".join(display_cell(cell) for cell in [name, cwd, status, issue, heads.get(thread_id, head), state]))
 
 
 def socket_path(explicit: str | None) -> str:
@@ -714,8 +937,7 @@ def task_exit_code(command: list[str]) -> tuple[int, str | None]:
 
 def run_task(args, command: list[str]) -> int:
     record = Path(args.record)
-    run_id = str(uuid4())
-    with writer(record):
+    with writer(record), registered_run(args.thread_id, record) as run_id:
         code, error = task_exit_code(command)
         client_id = str(uuid4())
         append_jsonl(record, {
@@ -750,6 +972,7 @@ def main(argv=None) -> int:
     commands = parser.add_subparsers(dest="action", required=True)
     board = commands.add_parser("board", help="List sessions and their final reply summaries")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
+    board.add_argument("--status", action="store_true", help="Show the latest executor comment status block")
     board.add_argument("--socket", help="Existing local App Server Unix socket path")
     for action in ("read", "status", "send", "run"):
         sub = commands.add_parser(action)
@@ -780,7 +1003,7 @@ def main(argv=None) -> int:
         parser.error("run requires a task command after --")
     try:
         if args.action == "board":
-            show_board(socket_path(args.socket), all_threads=args.all)
+            show_board(args.socket, all_threads=args.all, status=args.status)
             return 0
         if args.action in {"send", "run"}:
             args.message = message_text(args.message, args.message_file, args.sender)

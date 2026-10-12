@@ -1016,8 +1016,8 @@ def test_board_repo_worktree_scope_and_final_only(monkeypatch, tmp_path, capsys,
     output = capsys.readouterr().out
     lines = output.splitlines()
     assert len(lines) == (4 if all_threads else 3)
-    assert lines[1].split("\t")[2:] == ["active", "#1", "状态: 完成 在等: 无"]
-    assert lines[2].split("\t")[-1] == ""
+    assert lines[1].split("\t")[2:] == ["active", "#1", "状态: 完成 在等: 无", ""]
+    assert lines[2].split("\t")[4:] == ["", ""]
     assert "first user message" not in output
     assert "Long details" not in output
     assert ("Outside" in output) == all_threads
@@ -1392,7 +1392,7 @@ def test_board_issue_failure_warns_and_still_succeeds(monkeypatch, capsys, error
     monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *a: {"data": []}))
     assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
     output = capsys.readouterr()
-    assert output.out == "NAME\tCWD\tSTATUS\tISSUE\tHEAD\n"
+    assert output.out == "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n"
     assert len(output.err.splitlines()) == 1
     assert output.err.startswith("ding: issue lookup failed:")
 
@@ -1834,3 +1834,375 @@ def test_short_issue_target_outside_repository_explains_alternatives(monkeypatch
     monkeypatch.setattr(ding, "github_repository", missing)
     with pytest.raises(ValueError, match=r"elsewhere use OWNER/REPO#42 or the issue URL"):
         ding.resolve_target("#42", None, None)
+
+
+def test_run_registration_precedes_child_and_registration_failure_prevents_launch(tmp_path, monkeypatch):
+    record = tmp_path / "record.jsonl"
+    seen = []
+
+    def child(command):
+        run = ding.latest_runs()[THREAD_ID]
+        assert run["record"] == str(record)
+        assert run["pid"] == ding.os.getpid()
+        assert ding.run_state(run) == "running"
+        seen.append(run["run_id"])
+        return 7, None
+
+    monkeypatch.setattr(ding, "task_exit_code", child)
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "started", "error": None})
+    args = ["run", THREAD_ID, "--message", "done", "--record", str(record), "--socket", "/fake.sock", "--", "task"]
+    assert ding.main(args) == 7
+    assert {event["run_id"] for event in records(record)} == set(seen)
+    registry = ding.run_registry()
+    registry.unlink()
+    registry.mkdir()
+    assert ding.main(args) == 1
+    assert len(seen) == 1
+
+
+def test_run_lock_is_not_inherited_by_wrapped_process(tmp_path):
+    with ding.registered_run(THREAD_ID, tmp_path / "record.jsonl") as run_id:
+        script = (
+            "import os, sys\n"
+            "for fd in os.listdir('/proc/self/fd'):\n"
+            "    try: target = os.readlink('/proc/self/fd/' + fd)\n"
+            "    except OSError: continue\n"
+            "    assert sys.argv[1] not in target, target\n"
+        )
+        result = subprocess.run([ding.sys.executable, "-c", script, run_id],
+                                capture_output=True, text=True, close_fds=False, timeout=5)
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_board_reports_unloaded_lost_runs_without_mutation(tmp_path, monkeypatch, capsys, offline):
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/loaded/list":
+            return {"data": []}
+        if method == "thread/read":
+            return {"thread": thread(cwd=str(tmp_path), status="notLoaded")}
+        if method == "thread/turns/list":
+            return {"data": []}
+        pytest.fail(method)
+
+    def server(path):
+        if offline:
+            raise OSError("offline")
+        return server_calls(call)
+
+    monkeypatch.setattr(ding, "app_server", server)
+    monkeypatch.setattr(ding, "repository_roots", lambda: [tmp_path, Path.cwd()])
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--socket", "/fake.sock"]) == 0
+    captured = capsys.readouterr()
+    header, row = captured.out.splitlines()
+    assert header.split("\t") == ["NAME", "CWD", "STATUS", "ISSUE", "HEAD", "RUN"]
+    assert row.split("\t")[2] == ("unavailable" if offline else "notLoaded")
+    assert row.split("\t")[-1] == "lost"
+    assert calls == ([] if offline else ["thread/loaded/list", "thread/read", "thread/turns/list"])
+
+
+def test_board_latest_run_is_selected_before_scope_and_metadata_cwd_controls_scope(tmp_path, monkeypatch, capsys):
+    with ding.registered_run(THREAD_ID, tmp_path / "old.jsonl"):
+        pass
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    with ding.registered_run(THREAD_ID, tmp_path / "latest.jsonl"):
+        pass
+    with ding.registered_run(OTHER_ID, tmp_path / "outside.jsonl"):
+        pass
+    root = tmp_path / "repo"
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method in {"thread/loaded/list", "thread/list"}:
+            return {"data": []}
+        if method == "thread/read":
+            return {"thread": thread(params["threadId"], cwd=str(root) if params["threadId"] == THREAD_ID
+                                     else str(outside), status="notLoaded")}
+        if method == "thread/turns/list":
+            return {"data": []}
+        pytest.fail(method)
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "repository_roots", lambda: [root])
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--socket", "/fake.sock"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    assert len([item for item in calls if item[0] == "thread/read"]) == 2
+    assert ding.main(["board", "--all", "--socket", "/fake.sock"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 3
+
+
+def test_registered_runs_do_not_hide_malformed_app_server_metadata(tmp_path, monkeypatch, capsys):
+    with ding.registered_run(THREAD_ID, tmp_path / "record.jsonl"):
+        pass
+
+    def call(method, params):
+        if method == "thread/loaded/list":
+            return {"data": []}
+        return {"thread": {"id": THREAD_ID, "cwd": 1}}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "repository_roots", lambda: [tmp_path])
+    assert ding.main(["board", "--socket", "/fake.sock"]) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "Malformed App Server thread metadata" in captured.err
+
+
+@pytest.mark.parametrize("all_threads", [False, True])
+def test_board_initial_listing_transport_failure_uses_registered_runs(tmp_path, monkeypatch, capsys, all_threads):
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        raise OSError("connection lost")
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "repository_roots", lambda: [Path.cwd()])
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--socket", "/fake.sock", *(["--all"] if all_threads else [])]) == 0
+    captured = capsys.readouterr()
+    row = captured.out.splitlines()[1].split("\t")
+    assert row == [THREAD_ID, str(Path.cwd()), "unavailable", "", "", "lost"]
+    assert calls == ["thread/list" if all_threads else "thread/loaded/list"]
+    assert "App Server unavailable: connection lost" in captured.err
+
+
+@pytest.mark.parametrize("reply", [{"result": None}, {"error": "bad"}, "not JSON"])
+def test_board_registry_does_not_hide_malformed_initialize(tmp_path, monkeypatch, capsys, reply):
+    websocket = pytest.importorskip("websocket")
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+    ws = Connection([reply])
+    monkeypatch.setattr(websocket, "create_connection", lambda *args, **kwargs: ws)
+    path = str(tmp_path / "server")
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(path)
+        server.listen(1)
+        assert ding.main(["board", "--all", "--socket", path]) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert captured.err
+    assert "App Server unavailable" not in captured.err
+    assert ws.closed
+
+
+@pytest.mark.parametrize("stage", ["connect", "listing"])
+@pytest.mark.parametrize("all_threads", [False, True])
+@pytest.mark.parametrize("failure", ["exception", "empty"])
+def test_board_websocket_transport_failure_uses_registered_runs(tmp_path, monkeypatch, capsys, stage, all_threads, failure):
+    websocket = pytest.importorskip("websocket")
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+    ws = Connection([{"result": {}}])
+    recv = ws.recv
+
+    def disconnected_recv():
+        if stage == "listing" and ws.requests[-1]["method"] == "initialize":
+            return recv()
+        if failure == "empty":
+            return ""
+        raise websocket.WebSocketConnectionClosedException("connection lost")
+
+    def connect(*args, **kwargs):
+        if stage == "connect" and failure == "exception":
+            raise websocket.WebSocketConnectionClosedException("connection lost")
+        return ws
+
+    monkeypatch.setattr(ws, "recv", disconnected_recv)
+    monkeypatch.setattr(websocket, "create_connection", connect)
+    monkeypatch.setattr(ding, "repository_roots", lambda: [Path.cwd()])
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    path = str(tmp_path / "server")
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(path)
+        server.listen(1)
+        assert ding.main(["board", "--socket", path, *(["--all"] if all_threads else [])]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[1].split("\t") == [THREAD_ID, str(Path.cwd()), "unavailable", "", "", "lost"]
+    detail = "connection lost" if failure == "exception" else "App Server closed the connection before replying."
+    assert f"App Server unavailable: {detail}" in captured.err
+    assert ws.closed == (stage == "listing" or failure == "empty")
+
+
+@pytest.mark.parametrize("all_threads", [False, True])
+def test_board_registry_does_not_hide_malformed_initial_listing(tmp_path, monkeypatch, capsys, all_threads):
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *args: {"data": None}))
+    monkeypatch.setattr(ding, "repository_roots", lambda: [Path.cwd()])
+    assert ding.main(["board", "--socket", "/fake.sock", *(["--all"] if all_threads else [])]) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "Malformed App Server" in captured.err
+
+
+def test_board_registry_survives_socket_discovery_failure(tmp_path, monkeypatch, capsys):
+    with ding.registered_run(THREAD_ID, tmp_path / "missing.jsonl"):
+        pass
+
+    def missing_socket(directory):
+        raise ValueError("no App Server socket")
+
+    monkeypatch.setattr(ding, "discover_socket", missing_socket)
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--all"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[1].split("\t")[2] == "unavailable"
+    assert "App Server unavailable: no App Server socket" in captured.err
+
+
+def executor_comment(text, session=THREAD_ID, created="2026-10-12T10:00:00Z"):
+    return {"body": text + f"\n\nCodex session: {session}", "createdAt": created}
+
+
+STATUS_BLOCK = "状态: 完成\n在等: 无\n关键数字: 12/12\n下一步: 合并"
+
+
+def test_executor_comments_select_latest_own_across_tickets_with_last_owner_authoritative(monkeypatch):
+    calls = []
+    comments = {
+        186: [executor_comment(STATUS_BLOCK, created="2026-10-12T11:00:00Z"),
+              executor_comment(STATUS_BLOCK + f"\nCodex owner: {THREAD_ID}\nCodex owner: {OTHER_ID}",
+                               created="2026-10-12T12:00:00Z"),
+              executor_comment("状态: 旧\n在等: 无\n关键数字: 1\n下一步: 查", created="2026-10-11T10:00:00Z")],
+        193: [executor_comment("\r\n  " + STATUS_BLOCK.replace("完成", "运行中").replace("\n", "\r\n"),
+                               created="2026-10-12T11:30:00Z")],
+    }
+
+    def gh(arguments):
+        calls.append(arguments)
+        assert arguments[:2] == ["issue", "view"]
+        assert arguments[3:] == ["--repo", "owner/repo", "--json", "comments"]
+        return {"comments": comments[int(arguments[2])]}
+
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    heads = ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}})
+    assert heads == {THREAD_ID: STATUS_BLOCK.replace("完成", "运行中").replace("\n", " "),
+                     OTHER_ID: STATUS_BLOCK.replace("\n", " ")}
+    assert sorted(int(arguments[2]) for arguments in calls) == [186, 193]
+
+
+@pytest.mark.parametrize("latest", ["Details only", "状态: 完成\n在等: 无\n\n关键数字: 1\n下一步: 查",
+                                    "状态: \n在等: 无\n关键数字: 1\n下一步: 查"])
+def test_latest_own_comment_without_complete_block_never_uses_stale_status(monkeypatch, latest):
+    comments = [executor_comment(STATUS_BLOCK, created="2026-10-11T10:00:00Z"),
+                executor_comment(latest), executor_comment(STATUS_BLOCK, session=OTHER_ID)]
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": comments})
+    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+
+
+def test_bad_own_comment_timestamp_falls_back_instead_of_showing_older_status(monkeypatch, capsys):
+    comments = [executor_comment(STATUS_BLOCK), executor_comment(STATUS_BLOCK, created="invalid")]
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": comments})
+    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+    assert "invalid executor comment timestamp" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("status", [False, True])
+def test_board_status_option_replaces_head_and_default_never_fetches_comments(monkeypatch, capsys, status):
+    calls = []
+
+    def call(method, params):
+        if method == "thread/list":
+            return {"data": [thread()]}
+        assert method == "thread/turns/list"
+        return {"data": [{"items": [final("Final fallback")]}]}
+
+    def gh(arguments):
+        calls.append(arguments)
+        return {"comments": [executor_comment(STATUS_BLOCK)]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "issue_map", lambda: {THREAD_ID: {186}})
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    assert ding.main(["board", "--all", "--socket", "/fake.sock", *(["--status"] if status else [])]) == 0
+    row = capsys.readouterr().out.splitlines()[1].split("\t")
+    assert row[4] == (STATUS_BLOCK.replace("\n", " ") if status else "Final fallback")
+    assert len(calls) == int(status)
+
+
+@pytest.mark.parametrize("failure", [ValueError("bad JSON"), FileNotFoundError("gh"),
+                                      subprocess.TimeoutExpired(["gh"], 60), {"comments": "bad"}])
+def test_executor_comment_failures_warn_and_fall_back(monkeypatch, capsys, failure):
+    def gh(arguments):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+    assert "executor comment lookup failed for #186" in capsys.readouterr().err
+
+
+def test_executor_comment_calls_are_deduplicated_and_bounded(monkeypatch):
+    import threading
+    import time
+
+    active, peak, calls = 0, 0, []
+    lock = threading.Lock()
+
+    def gh(arguments):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            calls.append(int(arguments[2]))
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return {"comments": []}
+
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    assert ding.executor_comment_heads({THREAD_ID: set(range(1, 10)), OTHER_ID: {1, 2}}) == {}
+    assert sorted(calls) == list(range(1, 10))
+    assert 2 <= peak <= 4
+
+
+def test_comment_failure_on_one_ticket_does_not_show_stale_other_ticket_status(monkeypatch, capsys):
+    def gh(arguments):
+        if arguments[2] == "193":
+            raise OSError("offline")
+        return {"comments": [executor_comment(STATUS_BLOCK)]}
+
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    assert ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}}) == {}
+    assert "executor comment lookup failed for #193" in capsys.readouterr().err
+
+
+def test_board_shows_notification_failure_from_matching_record(tmp_path, monkeypatch, capsys):
+    record = tmp_path / "record.jsonl"
+    with ding.registered_run(THREAD_ID, record) as run_id:
+        ding.append_jsonl(record, {"event": "task_exit", "run_id": run_id,
+                                  "thread_id": THREAD_ID, "exit_code": 0})
+        ding.append_jsonl(record, {"event": "notification", "run_id": run_id,
+                                  "thread_id": THREAD_ID, "outcome": "queue_failed"})
+
+    def call(method, params):
+        if method == "thread/list":
+            return {"data": [thread(cwd=str(tmp_path))]}
+        assert method == "thread/turns/list"
+        return {"data": []}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    assert ding.main(["board", "--all", "--socket", "/fake.sock"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split("\t")[-1] == "notify_failed"
