@@ -430,10 +430,16 @@ def normalize_target(target: str | None, issue: int | None) -> str | None:
     if target and target.startswith("#"):
         if not re.fullmatch(r"#[1-9][0-9]*", target):
             raise ValueError("Issue target must be # followed by a positive issue number.")
-        target = github_repository() + target
+        try:
+            target = github_repository() + target
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(
+                f"'{target}' needs a GitHub repository in the current directory; "
+                f"elsewhere use OWNER/REPO{target} or the issue URL. ({' '.join(str(exc).split())})"
+            ) from exc
     if target and ("://" in target or target.startswith(("http:", "https:"))):
         match = re.fullmatch(
-            rf"https://github\.com/({ISSUE_REPOSITORY})/(?:issues|pull)/([1-9][0-9]*)(?:#[^\r\n]*)?",
+            rf"https://github\.com/({ISSUE_REPOSITORY})/(?:issues|pull)/([1-9][0-9]*)/?(?:\?[^#\s]*)?(?:#[^\r\n]*)?",
             target)
         if not match:
             raise ValueError("Issue URL must be https://github.com/OWNER/REPO/issues/NUMBER or /pull/NUMBER.")

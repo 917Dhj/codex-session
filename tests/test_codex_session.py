@@ -520,6 +520,9 @@ def test_uuid_and_unambiguous_issue_targets_are_local(monkeypatch):
     "https://github.com/example/project/issues/42#issuecomment-123",
     "https://github.com/example/project/pull/42",
     "https://github.com/example/project/pull/42#issuecomment-123",
+    "https://github.com/example/project/issues/42/",
+    "https://github.com/example/project/issues/42?query=1",
+    "https://github.com/example/project/issues/42?notification_referrer_id=NT_1#issuecomment-123",
 ])
 def test_explicit_issue_target_uses_its_repository(monkeypatch, tmp_path, target):
     monkeypatch.chdir(tmp_path)
@@ -557,7 +560,6 @@ def test_explicit_issue_target_uses_its_repository(monkeypatch, tmp_path, target
     "https://github.com/example/project/issues/-1",
     "https://github.com/example/project/issues/abc",
     "https://github.com/example/project/issues/42/extra",
-    "https://github.com/example/project/issues/42?query=1",
     "https://github.com/example/../issues/42",
     "https://github.com/example/project/discussions/42",
 ])
@@ -1823,3 +1825,12 @@ def test_malformed_rpc_error_is_not_a_definite_rejection(error):
     with pytest.raises(ValueError, match="Malformed App Server error") as exc:
         call("thread/queue/add", {})
     assert not isinstance(exc.value, ding.AppServerError)
+
+
+def test_short_issue_target_outside_repository_explains_alternatives(monkeypatch):
+    def missing():
+        raise ValueError("gh failed: not a git repository")
+
+    monkeypatch.setattr(ding, "github_repository", missing)
+    with pytest.raises(ValueError, match=r"elsewhere use OWNER/REPO#42 or the issue URL"):
+        ding.resolve_target("#42", None, None)
