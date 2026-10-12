@@ -63,7 +63,7 @@ def test_concurrent_sends_append_complete_private_records(tmp_path, monkeypatch)
     script = (
         "import ding, os, sys\n"
         "os.umask(0)\n"
-        "ding.queue_message = lambda *args: 0\n"
+        "ding.deliver_message = lambda *args: {'outcome': 'started', 'error': None}\n"
         "for index in range(5):\n"
         "    message = sys.argv[1] + ':' + str(index) + '\\n' + '界' * 16000\n"
         "    assert ding.main(['send', '00000000-0000-4000-8000-000000000001', "
@@ -76,9 +76,13 @@ def test_concurrent_sends_append_complete_private_records(tmp_path, monkeypatch)
     assert all(result.returncode == 0 for result in results), [result.stderr for result in results]
     journal = tmp_path / "state/ding/sent.jsonl"
     records = [json.loads(line) for line in journal.read_text().splitlines()]
-    assert len(records) == 10
+    assert len(records) == 20
     assert {record["message"] for record in records} == {
         f"{name}:{index}\n" + "界" * 16000 for name in ["first", "second"] for index in range(5)
     }
-    assert all(record["outcome"] == "queued" for record in records)
+    intents = {record["client_message_id"] for record in records if record["event"] == "send_intent"}
+    results = [record for record in records if record["event"] == "send_result"]
+    assert len(intents) == len(results) == 10
+    assert {record["client_message_id"] for record in results} == intents
+    assert all(record["outcome"] == "started" for record in results)
     assert stat.S_IMODE(journal.stat().st_mode) == 0o600

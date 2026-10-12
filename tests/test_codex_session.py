@@ -3,6 +3,7 @@ import json
 import io
 import stat
 import socket
+from pathlib import Path
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -20,13 +21,30 @@ OTHER_ID = "00000000-0000-4000-8000-000000000002"
 def isolated_state_and_no_real_queue(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     run = subprocess.run
+    popen = subprocess.Popen
 
     def guarded_run(argv, *args, **kwargs):
-        if list(argv[:2]) == ["codex", "queue"]:
+        if isinstance(argv, (list, tuple)) and Path(argv[0]).name == "codex" and any(
+                action in argv for action in ("queue", "exec", "resume")):
             pytest.fail("tests must not queue messages to real sessions")
         return run(argv, *args, **kwargs)
 
+    def guarded_popen(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and Path(argv[0]).name == "codex" and any(
+                action in argv for action in ("queue", "exec", "resume")):
+            pytest.fail("tests must not message real sessions through codex")
+        return popen(argv, *args, **kwargs)
+
     monkeypatch.setattr(subprocess, "run", guarded_run)
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+    connect = socket.socket.connect
+
+    def guarded_connect(sock, address):
+        if sock.family == socket.AF_UNIX and not Path(address).resolve().is_relative_to(tmp_path):
+            pytest.fail("tests must not connect to real App Server sockets")
+        return connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
 
 
 def thread(thread_id=THREAD_ID, name="Build", cwd="/repo", status="idle"):
@@ -232,20 +250,22 @@ def test_status_cli(capsys, monkeypatch):
     assert json.loads(capsys.readouterr().out) == {"type": "active", "activeFlags": []}
 
 
-def test_send_direct_queue_argv(monkeypatch):
+def test_send_persists_intent_before_delivery(monkeypatch, tmp_path):
     calls = []
-
-    def queue(argv, *, timeout):
-        calls.append(argv)
-        assert timeout == 60
-        return ding.subprocess.CompletedProcess(argv, 9)
-
-    monkeypatch.setattr(ding.subprocess, "run", queue)
-    monkeypatch.setattr(ding, "query", lambda *a, **kw: pytest.fail("send must not query status"))
     message = 'text "quoted"; $(not-shell)\nnext'
-    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", message]) == 9
-    assert calls == [["codex", "queue", "--remote", "unix:///test.sock", "--thread", THREAD_ID,
-                      "--message", message]]
+
+    def deliver(thread_id, text, path, client_id):
+        intent, = records(tmp_path / "state/ding/sent.jsonl")
+        assert intent["event"] == "send_intent"
+        assert intent["outcome"] == "pending"
+        assert intent["client_message_id"] == client_id
+        assert intent["message"] == message
+        calls.append((thread_id, text, path))
+        return {"outcome": "started", "error": None}
+
+    monkeypatch.setattr(ding, "deliver_message", deliver)
+    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", message]) == 0
+    assert calls == [(THREAD_ID, message, "/test.sock")]
 
 
 def records(path):
@@ -255,50 +275,55 @@ def records(path):
 @pytest.mark.parametrize("status", ["active", "idle", "notLoaded", "systemError", "future-state", None])
 def test_run_state_gate_and_durable_order(tmp_path, monkeypatch, status):
     path = tmp_path / "record.jsonl"
-    queues = []
     child_calls = []
     command = ["program", "--message", "--socket", "--", "$(literal)"]
+    calls = []
+    client_id = [None]
 
     def child(argv):
         child_calls.append(argv)
         return 7, None
 
-    def query(thread_id, socket_path, *, status_only):
-        assert (thread_id, socket_path, status_only) == (THREAD_ID, "/test.sock", True)
-        assert records(path)[0]["exit_code"] == 7
-        if status is None:
-            raise ValueError("Malformed App Server thread status.")
-        return {"type": status}
-
-    def queue(thread_id, message, socket_path):
-        assert len(records(path)) == 1
-        queues.append((thread_id, message, socket_path))
-        return 0
+    def call(method, params):
+        calls.append(method)
+        intent, = records(path)
+        assert intent["exit_code"] == 7
+        assert intent["message"] == "message"
+        client_id[0] = intent["client_message_id"]
+        if method == "thread/read":
+            if status is None:
+                raise ValueError("Malformed App Server thread status.")
+            return {"thread": thread(status="idle" if "thread/resume" in calls else status)}
+        if method == "thread/resume":
+            return {"thread": thread()}
+        if method == "thread/queue/add":
+            return {"queuedSubmission": {"id": "q", "clientUserMessageId": client_id[0],
+                                         "input": params["input"]}}
+        if method == "thread/turns/list":
+            return {"data": []}
+        if method == "thread/queue/start":
+            return {"turn": started_turn(client_id[0])}
+        pytest.fail(method)
 
     monkeypatch.setattr(ding, "task_exit_code", child)
-    monkeypatch.setattr(ding, "query", query)
-    monkeypatch.setattr(ding, "queue_message", queue)
-    assert ding.main([
-        "run", THREAD_ID, "--socket", "/test.sock", "--message", "message", "--record", str(path),
-        "--", *command,
-    ]) == 7
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.main(["run", THREAD_ID, "--socket", "/test.sock", "--message", "message",
+                      "--record", str(path), "--", *command]) == 7
     assert child_calls == [command]
     events = records(path)
     assert [e["event"] for e in events] == ["task_exit", "notification"]
     assert events[0]["run_id"] == events[1]["run_id"]
-    if status == "active":
-        assert queues == []
-        assert events[1]["outcome"] == "skipped_active"
-    else:
-        assert queues == [(THREAD_ID, "message", "/test.sock")]
-        assert events[1]["outcome"] == "queued"
-    assert bool(events[1]["status_error"]) == (status is None)
+    assert events[0]["client_message_id"] == events[1]["client_message_id"]
+    expected = "skipped_active" if status == "active" else (
+        "started" if status in {"idle", "notLoaded"} else "failed")
+    assert events[1]["outcome"] == expected
+    assert calls.count("thread/queue/add") == (1 if expected == "started" else 0)
 
 
 @pytest.mark.parametrize("resolved", [False, True])
-def test_run_socket_or_query_failure_still_sends(tmp_path, monkeypatch, resolved):
+def test_run_socket_or_query_failure_prevents_delivery(tmp_path, monkeypatch, resolved):
     path = tmp_path / "record.jsonl"
-    queued = []
+    calls = []
     monkeypatch.setattr(ding, "task_exit_code", lambda command: (0, None))
 
     def discover(directory):
@@ -307,47 +332,38 @@ def test_run_socket_or_query_failure_still_sends(tmp_path, monkeypatch, resolved
             raise ValueError("Found 0 sockets")
         return "/resolved.sock"
 
-    def failed_query(*args, **kwargs):
+    def call(method, params):
+        calls.append(method)
         raise OSError("unavailable")
 
-    def queue(thread_id, message, socket_path):
-        queued.append(socket_path)
-        return 0
-
     monkeypatch.setattr(ding, "discover_socket", discover)
-    monkeypatch.setattr(ding, "query", failed_query)
-    monkeypatch.setattr(ding, "queue_message", queue)
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
     assert ding.main(["run", THREAD_ID, "--message", "m", "--record", str(path), "--", "task"]) == 0
-    assert queued == (["/resolved.sock"] if resolved else [None])
-    assert records(path)[1]["status_error"]
+    assert calls == (["thread/read"] if resolved else [])
+    assert records(path)[1]["outcome"] == "failed"
+    assert records(path)[1]["error"]
 
 
-@pytest.mark.parametrize("queue_result", [8, FileNotFoundError("codex missing")])
-def test_real_child_output_and_queue_failure(tmp_path, monkeypatch, capfd, queue_result):
+def test_real_child_output_and_notification_failure(tmp_path, monkeypatch, capfd):
     path = tmp_path / "record.jsonl"
     counter = tmp_path / "calls.txt"
-    queue_calls = []
-    monkeypatch.setattr(ding, "query", lambda *args, **kwargs: {"type": "idle"})
+    calls = []
 
-    def queue(*args):
-        queue_calls.append(args)
-        if isinstance(queue_result, Exception):
-            raise queue_result
-        return queue_result
+    def deliver(*args, **kwargs):
+        calls.append(args)
+        return {"outcome": "failed", "error": "notification unavailable"}
 
-    monkeypatch.setattr(ding, "queue_message", queue)
+    monkeypatch.setattr(ding, "deliver_message", deliver)
     code = "import pathlib,sys; pathlib.Path(sys.argv[1]).open('a').write('run\\n'); print('out'); print('err', file=sys.stderr); sys.exit(6)"
-    assert ding.main([
-        "run", THREAD_ID, "--socket", "/test.sock", "--message", "m", "--record", str(path),
-        "--", ding.sys.executable, "-c", code, str(counter),
-    ]) == 6
+    assert ding.main(["run", THREAD_ID, "--socket", "/test.sock", "--message", "m", "--record", str(path),
+                      "--", ding.sys.executable, "-c", code, str(counter)]) == 6
     assert counter.read_text() == "run\n"
-    assert len(queue_calls) == 1
+    assert len(calls) == 1
     captured = capfd.readouterr()
     assert captured.out == "out\n"
     assert "err\n" in captured.err
     assert records(path)[0]["exit_code"] == 6
-    assert records(path)[1]["outcome"] == "queue_failed"
+    assert records(path)[1]["outcome"] == "failed"
 
 
 def test_signal_and_missing_task_exit_codes(tmp_path):
@@ -407,23 +423,27 @@ def test_keyboard_interrupt_reaps_child(monkeypatch):
 def test_notification_interrupt_preserves_task_exit(tmp_path, monkeypatch):
     path = tmp_path / "record.jsonl"
     monkeypatch.setattr(ding, "task_exit_code", lambda command: (7, None))
-    monkeypatch.setattr(ding, "query", lambda *args, **kwargs: {"type": "idle"})
 
-    def interrupt(*args):
+    def call(method, params):
+        if method == "thread/read":
+            return {"thread": thread()}
+        if method == "thread/turns/list":
+            return {"data": []}
+        assert method == "thread/queue/add"
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(ding, "queue_message", interrupt)
-    assert ding.main([
-        "run", THREAD_ID, "--socket", "/test.sock", "--message", "m", "--record", str(path), "--", "task",
-    ]) == 7
-    assert records(path)[1]["queue_error"] == "KeyboardInterrupt"
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.main(["run", THREAD_ID, "--socket", "/test.sock", "--message", "m",
+                      "--record", str(path), "--", "task"]) == 7
+    assert records(path)[1]["error"] == "KeyboardInterrupt"
+    assert records(path)[1]["outcome"] == "unknown"
 
 
 def test_notification_record_failure_preserves_task_exit(tmp_path, monkeypatch, capsys):
     path = tmp_path / "record.jsonl"
     append_jsonl = ding.append_jsonl
     monkeypatch.setattr(ding, "task_exit_code", lambda command: (7, None))
-    monkeypatch.setattr(ding, "query", lambda *args, **kwargs: {"type": "active"})
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "skipped_active", "error": None})
 
     def fail_notification(record, event):
         if event["event"] == "notification":
@@ -702,7 +722,7 @@ def test_ambiguous_issue_refuses_every_command_before_execution(
         return server_calls(lambda method, params: {"data": [thread(), thread(OTHER_ID, "Other", status="active")]})
 
     monkeypatch.setattr(ding, "app_server", server)
-    for function in ("queue_message", "task_exit_code", "run_task", "query"):
+    for function in ("deliver_message", "task_exit_code", "run_task", "query"):
         monkeypatch.setattr(ding, function, lambda *a, **kw: pytest.fail("ambiguous target must not execute"))
     argv = [action, *target, "--socket", "/explicit.sock"]
     record = tmp_path / "exit.jsonl"
@@ -720,7 +740,7 @@ def test_ambiguous_issue_refuses_every_command_before_execution(
     if action == "send":
         event, = records(tmp_path / "state/ding/sent.jsonl")
         assert event["thread_id"] is None
-        assert event["outcome"] == "queue_failed"
+        assert event["outcome"] == "failed"
 
 
 def test_issue_map_body_comments_and_optional_failure(monkeypatch):
@@ -940,7 +960,7 @@ def test_source_requires_one_nonempty_line(sender):
 def test_send_long_message_inputs_and_private_log(tmp_path, monkeypatch, input_kind):
     message = 'text "quoted"; $(not-shell)\r\n世界\n'
     queued = []
-    monkeypatch.setattr(ding, "queue_message", lambda *args: queued.append(args) or 0)
+    monkeypatch.setattr(ding, "deliver_message", lambda *args: queued.append(args[:3]) or {"outcome": "started", "error": None})
     if input_kind == "file":
         file = tmp_path / "message.txt"
         file.write_bytes(message.encode())
@@ -952,12 +972,12 @@ def test_send_long_message_inputs_and_private_log(tmp_path, monkeypatch, input_k
     actual = f"[from reviewer]\n{message}"
     assert queued == [(THREAD_ID, actual, "/test.sock")]
     journal = tmp_path / "state/ding/sent.jsonl"
-    event, = records(journal)
+    intent, event = records(journal)
     assert event["sender"] == "reviewer"
     assert event["thread_id"] == THREAD_ID
     assert event["message"] == actual
-    assert event["outcome"] == "queued"
-    assert event["queue_exit_code"] == 0
+    assert event["outcome"] == "started"
+    assert intent["client_message_id"] == event["client_message_id"]
     assert event["error"] is None
     assert event["timestamp_ns"] > 0
     assert stat.S_IMODE(journal.stat().st_mode) == 0o600
@@ -969,62 +989,76 @@ def test_send_log_tightens_existing_file_permissions(tmp_path, monkeypatch):
     journal.parent.mkdir(parents=True)
     journal.write_text('{"old": true}\n')
     journal.chmod(0o644)
-    monkeypatch.setattr(ding, "queue_message", lambda *args: 0)
+    monkeypatch.setattr(ding, "deliver_message", lambda *args: {"outcome": "started", "error": None})
     assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 0
     assert records(journal)[0] == {"old": True}
-    assert len(records(journal)) == 2
+    assert len(records(journal)) == 3
     assert stat.S_IMODE(journal.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("error, outcome, code", [
-    (FileNotFoundError("codex missing"), "queue_failed", 1),
-    (subprocess.TimeoutExpired(["codex", "queue", "secret-message"], 60), "unknown", 1),
+    (FileNotFoundError("socket missing"), "failed", 1),
+    (TimeoutError("message confirmation timed out"), "unknown", 1),
     (KeyboardInterrupt(), "unknown", 130),
 ])
 def test_send_failures_are_logged_without_retries(tmp_path, monkeypatch, capsys, error, outcome, code):
     calls = []
 
-    def failed_queue(*args):
-        calls.append(args)
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read" and outcome != "failed":
+            return {"thread": thread()}
+        if method == "thread/turns/list":
+            return {"data": []}
         raise error
 
-    monkeypatch.setattr(ding, "queue_message", failed_queue)
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
     assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "secret-message"]) == code
-    assert len(calls) == 1
-    event, = records(tmp_path / "state/ding/sent.jsonl")
+    assert calls.count("thread/queue/add") <= 1
+    intent, event = records(tmp_path / "state/ding/sent.jsonl")
+    assert event["client_message_id"] == intent["client_message_id"]
     assert event["outcome"] == outcome
-    assert event["queue_exit_code"] is None
     assert event["error"]
     assert "secret-message" not in capsys.readouterr().err
 
 
-def test_send_missing_target_is_logged_before_any_queue(tmp_path, monkeypatch):
+def test_send_missing_target_is_logged_before_delivery(tmp_path, monkeypatch):
     monkeypatch.setattr(ding, "resolve_target", lambda *a: (_ for _ in ()).throw(ValueError("No candidates")))
-    monkeypatch.setattr(ding, "queue_message", lambda *a: pytest.fail("must not queue"))
+    monkeypatch.setattr(ding, "deliver_message", lambda *a: pytest.fail("must not queue"))
     assert ding.main(["send", "Missing", "--message", "message"]) == 1
     event, = records(tmp_path / "state/ding/sent.jsonl")
     assert event["target"] == "Missing"
     assert event["thread_id"] is None
-    assert event["outcome"] == "queue_failed"
+    assert event["outcome"] == "failed"
 
 
-def test_send_success_with_log_failure_reports_queue_outcome(monkeypatch, capsys):
+def test_send_result_log_failure_preserves_intent_without_repeat(monkeypatch, capsys, tmp_path):
     calls = []
-    monkeypatch.setattr(ding, "queue_message", lambda *args: calls.append(args) or 0)
-    monkeypatch.setattr(ding, "append_jsonl", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    append = ding.append_jsonl
+
+    def persist(path, event):
+        if event["event"] == "send_result":
+            raise OSError("disk full")
+        append(path, event)
+
+    monkeypatch.setattr(ding, "deliver_message", lambda *args: calls.append(args) or
+                        {"outcome": "started", "error": None})
+    monkeypatch.setattr(ding, "append_jsonl", persist)
     assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 1
     assert len(calls) == 1
+    intent, = records(tmp_path / "state/ding/sent.jsonl")
+    assert intent["event"] == "send_intent"
     error = capsys.readouterr().err
     assert "sent log failed" in error
-    assert "queue outcome: queued" in error
-    assert "exit code: 0" in error
+    assert "delivery outcome: started" in error
+    assert "do not blindly resend" in error
 
 
-def test_send_unwritable_log_prevents_queue(monkeypatch, tmp_path):
+def test_send_unwritable_log_prevents_delivery(monkeypatch, tmp_path):
     state_file = tmp_path / "not-a-directory"
     state_file.touch()
     monkeypatch.setenv("XDG_STATE_HOME", str(state_file))
-    monkeypatch.setattr(ding, "queue_message", lambda *a: pytest.fail("must not queue"))
+    monkeypatch.setattr(ding, "deliver_message", lambda *a: pytest.fail("must not queue"))
     assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 1
 
 
@@ -1035,7 +1069,7 @@ def test_run_message_file_and_source_preserve_task_exit(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(ding, "task_exit_code", lambda *args: (7, None))
     monkeypatch.setattr(ding, "query", lambda *args, **kwargs: {"type": "idle"})
-    monkeypatch.setattr(ding, "queue_message", lambda *args: calls.append(args) or 0)
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: calls.append(args[:3]) or {"outcome": "started", "error": None})
     assert ding.main(["run", THREAD_ID, "--socket", "/test.sock", "--message-file", str(message),
                       "--from", "worker", "--record", str(journal), "--", "task"]) == 7
     assert calls == [(THREAD_ID, "[from worker]\ndone\n世界", "/test.sock")]
@@ -1324,3 +1358,334 @@ def test_app_server_utf8_validation_and_fragments(tmp_path, monkeypatch, case):
         finally:
             for peer in peers:
                 peer.close()
+
+
+MESSAGE_ID = "00000000-0000-4000-8000-000000000003"
+
+
+def started_turn(client_id=MESSAGE_ID, status="inProgress"):
+    return {"id": "turn-1", "status": status, "items": [
+        {"type": "userMessage", "clientId": client_id, "content": [{"type": "text", "text": "message"}]},
+    ]}
+
+
+def delivery_server(monkeypatch, *, status="idle", resumed="idle", failure=None,
+                    result_client=MESSAGE_ID, turn_status="inProgress", history=None):
+    calls = []
+    current_status = [status]
+    submitted = [False]
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/read":
+            return {"thread": thread(status=current_status[0])}
+        if method == "thread/resume":
+            assert params == {"threadId": THREAD_ID, "excludeTurns": True}
+            current_status[0] = resumed
+            return {"thread": thread(status=resumed)}
+        if method == "thread/queue/add":
+            submitted[0] = True
+            assert params == {"threadId": THREAD_ID, "clientUserMessageId": MESSAGE_ID,
+                              "input": [{"type": "text", "text": "message"}]}
+            if failure == "add":
+                raise OSError("lost add acknowledgement")
+            return {"queuedSubmission": {"id": "submission-1", "clientUserMessageId": MESSAGE_ID,
+                                         "input": params["input"]}}
+        if method == "thread/queue/start":
+            assert params == {"threadId": THREAD_ID, "queuedSubmissionId": "submission-1"}
+            if failure == "start":
+                raise OSError("lost start acknowledgement")
+            return {"turn": started_turn(result_client, turn_status)}
+        if method == "thread/turns/list":
+            return {"data": (history or []) if submitted[0] else []}
+        pytest.fail(f"unexpected mutation {method}")
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    return calls
+
+
+@pytest.mark.parametrize("status", ["idle", "notLoaded"])
+@pytest.mark.parametrize("turn_status", ["inProgress", "completed"])
+def test_delivery_resumes_and_starts_exact_submission_without_codex(monkeypatch, status, turn_status):
+    monkeypatch.setenv("PATH", "")
+    calls = delivery_server(monkeypatch, status=status, turn_status=turn_status)
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == "started"
+    assert result["turn_id"] == "turn-1"
+    assert result["queued_submission_id"] == "submission-1"
+    methods = [method for method, _ in calls]
+    assert methods == (["thread/read", "thread/resume"] if status == "notLoaded" else ["thread/read"]) + [
+        "thread/turns/list", "thread/queue/add", "thread/turns/list", "thread/read", "thread/queue/start",
+    ]
+
+
+def test_resume_active_race_skips_run_without_queue(monkeypatch):
+    calls = delivery_server(monkeypatch, status="notLoaded", resumed="active")
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID,
+                                  skip_active=True, timeout=0.01)
+    assert result["outcome"] == "skipped_active"
+    assert [method for method, _ in calls] == ["thread/read", "thread/resume"]
+
+
+@pytest.mark.parametrize("status, failure", [("idle", "add"), ("idle", "start"), ("active", "add")])
+@pytest.mark.parametrize("observed", [False, True])
+def test_lost_ack_reconciles_readonly_and_never_resends(monkeypatch, status, failure, observed):
+    calls = delivery_server(monkeypatch, status=status, failure=failure,
+                            history=[started_turn()] if observed else [])
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == ("started" if observed else "unknown")
+    assert sum(method == "thread/queue/add" for method, _ in calls) == 1
+    assert sum(method == "thread/queue/start" for method, _ in calls) <= 1
+
+
+def test_unrelated_turn_does_not_confirm_own_message(monkeypatch):
+    calls = delivery_server(monkeypatch, result_client=OTHER_ID, history=[started_turn(OTHER_ID)])
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == "unknown"
+    assert sum(method == "thread/queue/start" for method, _ in calls) == 1
+
+
+@pytest.mark.parametrize("initial_status", ["active", "notLoaded"])
+@pytest.mark.parametrize("flags", [[], ["waitingOnUserInput"]])
+def test_active_send_acknowledged_immediately(tmp_path, monkeypatch, capsys, initial_status, flags):
+    calls = []
+    record = tmp_path / "state/ding/sent.jsonl"
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active send must not wait"))
+
+    def call(method, params):
+        calls.append(method)
+        intent, = records(record)
+        assert intent["event"] == "send_intent"
+        if method in {"thread/read", "thread/resume"}:
+            value = thread(status=initial_status if method == "thread/read" else "active")
+            value["status"]["activeFlags"] = flags
+            return {"thread": value}
+        assert method == "thread/queue/add"
+        assert params["clientUserMessageId"] == intent["client_message_id"]
+        assert params["input"] == [{"type": "text", "text": intent["message"]}]
+        return {"queuedSubmission": {"id": "own-q", "clientUserMessageId": intent["client_message_id"],
+                                     "input": params["input"]}}
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 0
+    intent, result = records(record)
+    assert result["outcome"] == "queued_behind_active"
+    assert result["error"] is None
+    assert result["queued_submission_id"] == "own-q"
+    assert result["turn_id"] is None
+    assert result["turn_status"] is None
+    assert result["client_message_id"] == intent["client_message_id"]
+    assert calls == (["thread/read", "thread/resume"] if initial_status == "notLoaded" else ["thread/read"]) + [
+        "thread/queue/add",
+    ]
+    assert "queued_behind_active" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reject", ["add", "history", "start"])
+def test_known_rejection_preserves_acknowledged_queue(monkeypatch, reject):
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read":
+            return {"thread": thread()}
+        if method == "thread/queue/add":
+            if reject == "add":
+                raise ding.AppServerError("message rejected")
+            return {"queuedSubmission": {"id": "q", "clientUserMessageId": MESSAGE_ID,
+                                         "input": params["input"]}}
+        if method == "thread/turns/list":
+            if reject == "history" and "thread/queue/add" in calls:
+                raise ding.AppServerError("history unavailable")
+            return {"data": []}
+        if method == "thread/queue/start":
+            raise ding.AppServerError("session became active")
+        pytest.fail(method)
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == ("failed" if reject == "add" else "queued")
+    assert calls.count("thread/queue/add") == 1
+    assert calls.count("thread/queue/start") <= 1
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_idle_send_becomes_active_accepts_queue_without_start_or_wait(monkeypatch, observed):
+    calls = []
+    reads = ["idle", "active"]
+    submitted = [False]
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active send must not wait"))
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/read":
+            return {"thread": thread(status=reads.pop(0))}
+        if method == "thread/queue/add":
+            submitted[0] = True
+            return {"queuedSubmission": {"id": "own-q", "clientUserMessageId": MESSAGE_ID,
+                                         "input": params["input"]}}
+        if method == "thread/turns/list":
+            return {"data": [started_turn()] if observed and submitted[0] else []}
+        pytest.fail(method)
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.1)
+    assert result["outcome"] == ("started" if observed else "queued_behind_active")
+    assert result["error"] is None
+    assert result["turn_id"] == ("turn-1" if observed else None)
+    assert sum(method == "thread/queue/add" for method, _ in calls) == 1
+    assert not any(method == "thread/queue/start" for method, _ in calls)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("id", None), ("clientUserMessageId", OTHER_ID),
+    ("input", [{"type": "text", "text": "different"}]),
+])
+@pytest.mark.parametrize("status", ["idle", "active"])
+def test_invalid_submission_echo_never_starts_an_item(monkeypatch, field, value, status):
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read":
+            return {"thread": thread(status=status)}
+        if method == "thread/queue/add":
+            submission = {"id": "q", "clientUserMessageId": MESSAGE_ID, "input": params["input"]}
+            submission[field] = value
+            return {"queuedSubmission": submission}
+        assert method == "thread/turns/list"
+        return {"data": []}
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == "unknown"
+    assert calls.count("thread/queue/add") == 1
+    assert "thread/queue/start" not in calls
+
+
+def test_canonical_text_elements_echo_is_accepted(monkeypatch):
+    def call(method, params):
+        if method == "thread/read":
+            return {"thread": thread()}
+        if method == "thread/queue/add":
+            return {"queuedSubmission": {"id": "q", "clientUserMessageId": MESSAGE_ID,
+                                         "input": [{"type": "text", "text": "message", "text_elements": []}]}}
+        if method == "thread/turns/list":
+            return {"data": []}
+        assert method == "thread/queue/start"
+        turn = started_turn()
+        turn["items"][0]["content"][0]["text_elements"] = []
+        return {"turn": turn}
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID)["outcome"] == "started"
+
+
+@pytest.mark.parametrize("field, value", [("id", ""), ("status", "unknown"), ("content", [])])
+def test_invalid_own_turn_never_confirms_execution(monkeypatch, field, value):
+    turn = started_turn()
+    if field == "content":
+        turn["items"][0][field] = value
+    else:
+        turn[field] = value
+    delivery_server(monkeypatch, history=[turn])
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
+    assert result["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize("resumed", [thread(OTHER_ID), thread(status="notLoaded"), thread(status="systemError")])
+def test_invalid_resume_never_delivers_message(monkeypatch, resumed):
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read":
+            return {"thread": thread(status="notLoaded")}
+        assert method == "thread/resume"
+        return {"thread": resumed}
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID)["outcome"] == "failed"
+    assert calls == ["thread/read", "thread/resume"]
+
+
+def test_history_confirmation_checks_all_pages_and_cursors():
+    calls = []
+
+    def call(method, params):
+        assert method == "thread/turns/list"
+        calls.append(params)
+        if "cursor" not in params:
+            return {"data": [started_turn(OTHER_ID)], "nextCursor": "older"}
+        assert params["cursor"] == "older"
+        return {"data": [started_turn(status="completed")]}
+
+    assert ding.started_message(call, THREAD_ID, MESSAGE_ID, "message")["status"] == "completed"
+    assert len(calls) == 2
+    with pytest.raises(ValueError, match="pagination cursor"):
+        ding.started_message(lambda *args: {"data": [], "nextCursor": "same"}, THREAD_ID, MESSAGE_ID, "message")
+
+
+def test_delivery_rpc_uses_one_deadline_despite_notifications(monkeypatch):
+    elapsed = [0]
+    monkeypatch.setattr(ding.time, "monotonic", lambda: elapsed[0])
+    ws = Connection([{"result": {}}, {"result": {}}])
+    call = ding.initialize(ws, deadline=10)
+    elapsed[0] = 11
+    with pytest.raises(TimeoutError):
+        call("thread/queue/add", {})
+    assert [request["method"] for request in ws.requests] == ["initialize", "initialized"]
+
+
+def test_confirmation_stops_at_presubmit_baseline_without_older_pages():
+    calls = []
+    baseline = started_turn(OTHER_ID)
+    baseline["id"] = "before-submission"
+
+    def call(method, params):
+        calls.append(params)
+        assert "cursor" not in params
+        return {"data": [baseline], "nextCursor": "many-old-turns"}
+
+    assert ding.started_message(call, THREAD_ID, MESSAGE_ID, "message",
+                                after_turn_id="before-submission") is None
+    assert ding.started_message(call, THREAD_ID, MESSAGE_ID, "message",
+                                after_turn_id="before-submission") is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stage", ["status", "start"])
+@pytest.mark.parametrize("invalid", [[], {}])
+def test_malformed_delivery_status_preserves_task_exit(tmp_path, monkeypatch, stage, invalid):
+    journal = tmp_path / "exit.jsonl"
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read":
+            return {"thread": thread(status=invalid if stage == "status" else "idle")}
+        if method == "thread/turns/list":
+            return {"data": []}
+        if method == "thread/queue/add":
+            return {"queuedSubmission": {"id": "own-item",
+                "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}}
+        assert method == "thread/queue/start"
+        return {"turn": {"id": "own-turn", "status": invalid, "items": []}}
+
+    monkeypatch.setattr(ding, "task_exit_code", lambda command: (7, None))
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.main(["run", THREAD_ID, "--socket", "/test.sock", "--message", "message",
+                      "--record", str(journal), "--", "task"]) == 7
+    exit_event, notification = records(journal)
+    assert exit_event["exit_code"] == 7
+    assert notification["outcome"] == ("failed" if stage == "status" else "unknown")
+    assert calls.count("thread/queue/add") == (0 if stage == "status" else 1)
+    assert calls.count("thread/queue/start") == (0 if stage == "status" else 1)
+
+
+@pytest.mark.parametrize("error", [None, "rejected", {}, {"code": -1}, {"code": True, "message": "bad"}])
+def test_malformed_rpc_error_is_not_a_definite_rejection(error):
+    call = ding.initialize(Connection([{"result": {}}, {"error": error}]))
+    with pytest.raises(ValueError, match="Malformed App Server error") as exc:
+        call("thread/queue/add", {})
+    assert not isinstance(exc.value, ding.AppServerError)
