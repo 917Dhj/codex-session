@@ -552,14 +552,15 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
             if skip_active and result["status"]["type"] == "active":
                 result["outcome"] = "skipped_active"
                 return result
-            page = call("thread/turns/list", {
-                "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "full",
-            })
-            if not isinstance(page.get("data"), list):
-                raise ValueError("Malformed App Server turns page.")
-            if page["data"]:
-                message_turn(page["data"][0], client_id, message)
-                baseline = page["data"][0]["id"]
+            if result["status"]["type"] == "idle":
+                page = call("thread/turns/list", {
+                    "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "full",
+                })
+                if not isinstance(page.get("data"), list):
+                    raise ValueError("Malformed App Server turns page.")
+                if page["data"]:
+                    message_turn(page["data"][0], client_id, message)
+                    baseline = page["data"][0]["id"]
             mutation = "add"
             result["outcome"] = "unknown"
             inputs = [{"type": "text", "text": message}]
@@ -571,11 +572,17 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
                     or not same_message(submission.get("input"), message)):
                 raise ValueError("Malformed App Server queued submission.")
             result.update(outcome="queued", queued_submission_id=submission["id"])
+            if result["status"]["type"] == "active":
+                result["outcome"] = "queued_behind_active"
+                return result
             while time.monotonic() < deadline:
                 found = started_message(call, thread_id, client_id, message, after_turn_id=baseline)
                 if found is not None:
                     return confirm(found)
                 result["status"] = delivery_status(call, thread_id)
+                if result["status"]["type"] == "active" and mutation == "add":
+                    result["outcome"] = "queued_behind_active"
+                    return result
                 if result["status"]["type"] == "idle" and mutation == "add":
                     mutation = "start"
                     result["outcome"] = "unknown"
@@ -585,7 +592,7 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
                     found = message_turn(turn, client_id, message)
                     if found is not None:
                         return confirm(found)
-                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
     except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as exc:
         result["error"] = str(exc) or type(exc).__name__
         if isinstance(exc, AppServerError):
@@ -655,7 +662,8 @@ def send_task(args) -> int:
     warning = "; do not blindly resend" if event["outcome"] in {"queued", "unknown"} else ""
     detail = f"; {event['error']}" if event["error"] else ""
     print(f"ding: {event['outcome']}{warning}{detail}; record: {record}", file=sys.stderr)
-    return 0 if event["outcome"] == "started" else (130 if event["error"] == "KeyboardInterrupt" else 1)
+    return 0 if event["outcome"] in {"started", "queued_behind_active"} else (
+        130 if event["error"] == "KeyboardInterrupt" else 1)
 
 
 def task_exit_code(command: list[str]) -> tuple[int, str | None]:

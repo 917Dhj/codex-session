@@ -1427,10 +1427,10 @@ def test_resume_active_race_skips_run_without_queue(monkeypatch):
     assert [method for method, _ in calls] == ["thread/read", "thread/resume"]
 
 
-@pytest.mark.parametrize("failure", ["add", "start"])
+@pytest.mark.parametrize("status, failure", [("idle", "add"), ("idle", "start"), ("active", "add")])
 @pytest.mark.parametrize("observed", [False, True])
-def test_lost_ack_reconciles_readonly_and_never_resends(monkeypatch, failure, observed):
-    calls = delivery_server(monkeypatch, failure=failure,
+def test_lost_ack_reconciles_readonly_and_never_resends(monkeypatch, status, failure, observed):
+    calls = delivery_server(monkeypatch, status=status, failure=failure,
                             history=[started_turn()] if observed else [])
     result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
     assert result["outcome"] == ("started" if observed else "unknown")
@@ -1445,12 +1445,40 @@ def test_unrelated_turn_does_not_confirm_own_message(monkeypatch):
     assert sum(method == "thread/queue/start" for method, _ in calls) == 1
 
 
-def test_active_send_queues_once_without_start(monkeypatch):
-    calls = delivery_server(monkeypatch, status="active")
-    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.01)
-    assert result["outcome"] == "queued"
-    assert sum(method == "thread/queue/add" for method, _ in calls) == 1
-    assert not any(method == "thread/queue/start" for method, _ in calls)
+@pytest.mark.parametrize("initial_status", ["active", "notLoaded"])
+@pytest.mark.parametrize("flags", [[], ["waitingOnUserInput"]])
+def test_active_send_acknowledged_immediately(tmp_path, monkeypatch, capsys, initial_status, flags):
+    calls = []
+    record = tmp_path / "state/ding/sent.jsonl"
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active send must not wait"))
+
+    def call(method, params):
+        calls.append(method)
+        intent, = records(record)
+        assert intent["event"] == "send_intent"
+        if method in {"thread/read", "thread/resume"}:
+            value = thread(status=initial_status if method == "thread/read" else "active")
+            value["status"]["activeFlags"] = flags
+            return {"thread": value}
+        assert method == "thread/queue/add"
+        assert params["clientUserMessageId"] == intent["client_message_id"]
+        assert params["input"] == [{"type": "text", "text": intent["message"]}]
+        return {"queuedSubmission": {"id": "own-q", "clientUserMessageId": intent["client_message_id"],
+                                     "input": params["input"]}}
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 0
+    intent, result = records(record)
+    assert result["outcome"] == "queued_behind_active"
+    assert result["error"] is None
+    assert result["queued_submission_id"] == "own-q"
+    assert result["turn_id"] is None
+    assert result["turn_status"] is None
+    assert result["client_message_id"] == intent["client_message_id"]
+    assert calls == (["thread/read", "thread/resume"] if initial_status == "notLoaded" else ["thread/read"]) + [
+        "thread/queue/add",
+    ]
+    assert "queued_behind_active" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("reject", ["add", "history", "start"])
@@ -1481,43 +1509,46 @@ def test_known_rejection_preserves_acknowledged_queue(monkeypatch, reject):
     assert calls.count("thread/queue/start") <= 1
 
 
-def test_active_session_becomes_idle_starts_only_own_queue_item(monkeypatch):
+@pytest.mark.parametrize("observed", [False, True])
+def test_idle_send_becomes_active_accepts_queue_without_start_or_wait(monkeypatch, observed):
     calls = []
-    reads = ["active", "active", "idle"]
-    monkeypatch.setattr(ding.time, "sleep", lambda seconds: None)
+    reads = ["idle", "active"]
+    submitted = [False]
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active send must not wait"))
 
     def call(method, params):
         calls.append((method, params))
         if method == "thread/read":
             return {"thread": thread(status=reads.pop(0))}
         if method == "thread/queue/add":
+            submitted[0] = True
             return {"queuedSubmission": {"id": "own-q", "clientUserMessageId": MESSAGE_ID,
                                          "input": params["input"]}}
         if method == "thread/turns/list":
-            return {"data": [started_turn(OTHER_ID)]}
-        if method == "thread/queue/start":
-            assert params["queuedSubmissionId"] == "own-q"
-            return {"turn": started_turn()}
+            return {"data": [started_turn()] if observed and submitted[0] else []}
         pytest.fail(method)
 
     monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
     result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.1)
-    assert result["outcome"] == "started"
+    assert result["outcome"] == ("started" if observed else "queued_behind_active")
+    assert result["error"] is None
+    assert result["turn_id"] == ("turn-1" if observed else None)
     assert sum(method == "thread/queue/add" for method, _ in calls) == 1
-    assert sum(method == "thread/queue/start" for method, _ in calls) == 1
+    assert not any(method == "thread/queue/start" for method, _ in calls)
 
 
 @pytest.mark.parametrize("field, value", [
     ("id", None), ("clientUserMessageId", OTHER_ID),
     ("input", [{"type": "text", "text": "different"}]),
 ])
-def test_invalid_submission_echo_never_starts_an_item(monkeypatch, field, value):
+@pytest.mark.parametrize("status", ["idle", "active"])
+def test_invalid_submission_echo_never_starts_an_item(monkeypatch, field, value, status):
     calls = []
 
     def call(method, params):
         calls.append(method)
         if method == "thread/read":
-            return {"thread": thread()}
+            return {"thread": thread(status=status)}
         if method == "thread/queue/add":
             submission = {"id": "q", "clientUserMessageId": MESSAGE_ID, "input": params["input"]}
             submission[field] = value
