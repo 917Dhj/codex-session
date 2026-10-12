@@ -316,10 +316,14 @@ def test_run_state_gate_and_durable_order(tmp_path, monkeypatch, status):
     assert [e["event"] for e in events] == ["task_exit", "notification"]
     assert events[0]["run_id"] == events[1]["run_id"]
     assert events[0]["client_message_id"] == events[1]["client_message_id"]
-    expected = "skipped_active" if status == "active" else (
+    expected = "queued_behind_active" if status == "active" else (
         "started" if status in {"idle", "notLoaded"} else "failed")
     assert events[1]["outcome"] == expected
-    assert calls.count("thread/queue/add") == (1 if expected == "started" else 0)
+    assert calls.count("thread/queue/add") == (1 if expected != "failed" else 0)
+    assert calls.count("thread/queue/start") == (1 if expected == "started" else 0)
+    assert events[1]["queued_submission_id"] == ("q" if expected != "failed" else None)
+    assert events[1]["turn_id"] == ("turn-1" if expected == "started" else None)
+    assert events[1]["turn_status"] == ("inProgress" if expected == "started" else None)
 
 
 @pytest.mark.parametrize("resolved", [False, True])
@@ -445,7 +449,7 @@ def test_notification_record_failure_preserves_task_exit(tmp_path, monkeypatch, 
     path = tmp_path / "record.jsonl"
     append_jsonl = ding.append_jsonl
     monkeypatch.setattr(ding, "task_exit_code", lambda command, **kwargs: (7, None))
-    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "skipped_active", "error": None})
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "queued_behind_active", "error": None})
 
     def fail_notification(record, event):
         if event["event"] == "notification":
@@ -1557,12 +1561,13 @@ def test_delivery_resumes_and_starts_exact_submission_without_codex(monkeypatch,
     ]
 
 
-def test_resume_active_race_skips_run_without_queue(monkeypatch):
+def test_resume_active_race_acknowledges_queue(monkeypatch):
     calls = delivery_server(monkeypatch, status="notLoaded", resumed="active")
     result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID,
-                                  skip_active=True, timeout=0.01)
-    assert result["outcome"] == "skipped_active"
-    assert [method for method, _ in calls] == ["thread/read", "thread/resume"]
+                                  timeout=0.01)
+    assert result["outcome"] == "queued_behind_active"
+    assert result["queued_submission_id"] == "submission-1"
+    assert [method for method, _ in calls] == ["thread/read", "thread/resume", "thread/queue/add"]
 
 
 @pytest.mark.parametrize("status, failure", [("idle", "add"), ("idle", "start"), ("active", "add")])
@@ -1583,17 +1588,27 @@ def test_unrelated_turn_does_not_confirm_own_message(monkeypatch):
     assert sum(method == "thread/queue/start" for method, _ in calls) == 1
 
 
+@pytest.mark.parametrize("command", ["send", "run"])
 @pytest.mark.parametrize("initial_status", ["active", "notLoaded"])
 @pytest.mark.parametrize("flags", [[], ["waitingOnUserInput"]])
-def test_active_send_acknowledged_immediately(tmp_path, monkeypatch, capsys, initial_status, flags):
+def test_active_delivery_acknowledged_immediately(tmp_path, monkeypatch, capsys, command, initial_status, flags):
     calls = []
-    record = tmp_path / "state/ding/sent.jsonl"
-    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active send must not wait"))
+    record = tmp_path / "state/ding/sent.jsonl" if command == "send" else tmp_path / "run.jsonl"
+    child_calls = []
+
+    def child(argv, **kwargs):
+        child_calls.append(argv)
+        return 7, None
+
+    monkeypatch.setattr(ding, "task_exit_code", child)
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: pytest.fail("active delivery must not wait"))
 
     def call(method, params):
         calls.append(method)
         intent, = records(record)
-        assert intent["event"] == "send_intent"
+        assert intent["event"] == ("send_intent" if command == "send" else "task_exit")
+        if command == "run":
+            assert intent["exit_code"] == 7
         if method in {"thread/read", "thread/resume"}:
             value = thread(status=initial_status if method == "thread/read" else "active")
             value["status"]["activeFlags"] = flags
@@ -1605,8 +1620,15 @@ def test_active_send_acknowledged_immediately(tmp_path, monkeypatch, capsys, ini
                                      "input": params["input"]}}
 
     monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
-    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--message", "message"]) == 0
+    args = [command, THREAD_ID, "--socket", "/test.sock", "--message", "message"]
+    if command == "run":
+        args += ["--record", str(record), "--", "task"]
+    assert ding.main(args) == (0 if command == "send" else 7)
+    assert child_calls == ([] if command == "send" else [["task"]])
     intent, result = records(record)
+    if command == "run":
+        assert result["event"] == "notification"
+        assert result["run_id"] == intent["run_id"]
     assert result["outcome"] == "queued_behind_active"
     assert result["error"] is None
     assert result["queued_submission_id"] == "own-q"
