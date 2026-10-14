@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/dkitchen.png" width="420" alt="两个像素风机器人厨师：大的按响服务铃，小的端着锅应声而来">
+</p>
+
 # dkitchen
 
 [English](README.md) | **简体中文**

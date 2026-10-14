@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/dkitchen.png" width="420" alt="Two pixel-art robot chefs: the big one rings a service bell, the small one answers with a pan">
+</p>
+
 # dkitchen
 
 **English** | [简体中文](https://github.com/917Dhj/dkitchen/blob/main/README.zh-CN.md)
