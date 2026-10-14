@@ -110,7 +110,7 @@ pipx install dkitchen
 
 *d* 是我的记号。dkitchen 是我管自己厨房的方式，写下来，好让你也能开起自己的厨房。它诞生在我的科研仓库里：这个仓库在最初的四周里，用这套工作流处理了 171 个 issue，合并了 111 个 PR。
 
-米其林后厨这个比喻来自 Lauren Tan，网名 [Poteto](https://github.com/poteto)。这套工作流的很多做法都受到了 Poteto 管理 agent 方式的启发。谢谢 Poteto。🙏
+米其林后厨这个比喻来自 Lauren Tan，网名 [Poteto](https://github.com/poteto)。这套工作流的很多做法都受到了 Poteto 管理 agent 方式的启发。用 GitHub issue 管票的做法，最初改自 [Matt Pocock 的 skills](https://github.com/mattpocock/skills) 里的 issue tracker 配置。谢谢两位。🙏
 
 ## 许可证
 

@@ -110,7 +110,7 @@ Start with the orchestrator and executors, then add the designer and verifier wh
 
 The *d* is my mark. dkitchen is how I run my own kitchen, written down so you can run yours. It started in my research repo, which moved 171 issues and 111 merged PRs through this workflow in its first four weeks.
 
-The Michelin kitchen metaphor comes from Lauren Tan, known online as [Poteto](https://github.com/poteto). Poteto's way of running agents inspired much of this workflow. Thank you, Poteto. 🙏
+The Michelin kitchen metaphor comes from Lauren Tan, known online as [Poteto](https://github.com/poteto). Poteto's way of running agents inspired much of this workflow. The way tickets live on GitHub issues started from the issue tracker setup in [Matt Pocock's skills](https://github.com/mattpocock/skills). Thank you both. 🙏
 
 ## License
 
