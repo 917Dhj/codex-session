@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import ding
+from dkitchen import ding
 
 
 def test_run_marker_matches_registry_and_record_and_reaches_grandchild(tmp_path, monkeypatch):
@@ -34,7 +34,7 @@ def test_run_marker_matches_registry_and_record_and_reaches_grandchild(tmp_path,
 
 def test_writer_excludes_other_process_and_releases_after_error(tmp_path):
     path = tmp_path / "nested" / "exit.jsonl"
-    script = "import sys; from pathlib import Path; from ding import writer;\nwith writer(Path(sys.argv[1])): pass"
+    script = "import sys; from pathlib import Path; from dkitchen.ding import writer;\nwith writer(Path(sys.argv[1])): pass"
     with pytest.raises(ValueError, match="task error"):
         with ding.writer(path):
             result = subprocess.run([sys.executable, "-c", script, str(path)], capture_output=True, text=True)
@@ -83,7 +83,7 @@ def test_directory_descriptor_closed_when_sync_fails(tmp_path, monkeypatch):
 def test_concurrent_sends_append_complete_private_records(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     script = (
-        "import ding, os, sys\n"
+        "from dkitchen import ding\nimport os, sys\n"
         "os.umask(0)\n"
         "ding.deliver_message = lambda *args: {'outcome': 'started', 'error': None}\n"
         "for index in range(5):\n"
@@ -117,7 +117,7 @@ def isolated_run_registry(tmp_path, monkeypatch):
 
 def test_concurrent_run_registration_is_private_and_preserves_all_invocations(tmp_path):
     script = (
-        "import ding, os, sys\n"
+        "from dkitchen import ding\nimport os, sys\n"
         "from pathlib import Path\n"
         "os.umask(0)\n"
         "for index in range(5):\n"
@@ -145,7 +145,7 @@ def test_concurrent_run_registration_is_private_and_preserves_all_invocations(tm
 
 def test_run_lock_distinguishes_exact_invocation_and_releases_on_death(tmp_path):
     script = (
-        "import ding, sys\n"
+        "from dkitchen import ding\nimport sys\n"
         "from pathlib import Path\n"
         "with ding.registered_run('00000000-0000-4000-8000-000000000001', Path(sys.argv[1])):\n"
         "    print('ready', flush=True)\n"

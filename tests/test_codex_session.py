@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import ding
+from dkitchen import ding
 
 
 THREAD_ID = "00000000-0000-4000-8000-000000000001"

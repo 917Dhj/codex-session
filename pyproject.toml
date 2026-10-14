@@ -5,31 +5,43 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dkitchen"
 version = "0.1.0"
-description = "Message agent sessions and wake them after task completion"
+description = "A multi-agent workflow for research repos, with the ding CLI for messaging and waking agent sessions"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "917Dhj"}]
+keywords = ["agents", "multi-agent", "codex", "claude-code", "workflow", "research", "tmux", "cli"]
 dependencies = ["websocket-client>=1.9,<2"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
 [project.scripts]
-ding = "ding:main"
-codex-session = "ding:main"
+ding = "dkitchen.ding:main"
 
 [project.urls]
+Homepage = "https://github.com/917Dhj/dkitchen"
+Documentation = "https://github.com/917Dhj/dkitchen/blob/main/docs/ding.md"
 Repository = "https://github.com/917Dhj/dkitchen"
+Issues = "https://github.com/917Dhj/dkitchen/issues"
 
-[tool.setuptools]
-py-modules = ["ding"]
-package-dir = {"" = "src"}
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
