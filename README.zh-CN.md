@@ -2,11 +2,15 @@
   <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/dkitchen.png" width="240" alt="两个像素风机器人厨师：大的按响服务铃，小的端着锅应声而来">
 </p>
 
-# dkitchen
+<h1 align="center">dkitchen</h1>
 
-[English](README.md) | **简体中文**
+<p align="center">
+  <a href="README.md">English</a> | <b>简体中文</b>
+</p>
 
-**你决定做什么菜，agent 们把厨房转起来。** 🧑‍🍳
+<p align="center">
+  <b>你决定做什么菜，agent 们把厨房转起来。</b> 🧑‍🍳
+</p>
 
 dkitchen 是我每天用来跑科研仓库的多 agent 工作流。它给一组 Claude Code 和 Codex 会话分好岗位，约定它们怎么通过 GitHub issue 交接工作、什么时候必须停下来问你，并配齐把这一切串起来的工具。只有你能做的决定留给你：研究什么、试什么、花多少。
 

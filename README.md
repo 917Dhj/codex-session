@@ -2,11 +2,15 @@
   <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/dkitchen.png" width="240" alt="Two pixel-art robot chefs: the big one rings a service bell, the small one answers with a pan">
 </p>
 
-# dkitchen
+<h1 align="center">dkitchen</h1>
 
-**English** | [简体中文](https://github.com/917Dhj/dkitchen/blob/main/README.zh-CN.md)
+<p align="center">
+  <b>English</b> | <a href="https://github.com/917Dhj/dkitchen/blob/main/README.zh-CN.md">简体中文</a>
+</p>
 
-**You decide what to cook. Your agents run the kitchen.** 🧑‍🍳
+<p align="center">
+  <b>You decide what to cook. Your agents run the kitchen.</b> 🧑‍🍳
+</p>
 
 dkitchen is the multi-agent workflow I use every day to run my research repo. It gives a set of Claude Code and Codex sessions fixed stations, a shared way to hand off work through GitHub issues, clear rules for when to stop and ask you, and the tools that tie it together. You keep the decisions only you can make: what to research, what to try, what to spend.
 
