@@ -279,3 +279,14 @@ def test_log_issue_must_be_positive(capsys):
     with pytest.raises(SystemExit) as exc:
         ding.main(["log", "--item", "a", "--issue", "0"])
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("text", [None, CHINESE])
+def test_a_quoted_session_signature_signs_nothing(tmp_path, text):
+    loaded = settings(tmp_path, text)
+    stations = loaded.stations
+    verifier = (f"## {stations.verifier}{stations.separator}#272 run request check\n\n"
+                "| request body | ok: it starts with the status block and contains `Codex session:` |\n")
+    assert watch.role(verifier, loaded) == stations.verifier
+    assert watch.role("I checked it; the body has `Codex session:` in it.", loaded) == stations.user
+    assert watch.role(executor("Status: done\nWaiting on: none\nKey numbers: 1\nNext: merge"), loaded) == stations.executor

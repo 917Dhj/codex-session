@@ -61,14 +61,16 @@ def issue_number(url: str) -> int:
 
 
 def role(body: str, config: Config) -> str:
-    """The executor by its session line; otherwise the station named at the start of the first line; else the user."""
+    """The station named at the start of the first line; otherwise the executor by a line starting with its
+    session signature; else the user. A session signature quoted inside a line signs nothing."""
     stations = config.stations
-    if "Codex session:" in body:
-        return stations.executor
     first = next((line for line in body.splitlines() if line.strip()), "")
     first = re.sub(r"^[\s#*>]+", "", first)
-    return next((name for name in (stations.designer, stations.verifier, stations.orchestrator)
-                 if first.startswith(name)), stations.user)
+    signed = next((name for name in (stations.designer, stations.verifier, stations.orchestrator)
+                   if first.startswith(name)), None)
+    if signed:
+        return signed
+    return stations.executor if re.search(r"(?m)^[ \t]*Codex session:", body) else stations.user
 
 
 def fields(body: str, config: Config) -> dict[str, str]:
