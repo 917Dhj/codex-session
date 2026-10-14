@@ -1,116 +1,117 @@
 # dkitchen
 
-`ding` passes messages between agent sessions and wakes a session when a task finishes. The current backend is Codex App Server.
+**English** | [简体中文](https://github.com/917Dhj/dkitchen/blob/main/README.zh-CN.md)
 
-This is an independent project, not an official OpenAI tool. The package is `dkitchen`, the Python module is `ding`, and the command is `ding`. The transitional `codex-session` command uses the same entry point and will be removed in a later release.
+**You decide what to cook. Your agents run the kitchen.** 🧑‍🍳
 
-`ding` may conflict with other CLI commands of the same name, including [liviu-/ding](https://github.com/liviu-/ding) and [dingdone](https://pypi.org/project/dingdone/).
+dkitchen is the multi-agent workflow I use every day to run my research repo. It gives a set of Claude Code and Codex sessions fixed stations, a shared way to hand off work through GitHub issues, clear rules for when to stop and ask you, and the tools that tie it together. You keep the decisions only you can make: what to research, what to try, what to spend.
 
-## Installation
+## 🍽️ Why a kitchen
 
-Requires Python 3.10 or later and a POSIX system. Tested on Linux with `codex-cli 0.162.0`. The CLI uses Unix sockets and `fcntl` locks.
+AI agents made execution cheap. The bottleneck moved to you.
+
+With one agent, you supervise every step. With several, you become the message bus: copying context between sessions, checking whether a job finished, remembering which session owns which task, approving small things all day. Your GPUs sit idle between runs because nobody noticed the last one ended. By evening you have touched everything and thought about nothing.
+
+A Michelin kitchen solves the same problem. The head chef designs the menu and tastes the dishes. Everyone else has a station, every order is a ticket, and a bell rings when a dish is ready. The head chef never chops onions, and never loses track of the kitchen.
+
+dkitchen sets up your agents the same way. You are the head chef.
+
+## 🧑‍🍳 The kitchen
+
+| Station | In a kitchen | What it does | Runs on |
+| --- | --- | --- | --- |
+| 👑 **You** | Head chef | Choose the direction, approve designs and budgets, decide what the results mean for your paper. | You |
+| 🤖 **Orchestrator** | Sous chef at the pass | Schedules tickets, GPUs, and concurrency. Relays messages, reviews and merges PRs, reports facts to you. | Claude Code · Claude Opus 5.5 |
+| 🤔 **Designer** | Recipe developer | Writes tickets, designs methods and every piece of text a model will see, interprets results. | Claude Code · Claude Opus 5.5 |
+| 🔍 **Verifier** | Taster | Checks facts against code and data before money is spent. Reports what it found and never makes the call. | Claude Code · Claude Sonnet 5.5 |
+| 🔪 **Executors** | Line cooks | One fresh session per ticket, in its own worktree. Implements, runs, and reports on the ticket. | Codex · GPT-6.1 Sol |
+
+Each station has written rules for what it owns, what it hands off, and when it must stop. When something fits no station, the agents ask you.
+
+## 🎫 How a ticket moves through the kitchen
+
+1. **You and the designer agree on what to do.** The designer writes it up as a GitHub issue: the goal, the exact steps, and the budget the work may spend.
+2. **The verifier checks the ticket's premises** against the code and data: field names, dataset ranges, call counts, cost estimates.
+3. **The orchestrator dispatches it** to a new executor session and picks free GPUs.
+4. **The executor works and reports on the ticket.** Every comment opens with the same four lines: status, who it is waiting on, the key numbers, and what happens next. Long jobs start with `ding launch`; when the job exits, `ding` wakes the executor so it can read the output and continue.
+5. **Results go to the designer** for interpretation. The orchestrator reviews the PR, merges it, and logs what it did and why.
+6. **You read a short report** and make the next call.
+
+Every decision, request, and result lives on a ticket, so any session (or you, a week later) can pick up the story from GitHub.
+
+## ✋ What stays with you
+
+The rules write down which calls belong to the head chef:
+
+- the research direction, how datasets are used, and what the paper claims;
+- model runs, paid API calls, or service starts beyond what a ticket's approved budget covers.
+
+Agents propose on these and wait. An approval only counts when it is in your own words. Neither the orchestrator nor the designer can approve on your behalf.
+
+Everything else the kitchen handles on its own, by one rule: **if anyone would do it the same way, the agents do it. If the choice changes the results, the cost, or the direction, they stop and wait for you.**
+
+This is what lets you walk away. While you are in class, asleep, or reading papers, an issue watcher wakes the orchestrator when an executor finishes a stage, gets stuck, or goes quiet; when you leave a comment; or when a PR opens. The orchestrator moves forward what is already approved and leaves a list of decisions for when you are back.
+
+## ⚖️ One pool of resources
+
+A research repo has more resources than any single agent sees: GPUs on several servers, a shared model server, CPU time, an API budget, tokens, and hours in the day. In dkitchen the orchestrator, running on the strongest model you have, manages them as one pool.
+
+- 🖥️ **Compute.** It schedules tickets across free GPUs and checks the shared model server's load before raising concurrency.
+- 💰 **Money.** Each ticket that runs models carries one approved budget for calls, cost, and GPU hours. Stages within the budget start right away, and anything beyond it comes back to you.
+- 🪙 **Tokens.** One session per ticket keeps each context small, and fact-checking runs on a cheaper model.
+- ⏱️ **Time.** Jobs wake their owner when they exit, so nothing waits for someone to look.
+
+## 🧰 The tools
+
+### 🛎️ `ding`, the bell
+
+`ding` passes messages between agent sessions and wakes a session when its long job ends.
+
+```bash
+ding board                                            # who is working on what, in this repo
+ding send '#42' --from orchestrator --message-file note.md
+ding launch train -- python train.py                  # run in tmux, wake me when it exits
+```
+
+You can address a session by its UUID, its name, or a GitHub issue such as `'#42'`; `ding` finds the session that owns that ticket. On Linux, `ding board` also lists long-running processes that were started without `ding`, so you can spot jobs nobody will be woken for.
+
+`ding` talks to Codex sessions through the Codex App Server. The full guide is in [docs/ding.md](https://github.com/917Dhj/dkitchen/blob/main/docs/ding.md).
+
+## 🚀 Get started
+
+### Requirements
+
+- Linux or another POSIX system, with `tmux`
+- Python 3.10 or later
+- A GitHub repo and the `gh` CLI
+- Claude Code, and Codex with its App Server running under the same user
+
+### Install `ding`
 
 ```bash
 pipx install git+https://github.com/917Dhj/dkitchen.git
-pipx ensurepath
 ```
 
-For an existing pipx installation, run `pipx uninstall codex-session` before installing the renamed package.
+## ❓ FAQ
 
-Without pipx, install into a virtual environment and add its bin directory to your shell's `PATH`.
+**Is it safe to let agents run unattended?**
+They stop for anything that changes direction, results, or spending, and approvals only come from your own words on a ticket. Every action is a comment or a PR on GitHub, so you can audit the night's work over coffee.
 
-```bash
-python3 -m venv ~/.local/share/dkitchen
-~/.local/share/dkitchen/bin/python -m pip install git+https://github.com/917Dhj/dkitchen.git
-export PATH="$HOME/.local/share/dkitchen/bin:$PATH"
-```
+**Will it fit my repo?**
+The rules were written for computational research, and most of them carry over to any repo with long-running jobs.
 
-A compatible Codex App Server must already run under the same user. Notifications use the App Server `thread/resume`, `thread/queue/add`, and `thread/queue/start` interfaces available in the tested version. The `codex` executable is not required in the calling shell or tmux `PATH`. These interfaces use an experimental API and may change with Codex versions.
+**Do I need both Claude Code and Codex?**
+For now, yes. That is the combination I run every day.
 
-## Sessions and messages
+**Isn't this too much process for a small project?**
+Start with the orchestrator and executors, then add the designer and verifier when you want them.
 
-```bash
-ding board
-ding board --all
-ding board --status
-ding board --min-age 600 --min-cpu 10
-ding read UUID
-ding read --head 'Exact session name'
-ding status '#186'
-ding status '917Dhj/Human-centric-agents#186'
-ding status https://github.com/917Dhj/Human-centric-agents/issues/186
-ding send --issue 186 --message-file message.txt --from coordinator
-printf '%s\n' 'Your message' | ding send UUID --message -
-ding run UUID --message 'Your message' --record exit.jsonl -- python task.py
-ding launch training -- python task.py
-```
+## 💡 About
 
-`board` prints tab-separated columns `NAME`, `CWD`, `STATUS`, `ISSUE`, `HEAD`, and `RUN`. `HEAD` contains the first paragraph of the latest final reply. Sessions without a final reply have a blank summary. `RUN` contains the most recently registered run's state, or is blank for sessions without a registered run.
+The *d* is my mark. dkitchen is how I run my own kitchen, written down so you can run yours. It started in my research repo, which moved 171 issues and 111 merged PRs through this workflow in its first four weeks.
 
-By default, `board` includes loaded sessions with `idle` or `active` status and registered run targets, including unloaded sessions. The scope is the current Git repository and its linked worktrees, or the current directory outside Git. Registered targets use the session's directory when available and the run's launch directory otherwise. `--all` includes all non-archived App Server sessions and registered targets in every directory. If the App Server is unavailable, registered targets still appear with their UUID, launch directory, and `unavailable` session status. The board only reads sessions and records. It never restores a session or retries a notification.
+The Michelin kitchen metaphor comes from Lauren Tan, known online as [Poteto](https://github.com/poteto). Poteto's way of running agents inspired much of this workflow. Thank you, Poteto. 🙏
 
-With `gh` available, the board looks up issues in the current repository. An issue with a `Codex owner: UUID` line belongs only to its latest owner across the body and comments. Other issues belong to every valid `Codex session: UUID` reference. An invalid latest owner prints a warning and omits that issue. A failed lookup prints a warning to stderr and leaves `ISSUE` blank.
+## License
 
-`board --status` replaces `HEAD` with the latest matching executor comment's opening four lines, flattened into one cell. The lines must have nonempty values for `状态:`, `在等:`, `关键数字:`, and `下一步:` in that order. A comment's last `Codex owner` line takes precedence over its `Codex session` lines. Comments match canonical session UUIDs, and the newest comment across the session's mapped issues wins. If that comment has no complete status block, `HEAD` uses the final reply. Failed comment lookups or invalid matching timestamps also use the final reply with a warning. Each distinct visible issue gets one `gh issue view NUMBER --repo OWNER/REPO --json comments` call, with at most four calls at once. Ordinary `board` does not fetch individual issue comments.
-
-On Linux, every `board` invocation also checks local processes owned by the current effective user. When it finds unwrapped work, it appends a separate table with `UNWRAPPED_PID`, `CPU%`, `AGE_SECONDS`, `TMUX_SESSION`, `TMUX_WINDOW`, and `COMMAND`. This check covers the local host regardless of the session table's repository scope or `--all`. Findings remain visible if the session lookup fails; the command still returns that lookup's failure code.
-
-The default minimum process age is 600 seconds. Each tmux pane contributes at most one task, its root workload or the topmost workload beneath its root, regardless of CPU usage. Shells running a script or `-c` command count as workloads, with age measured from the shell's own start time. Shells whose live immediate children are all run wrappers are omitted. Interactive shells without a script or `-c` command are skipped, and idle shell panes are omitted. Processes outside tmux panes must also meet the default 10 percent lifetime CPU usage per core threshold. `--min-age SECONDS` and `--min-cpu PERCENT` accept finite nonnegative values, including CPU thresholds over 100 for multicore jobs. The check uses one `/proc` snapshot without a sampling delay. A process is wrapped when it or a verifiable ancestor is an actual `ding run` or `codex-session run` invocation, including older wrappers without an environment marker. A marker alone does not hide a process after its wrapper dies. Broken or cyclic ancestry, inaccessible processes, zombies, and known infrastructure processes are omitted. Infrastructure includes tmux servers, pure SSH tunnels (`-N`, or forwarding without a remote command), Codex, Claude, common editors, and language services; their workload children are checked independently. The entire `ssh_tunnel` tmux session is excluded. tmux context comes from the ancestor pane PID or a mapped `TMUX_PANE`; it is blank when unavailable. An unavailable `/proc` audit prints a warning.
-
-This is a conservative process heuristic, not a complete task inventory. Outside tmux panes it can miss GPU jobs that use little CPU and other low-utilization jobs. It also omits short jobs and processes whose ancestry cannot be read. It does not query GPUs or remote hosts.
-
-Every target (`send`, `run`, `read`, and `status`) accepts a UUID, an exact name displayed by `board`, a quoted `'#186'`, `--issue 186`, `OWNER/REPO#186`, or `https://github.com/OWNER/REPO/issues/186`. GitHub `/pull/186` links are treated as issues, and a trailing slash, query strings such as `?notification_referrer_id=...`, and fragments such as `#issuecomment-123` are ignored. Qualified issue numbers and links use their explicit repository regardless of the current directory; `'#186'` and `--issue 186` use the current directory's repository. Names are matched across all non-archived sessions. Missing or ambiguous names report candidates. Issue targets use the latest `Codex owner: UUID` line across the body and comments. Without an owner, all `Codex session: UUID` references must identify one session; repeated mentions of the same UUID are allowed. Multiple distinct sessions cause refusal before sending, starting a task, or querying a reply/status. The error lists each candidate's UUID, App Server name and status, comment count, and latest comment creation time and link. A body-only reference has zero comments and uses the issue's creation time and link. Unavailable session metadata is shown as `unknown`. An invalid latest owner or an owner-free invalid session reference also causes refusal. Specify a UUID or exact session name to resolve ambiguity. Quote `#186` so the shell does not treat it as a comment. A session without a name displays its UUID. Control characters and quotes are escaped in board cells and candidate details.
-
-`read` prints the latest final assistant reply. `read --head` prints only the lines before its first blank line. `status` prints the App Server status as JSON. `send` restores an unloaded session through the existing App Server and queues one message. An active session returns exit code 0 immediately after the App Server acknowledges the matching queue item, with outcome `queued_behind_active`. The App Server automatically starts queued messages after the current turn finishes normally. A turn waiting for user input must finish first; an interruption or budget pause leaves queued messages pending. Queue acceptance does not confirm execution. For an idle session, `send` starts its exact queue item and confirms that the matching message began execution within 60 seconds, including turns that completed during confirmation. That returns exit code 0 with outcome `started`. Neither outcome confirms that the work completed successfully.
-
-Both `send` and `run` require either `--message TEXT` or `--message-file PATH`. `--message -` reads stdin. Files use UTF-8. `--from NAME` adds a first line of `[from NAME]` to the message.
-
-`send` persists a unique client message ID, timestamp, sender, target, and full message before delivery, then appends the result to `${XDG_STATE_HOME:-~/.local/state}/ding/sent.jsonl`. Issue targets are recorded as `OWNER/REPO#186`, including short `'#186'` and `--issue 186` inputs. The file has private permissions, and concurrent sends serialize their log writes. Results distinguish `started`, `queued_behind_active`, `queued`, `unknown`, and `failed`, with queue item and turn IDs when available. `queued_behind_active` records the acknowledged queue item without claiming a turn ID. A `queued` or `unknown` result returns a nonzero exit code and warns against resending. A lost acknowledgement triggers read-only history reconciliation; delivery mutations are never retried. A result log failure also warns against resending. The durable intent remains available when the result cannot be saved.
-
-## Long tasks
-
-From the owning Codex session, use `launch` to start a wrapped long job in a dedicated detached tmux session.
-
-```bash
-ding launch training -- python task.py
-ding launch evaluation --message 'Evaluation finished; inspect exit.jsonl' \
-  --record "$PWD/exit.jsonl" -- python evaluate.py
-tmux attach -t ding-training
-```
-
-`launch NAME` creates tmux session `ding-NAME` and its first window `NAME` in the caller's current directory. Names contain 1-64 letters, digits, underscores, or hyphens and start with a letter or digit. Existing names cause an error; sessions are never reused or replaced. The new pane has `remain-on-exit` enabled before the task starts and remains available after the wrapper exits. After inspecting the output and records, the launching executor closes it with `tmux kill-session -t =ding-NAME`. A successful launch reports tmux creation and the absolute record path; it does not mean the task has finished. A launch timeout leaves creation unconfirmed and warns against retrying before inspecting tmux and records.
-
-`launch` reads and validates `CODEX_THREAD_ID` before invoking tmux, and passes the canonical UUID explicitly to `run`. It accepts `--message`, `--message-file`, `--from`, `--record`, and `--socket`. With no message option, the notification is `Task NAME exited; inspect ABSOLUTE_RECORD_PATH`. The default record is `${XDG_STATE_HOME:-~/.local/state}/ding/launch-records/LAUNCH_UUID.jsonl`. Input files, stdin, and the sender prefix are materialized once in the caller into a retained UTF-8 message file `LAUNCH_UUID.message.txt` in that directory, with mode `0600` and directory mode `0700`. Explicit record and socket paths are made absolute before entering tmux.
-
-The inner wrapper uses the current absolute Python interpreter and module file. Each new tmux session receives the caller's `CODEX_THREAD_ID`, `PATH` (or the system default when absent), `HOME`, effective absolute `XDG_STATE_HOME`, and `PYTHONPATH` (empty when absent). Global tmux environment settings are unchanged. Other variables may still come from tmux's environment; pass task-specific settings explicitly, for example `ding launch training -- env CUDA_VISIBLE_DEVICES=0 python train.py`.
-
-Direct `ding run UUID --message TEXT --record PATH -- COMMAND` remains available. Both forms export `DING_RUN_ID` to the wrapped child and its descendants, using the exact registry `run_id` and replacing any inherited outer marker. The caller's environment is unchanged.
-
-Keep the wrapped command in the foreground. `run` records the task's exit, message, and unique client message ID before checking the session. Notifications use the same delivery as `send`. An active session, including one restored with active work, acknowledges the notification as `queued_behind_active` immediately. An idle session, including one restored as idle, receives execution confirmation for the exact queued message. A failed status check prevents delivery. The wrapper preserves the task's exit code regardless of notification success. Each invocation appends `task_exit` and `notification` JSONL records with a shared `run_id` and client message ID. The wrapper does not rerun the task.
-
-Before starting the command, `run` appends a `run_start` entry to `${XDG_STATE_HOME:-~/.local/state}/ding/runs.jsonl`. Failure to register prevents the command from starting. The registry has mode `0600`, and its `ding` directory has mode `0700`. Concurrent registrations serialize this durable append. Each line has this shape.
-
-```json
-{"event":"run_start","run_id":"UUID","thread_id":"CANONICAL_SESSION_UUID","record":"/absolute/exit.jsonl","pid":1234,"started_ns":1791799200000000000,"cwd":"/absolute/launch/directory"}
-```
-
-The registry stores one start event per invocation. `board` uses the last valid registration for each session, then matches `task_exit` and `notification` records by `run_id` and `thread_id`. Older records without a registry entry are not discovered. Invalid registry rows print warnings and are skipped.
-
-Each invocation holds a private lock at `ding/run-locks/RUN_ID.lock` until the wrapper exits after notification. The lock descriptor does not pass to the task. Process death or a reboot releases the lock, and PID reuse cannot make that invocation appear alive. The token files remain after exit so readers can probe the same invocation without creating or replacing files.
-
-`RUN` is `running` while the lock is held and no exit is recorded. It is `lost` when no exit is recorded and the lock is absent or released. After a recorded task exit, `exited(CODE)` means notification is still pending in a live wrapper, started, or acknowledged behind active work. Historical `skipped_active` receipts also display `exited(CODE)`. `notify_failed` means a failed or unconfirmed notification, including `queue_failed`, `failed`, `unknown`, or `queued`. A dead wrapper with an exit but no notification receipt also shows `notify_failed`. Missing or empty records provide no exit evidence. Unreadable records or corrupt complete events show `unknown` with a warning. An incomplete trailing JSON event is ignored with a warning, preserving earlier complete receipts.
-
-Wakeups use the existing App Server after the task exits. The wrapper adds at most one message and starts at most its own queue item once. It has no CLI fallback or automatic replay.
-
-The CLI discovers a single socket under `/tmp/codex-daemon-<uid>`. To choose one explicitly, add `--socket /path/to/socket` before the wrapped command's `--`. For a remote host, run the CLI there over SSH.
-
-A session can become active between checking and sending. After a matching queue acknowledgement, observing that state returns `queued_behind_active` without waiting or explicitly starting the item. Check the delivery record and session history before resending; a new command creates a new message ID and can duplicate work. Killing the wrapper with SIGKILL or shutting down its host prevents notification. Failure to persist the initial exit record returns an error and prevents notification.
-
-## Development
-
-```bash
-python -m pip install -e '.[dev]'
-python -m pytest tests/test_codex_session.py tests/test_records.py
-```
-
-CI runs the tests on Python 3.10, 3.11, and 3.12. Tests never send messages to real sessions.
+[MIT](https://github.com/917Dhj/dkitchen/blob/main/LICENSE)
