@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dkitchen</title>
+<style>
+  /* Silkscreen and VT323, both under the SIL Open Font License; see fonts/ */
+  @font-face { font-family: "Silkscreen"; src: url("fonts/Silkscreen-Regular.ttf"); }
+  @font-face { font-family: "VT323"; src: url("fonts/VT323-Regular.ttf"); }
+  html, body { margin: 0; background: #0d1117; }
+  canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="kitchen" width="960" height="540"></canvas>
+<script>
+// Everything is drawn on a 240x135 grid of 4x4-pixel units; text is drawn in canvas pixels.
+const U = 4;
+const canvas = document.getElementById("kitchen");
+const ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const C = {
+  wall: "#1d1a17", tile: "#23201c", band1: "#211d19", floor: "#191715", line: "#2e2924",
+  outline: "#0f0d0c", steel: "#9ea3ab", steelHi: "#c9ced6", steelLo: "#6c717a",
+  ink: "#f4efe6", muted: "#9b958b", brass: "#d9a441", claude: "#f6622a", codex: "#5c86f8",
+};
+
+const SPRITES = {
+  crab: { map: { "#": "#f6622a", h: "#ff8c5a", e: "#0f0d0c", d: "#c94a1c" }, rows: [
+    "  ##############  ",
+    "  #hh###########  ",
+    "  ##ee######ee##  ",
+    "  ##ee######ee##  ",
+    "##################",
+    "##################",
+    "  ##############  ",
+    "  dddddddddddddd  ",
+    "  d  d      d  d  ",
+    "  d  d      d  d  ",
+  ]},
+  toque: { map: { w: "#f4f1ea", g: "#d8d4cc", b: "#e2ded6" }, rows: [
+    "   wwwwww   ",
+    " wwwwwwwwww ",
+    "wwwwwwwwwwww",
+    "wwwgwwwwgwww",
+    "wwwwwwwwwwww",
+    " wwwwwwwwww ",
+    " bbbbbbbbbb ",
+  ]},
+  toqueSmall: { map: { w: "#f4f1ea", g: "#d8d4cc", b: "#e2ded6" }, rows: [
+    "  wwwwww  ",
+    " wwwwwwww ",
+    "wwwgwwgwww",
+    " wwwwwwww ",
+    " bbbbbbbb ",
+  ]},
+  codex: { map: { b: "#5c86f8", L: "#8fb0ff", d: "#3d5fd6", s: "#1a1f54", k: "#dfe6ff" }, rows: [
+    "    bbbb  bb    ",
+    "   bLLbbbbbbbb  ",
+    " bbbbbbbbbbbbbb ",
+    "bbbbbbbbbbbbbbbb",
+    "bbbssssssssssbbb",
+    "bbbskssssssssbbb",
+    "bbbsskssssssbbbb",
+    "bbbsksssksssbbbb",
+    "bbbssssssssssbbb",
+    " bbbbbbbbbbbbbb ",
+    "   bbbbbbbbbb   ",
+    "  b bbbbbbbb b  ",
+    "  b bbbkkbbb b  ",
+    "    bbbbbbbb    ",
+    "    bbb  bbb    ",
+    "    ddd  ddd    ",
+  ]},
+  codexIdle: { map: { b: "#4a63b0", L: "#6f86c9", d: "#34488a", s: "#141833", k: "#5a6aa8" }, rows: [
+    "    bbbb  bb    ",
+    "   bLLbbbbbbbb  ",
+    " bbbbbbbbbbbbbb ",
+    "bbbbbbbbbbbbbbbb",
+    "bbbssssssssssbbb",
+    "bbbssssssssssbbb",
+    "bbbskkssskksbbbb",
+    "bbbssssssssssbbb",
+    "bbbssssssssssbbb",
+    " bbbbbbbbbbbbbb ",
+    "   bbbbbbbbbb   ",
+    "  b bbbbbbbb b  ",
+    "  b bbbbbbbb b  ",
+    "    bbbbbbbb    ",
+    "    bbb  bbb    ",
+    "    ddd  ddd    ",
+  ]},
+  chef: { scale: 0.5, map: { w: "#f4f1ea", g: "#d8d4cc", b: "#e2ded6", h: "#2a1f1b", H: "#5a463b", f: "#f0c39e", k: "#2e2420",
+                 G: "#141414", l: "#ffffff", e: "#1b1b1b", s: "#d9a07c", p: "#eaa08e", m: "#9a4a3a", j: "#f7f5f0",
+                 J: "#ddd8cf", x: "#3a3a3a", r: "#2f3542", a: "#e6e2da", n: "#2b2f38", o: "#151515" }, rows: [
+    "    wwwwww  wwwwwwww  wwwwww    ",
+    "   wwwwwwwwwwwwwwwwwwwwwwwwww   ",
+    "  wwwwwwwwwwwwwwwwwwwwwwwwwwww  ",
+    "  wwwwwwgwwwwwwwwwwwwwwgwwwwww  ",
+    "  wwwwwwgwwwwwwwwwwwwwwgwwwwww  ",
+    "  wwwwwwgwwwwwwwwwwwwwwgwwwwww  ",
+    "  wwwwwwgwwwwwwwwwwwwwwgwwwwww  ",
+    "  wwwwwwgwwwwwwwwwwwwwwgwwwwww  ",
+    "  wwwwwwwwwwwwwwwwwwwwwwwwwwww  ",
+    "   wwwwwwwwwwwwwwwwwwwwwwwwww   ",
+    "    bbbbbbbbbbbbbbbbbbbbbbbb    ",
+    "    bbbbbbbbbbbbbbbbbbbbbbbb    ",
+    "     hhhhhhhhhhhhhhhhhhhhhhh    ",
+    "    HhhhHhhhhhHhhhhhHhhhhhHhh   ",
+    "    hhhfhkkkkfhhhffkkkkfffhhh   ",
+    "    HhGGGGGGGGGffGGGGGGGGGHhh   ",
+    "    hhGlffffffGGGGlffffffGhhh   ",
+    "    hhGffeefffGffGfffeeffGhhh   ",
+    "    HhGffeefffGffGfffeeffGHhh   ",
+    "    hhGGGGGGGGGffGGGGGGGGGhhh   ",
+    "     hfppffffffssffffffppf h    ",
+    "       ffffffffffffffffff       ",
+    "       ffffffmffffmffffff       ",
+    "       fffffffmmmmfffffff       ",
+    "        ffffffffffffffff        ",
+    "         ffffffffffffff         ",
+    "           ffffffffff           ",
+    "            ffffffff            ",
+    "          jjjrrrrrrjjj          ",
+    "        jjjjjjrrrrjjjjjj        ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjxxjjjjxxjjjjjJ      ",
+    "      JjjjjjxxjjjjxxjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjxxjjjjxxjjjjjJ      ",
+    "      JjjjjjxxjjjjxxjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      JjjjjjjjjjjjjjjjjjjJ      ",
+    "      ffjjjjjjjjjjjjjjjjff      ",
+    "      ffjjjjjjjjjjjjjjjjff      ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "        aaaaaaaaaaaaaaaa        ",
+    "          nnnnn  nnnnn          ",
+    "          nnnnn  nnnnn          ",
+    "          nnnnn  nnnnn          ",
+    "          nnnnn  nnnnn          ",
+    "          nnnnn  nnnnn          ",
+    "          nnnnn  nnnnn          ",
+    "         oooooo  oooooo         ",
+    "         oooooo  oooooo         ",
+  ]},
+  spoon: { map: { s: "#d6dae0", h: "#9ea1aa" }, rows: [
+    "ss",
+    "ss",
+    " h",
+    " h",
+    " h",
+    " h",
+    " h",
+  ]},
+  laptop: { map: { k: "#9ea1aa", s: "#11141c", g: "#7fd18b", b: "#7aa2ff", y: "#e8c56a", p: "#c792ea", d: "#6c717a" }, rows: [
+    " kkkkkkkkkkkk ",
+    " kssssssssssk ",
+    " ksggggsbbbsk ",
+    " ksssyyyyysss ",
+    " kssppsgggssk ",
+    " ksssbbbbsssk ",
+    " ksggsssssssk ",
+    " kkkkkkkkkkkk ",
+    "dddddddddddddd",
+  ]},
+  bell: { map: { y: "#d9a441", Y: "#a87a2a", s: "#c9ced6", l: "#f3f5f8" }, rows: [
+    "    yy    ",
+    "    ss    ",
+    "  ssssss  ",
+    " sllsssss ",
+    " ssssssss ",
+    "yyyyyyyyyy",
+    " YYYYYYYY ",
+  ]},
+  scroll: { map: { p: "#efe6cf", g: "#9b8f78", r: "#c9b892" }, rows: [
+    "rrrrrrr",
+    "ppppppp",
+    "pgggggp",
+    "ppppppp",
+    "pggggpp",
+    "ppppppp",
+    "rrrrrrr",
+  ]},
+  magnifier: { map: { o: "#9ea1aa", ".": "#bfe3ff", h: "#6b4226" }, rows: [
+    " ooo   ",
+    "o...o  ",
+    "o...o  ",
+    "o...o  ",
+    " ooo   ",
+    "    h  ",
+    "     h ",
+  ]},
+  mug: { map: { m: "#d9d4ca", c: "#5a3a22", s: "#8c877e" }, rows: [
+    "mccm  ",
+    "mmmmmm",
+    "mmmm m",
+    "mmmmmm",
+    "mmmm  ",
+  ]},
+};
+
+for (const [name, sprite] of Object.entries(SPRITES)) {
+  const width = sprite.rows[0].length;
+  sprite.rows.forEach((row, i) => {
+    if (row.length !== width) throw new Error(`${name} row ${i} is ${row.length} wide, expected ${width}`);
+  });
+}
+
+function rect(x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x * U, y * U, w * U, h * U);
+}
+
+function sprite(name, x, y, outline = true) {
+  const { map, rows, scale: s = 1 } = SPRITES[name];
+  if (outline) {
+    rows.forEach((row, j) => [...row].forEach((ch, i) => {
+      if (ch !== " ") for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) rect(x + (i + dx) * s, y + (j + dy) * s, s, s, C.outline);
+    }));
+  }
+  rows.forEach((row, j) => [...row].forEach((ch, i) => { if (ch !== " ") rect(x + i * s, y + j * s, s, s, map[ch]); }));
+}
+
+function text(str, x, y, { size = 16, color = C.ink, align = "left", font = "Silkscreen" } = {}) {
+  ctx.font = `${size}px ${font}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = "top";
+  ctx.fillText(str, x * U, y * U);
+}
+
+// ---- time ---------------------------------------------------------------
+// renderAt(t) draws the frame at t seconds; the same t always draws the same frame.
+const DURATION = 36.6;
+// The story runs on two clocks. REAL is the time in the loop. STORY is the time of the work in the kitchen;
+// it pauses while the head chef and the designer talk (REAL 3 to 12.1) and then runs 4.6 s behind REAL.
+const TALK_END = 12.1, SHIFT = 4.6;
+let REAL = 0, STORY = 0;
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const ease = (p) => (p < 0.5 ? 2 * p * p : 1 - (-2 * p + 2) ** 2 / 2);
+const lerp = (a, b, p) => a + (b - a) * p;
+const half = (v) => Math.round(v * 2) / 2;                 // moving things stay on the half-unit grid
+const tick = (t, fps) => Math.floor((t - STORY + REAL) * fps);  // stepped idle animation, always on REAL time
+const noise = (n) => { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); };
+
+// ---- story --------------------------------------------------------------
+const CAPTIONS = [
+  [0.0, "$ ding board      4 cooking · GPU2-3 free · 5 tickets on the rail"],
+  [3.0, 'you: "try method B on dataset X?"'],
+  [4.4, "designer comes over: this one changes what the model sees"],
+  [5.4, 'designer: "PROPOSAL: new prompts for B. your call"'],
+  [7.6, 'you: "yes. keep the old prompts as the baseline"'],
+  [10.2, 'designer$ gh issue create --title "Eval method B on X"   → #17'],
+  [12.1, "verifier$ ding check-refs check.md   → 0 problems"],
+  [13.5, 'verifier → orchestrator: "#17 pass"'],
+  [14.6, "orchestrator$ ding board   → GPU2, GPU3 free"],
+  [15.6, 'orchestrator$ ding relay 17 --message "start #17 on GPU2-3"'],
+  [17.2, "codex #17$ ding launch eval17 -- python eval.py --gpus 2,3"],
+  [19.1, "orchestrator$ ding watch   → #14 Status: waiting on design"],
+  [21.4, 'designer → orchestrator: "#14 answered, see the ticket"'],
+  [23.6, "codex #13$ pytest   → 48 passed · PR #31 opened"],
+  [25.2, "orchestrator$ scripts/review_pr.py 31   → ready to merge"],
+  [26.4, "orchestrator$ ding merge 31 3f9c2a1   → merged"],
+  [28.6, "orchestrator → you: 1 decision waiting"],
+  [31.2, 'orchestrator$ ding relay 14 --message "approved: +1.2k calls"'],
+  [32.6, "$ ding board      5 cooking · GPU0-3 busy · you: 0 waiting"],
+];
+
+// Which parts of the kitchen are lit; the rest is dimmed.
+// The resource panel is never dimmed.
+const REGIONS = { head: [0, 0, 180, 34], pass: [0, 34, 180, 46], line: [0, 80, 180, 44] };
+const FOCUS = [  // in REAL time
+  [0, 1, ["head"]], [1, 2, ["pass"]], [2, 3, ["line"]],
+  [3, 12.1, ["head", "pass"]], [12.1, 14.6, ["pass"]], [14.6, 19.1, ["pass", "panel", "line"]],
+  [19.1, 23.6, ["pass", "line"]], [23.6, 28.6, ["pass", "line"]], [28.6, 32.6, ["head", "pass", "panel"]],
+];
+
+function lit(region, t) {
+  const at = (u) => { const w = FOCUS.find(([a, b]) => u >= a && u < b); return !w || w[2].includes(region) ? 1 : 0; };
+  let sum = 0;
+  for (let k = -2; k <= 2; k++) sum += at(t + k * 0.12);
+  return sum / 5;
+}
+
+// The ticket rail: six slots; #17 arrives, #13 leaves.
+const SLOT = (i) => 72 + i * 17;
+function tickets(t) {
+  const order = t < 22.8 ? ["#12", "#13", "#14", "#15", "#16", "#17"] : ["#12", "#14", "#15", "#16", "#17"];
+  const slide = ease(prog(t, 22.8, 23.4));
+  const before = { "#12": 0, "#14": 2, "#15": 3, "#16": 4, "#17": 5 };
+  return order.map((label, i) => {
+    let x = SLOT(t < 22.8 ? i : lerp(before[label], i, slide)), y = 42.5, alpha = 1;
+    if (label === "#17") {
+      if (REAL < 11.0) return null;
+      const f = ease(prog(REAL, 11.0, 11.8));
+      x = lerp(30, x, f); y = lerp(60, y, f);
+    }
+    if (label === "#13") alpha = 1 - prog(t, 22.4, 22.8);
+    return { label, x, y, alpha, checked: label === "#17" && t >= 8.3, flagged: label === "#14" && t >= 14.5 && t < 17.7 };
+  }).filter(Boolean);
+}
+
+const callsAt = () => Math.round(812 + 30 * (Math.min(REAL, 19.1) + Math.max(0, REAL - 22.3)));
+
+// ---- drawing helpers -----------------------------------------------------
+function alpha(a, draw) { ctx.save(); ctx.globalAlpha *= a; draw(); ctx.restore(); }
+
+function ring(cx, cy, r, color) {
+  for (let k = 0; k < 48; k++) {
+    const a = (k / 48) * Math.PI * 2;
+    rect(half(cx + Math.cos(a) * r), half(cy + Math.sin(a) * r * 0.6), 0.75, 0.75, color);
+  }
+}
+
+function check(x, y, color) {
+  [[0, 2], [1, 3], [2, 2], [3, 1], [4, 0]].forEach(([dx, dy]) => rect(x + dx, y + dy, 1, 1, color));
+}
+
+function note(x, y, label) {
+  rect(half(x) - 0.5, half(y) - 0.5, 7, 5, C.outline);
+  rect(half(x), half(y), 6, 4, "#efe6cf");
+  rect(half(x) + 1, half(y) + 1.25, 4, 0.5, "#9b8f78");
+  rect(half(x) + 1, half(y) + 2.5, 3, 0.5, "#9b8f78");
+  if (label) text(label, half(x) + 3, half(y) - 4, { size: 12, color: C.ink, align: "center" });
+}
+
+function fly(t, a, b, from, to, label, lift = 10) {
+  if (t < a || t > b) return;
+  const p = ease(prog(t, a, b));
+  note(lerp(from[0], to[0], p), lerp(from[1], to[1], p) - Math.sin(p * Math.PI) * lift, label);
+}
+
+function bandTitle(str, y, color) {
+  rect(3, y + 0.5, 1.5, 1.5, color);
+  text(str, 6, y - 0.5, { size: 16, color: C.muted });
+}
+
+function bubble(x, y, w, h, lines, tailX) {
+  rect(x - 0.5, y - 0.5, w + 1, h + 1, C.outline);
+  rect(x, y, w, h, "#f4efe6");
+  for (let k = 0; k < 3; k++) rect(tailX + k, y + h + k * 0.5 - 0.5, 3 - k, 1, "#f4efe6");
+  lines.forEach(([str, color], i) => text(str, x + 3, y + 2 + i * 4.5, { size: 12, color: color || "#2a2622" }));
+}
+
+// ---- the kitchen ---------------------------------------------------------
+function background() {
+  rect(0, 0, 240, 135, C.wall);
+  for (let y = 40; y < 80; y += 5) rect(0, y, 180, 0.25, C.tile);
+  for (let x = 0; x < 180; x += 8) rect(x, 34, 0.25, 46, C.tile);
+  rect(0, 0, 180, 34, C.band1);
+  rect(0, 80, 180, 44, C.floor);
+  rect(0, 34, 180, 0.5, C.line);
+  rect(0, 80, 180, 0.5, C.line);
+}
+
+const SIPS = [[1.0, 2.2], [13.2, 14.4], [20.8, 22.0], [26.2, 27.4]];  // REAL time
+
+function headChef(t) {
+  bandTitle("HEAD CHEF · YOU", 3, "#e8e2d6");
+  sprite("chef", 82, 3);
+  // the spoon gives way to a stamp while a decision is on the table
+  const stamping = t >= 25.5 && t < 26.8;
+  if (!stamping) { sprite("spoon", 82, 18); rect(82.5, 24, 2.5, 2, "#f0c39e"); }
+  rect(66, 25.5, 48, 2, "#7a5638");
+  rect(66, 27.5, 48, 5.5, "#5e4129");
+  rect(68, 29.5, 44, 0.5, "#6e4c31");
+  // now and then the head chef takes a sip of coffee
+  const sip = SIPS.map(([a, b]) => Math.min(ease(prog(REAL, a, a + 0.35)), 1 - ease(prog(REAL, b - 0.35, b)))).reduce((m, v) => Math.max(m, v), 0);
+  const mx = half(lerp(103, 94, sip)), my = half(lerp(20.5, 12, sip));
+  sprite("mug", mx, my);
+  if (sip > 0) rect(mx + 4.5, my + 2.5, 2.5, 2, "#f0c39e");
+  if (sip < 0.05) {
+    const s = tick(t, 4) % 3;
+    rect(104, 16.5 - s * 0.5, 0.5, 2, C.muted);
+    rect(106, 15.5 + (s % 2) * 0.5, 0.5, 2, C.muted);
+  }
+
+  // the report card
+  if (t >= 24.9 && t < 26.9) {
+    alpha(prog(t, 24.9, 25.1) * (1 - prog(t, 26.6, 26.9)), () => {
+      bubble(10, 6, 64, 25, [["REPORT", "#8a8378"], ["#13 merged, #17 running"], ["decide: #14 +1.2k calls?"],
+        ["cost about $12", "#8a8378"]], 72);
+      if (t >= 26.1) {
+        rect(55, 22.5, 15, 7, "#3f8f4e");
+        rect(56, 23.5, 13, 5, "#e9f6ea");
+        text("OK", 62.5, 24, { size: 12, color: "#2f7a3e", align: "center" });
+      }
+    });
+  }
+  fly(t, 24.0, 24.9, [80, 60], [40, 16], "", 8);
+  fly(t, 26.6, 27.5, [40, 16], [88, 58], "", 8);
+  if (stamping) {
+    const down = t < 26.1 ? ease(prog(t, 25.5, 26.0)) : 1 - ease(prog(t, 26.2, 26.7));
+    const sx = lerp(84, 61, ease(prog(t, 25.5, 25.8))), sy = lerp(12, 16.5, down);
+    rect(sx - 0.5, sy - 0.5, 4, 5, C.outline);
+    rect(sx, sy, 3, 4, "#7a5638");
+    rect(sx - 1.5, sy + 4, 6, 2, "#3f8f4e");
+  }
+}
+
+function crab(x, y, t, phase) {
+  const bob = tick(t + phase, 2) % 2 ? 0.5 : 0;
+  sprite("crab", x, y + bob);
+  sprite("toque", x + 3, 54 + bob);
+}
+
+function pass(t) {
+  bandTitle("THE PASS · CLAUDE CODE", 37, C.claude);
+  rect(70, 41, 104, 1.5, C.steelLo);
+  rect(70, 41, 104, 0.75, C.steel);
+  for (const k of tickets(t)) {
+    alpha(k.alpha, () => {
+      const x = half(k.x), y = half(k.y);
+      if (y === 42.5) rect(x + 4.5, 40, 3, 3, C.steelHi);
+      rect(x - 0.5, y - 0.5, 13, 10, C.outline);
+      rect(x, y, 12, 9, k.flagged ? "#f3d27a" : "#efe6cf");
+      text(k.label, x + 6, y + 1.5, { size: 12, color: "#3b3326", align: "center" });
+      if (k.checked) check(x + 3.5, y + 5, "#3f8f4e");
+      else rect(x + 2.5, y + 6, 7, 0.5, "#b5a888");
+    });
+  }
+  rect(8, 64, 164, 2, C.steelHi);
+  rect(8, 66, 164, 9, C.steel);
+  rect(8, 74.25, 164, 0.75, C.steelLo);
+
+  // bell rings at 11.0
+  const ringing = t >= 11 && t < 11.8;
+  sprite("bell", 104 + (ringing ? (tick(t, 16) % 2 ? 0.5 : -0.5) : 0), 57);
+  if (t >= 11 && t < 12.2) {
+    for (let k = 0; k < 3; k++) {
+      const p = prog(t, 11 + k * 0.2, 11.8 + k * 0.2);
+      if (p > 0 && p < 1) alpha(1 - p, () => ring(109, 60, 4 + p * 14, C.brass));
+    }
+    alpha(1 - prog(t, 11.8, 12.2), () => text("DING!", 117, 56, { size: 16, color: C.brass }));
+  }
+
+  if (!(REAL >= 4.4 && REAL < 10.2)) crab(18, 62, t, 0);
+  crab(81, 62, t, 0.25);
+  crab(144, 62, t, 0.5);
+  // designer writes: the recipe bobs while drafting a ticket or an answer
+  const drafting = (REAL >= 10.2 && REAL < 11.0) || (t >= 15.9 && t < 16.8);
+  if (!(REAL >= 4.4 && REAL < 10.2)) sprite("scroll", 38, 63 - (drafting && tick(t, 8) % 2 ? 1 : 0));
+  if (drafting) text("...", 43, 56, { size: 12, color: C.ink });
+  // verifier's magnifier goes to #17 and back
+  const go = ease(prog(t, 7.5, 8.2)), back = ease(prog(t, 9.0, 9.6));
+  const m = go * (1 - back);
+  sprite("magnifier", half(lerp(163, 158, m)), half(lerp(61, 46, m)));
+  fly(t, 8.9, 9.7, [150, 58], [96, 56], "pass", 6);
+
+  // PR #31 arrives on the pass, gets reviewed, merged, and cleared
+  if (t >= 19.6 && t < 23.2) {
+    const p = ease(prog(t, 19.6, 20.6));
+    const x = half(lerp(84, 64, p)), y = half(lerp(98, 59, p) - Math.sin(p * Math.PI) * 6);
+    alpha(1 - prog(t, 22.6, 23.2), () => {
+      rect(x - 0.5, y + 2.5, 15, 3, C.outline);
+      rect(x, y + 3, 14, 2, "#e9e4da");
+      rect(x + 2, y - 1, 10, 4, "#c75b3a");
+      rect(x + 3, y - 1.5, 8, 1, "#e07a54");
+      text("PR #31", x + 7, y - 6, { size: 12, color: C.ink, align: "center" });
+      if (t >= 20.6 && t < 21.8 && tick(t, 6) % 2) rect(x - 1, y - 2, 16, 8.5, "rgba(255,255,255,0.15)");
+      if (t >= 21.8) {
+        rect(x + 1, y - 9, 12, 4.5, "#8957e5");
+        text("MERGED", x + 7, y - 8.75, { size: 12, color: "#ffffff", align: "center" });
+      }
+    });
+  }
+  ["DESIGNER", "ORCHESTRATOR", "VERIFIER"].forEach((label, i) =>
+    text(label, [27, 90, 153][i], 76, { size: 12, color: C.ink, align: "center" }));
+}
+
+function cook(x, ticket, t, { idle = false, phase = 0 } = {}) {
+  const bob = !idle && tick(t + phase, 3) % 2 ? 0.5 : 0;
+  sprite(idle ? "codexIdle" : "codex", x, 106 + bob);
+  sprite("toqueSmall", x + 3, 101 + bob);
+  if (ticket) {
+    rect(x + 1.5, 88.5, 13, 9, C.outline);
+    rect(x + 2, 89, 12, 8, "#efe6cf");
+    text(ticket, x + 8, 90.5, { size: 12, color: "#3b3326", align: "center" });
+  }
+  if (idle) text("z z", x + 11, 96 - (tick(t, 2) % 2) * 0.5, { size: 12, color: C.muted, align: "center" });
+}
+
+function flames(x, y, n, t, seed) {
+  for (let f = 0; f < n; f++) {
+    const h = 1.5 + Math.round(noise(tick(t, 6) * 13 + f + seed) * 2) * 0.5;
+    rect(x + f * 2.5, y + 2 - h, 1.5, h, "#f6a033");
+    rect(x + f * 2.5 + 0.25, y + 1.25 - h, 1, 1, "#ffd36a");
+  }
+}
+
+function steam(x, y, t) {
+  for (let k = 0; k < 3; k++) {
+    const rise = ((tick(t, 4) + k * 2) % 6) * 0.5;
+    rect(x + k * 4, y + 1 - rise, 0.75, 2.5, "#6f6a63");
+  }
+}
+
+function line(t) {
+  bandTitle("THE LINE · CODEX", 82.5, C.codex);
+  // A four-burner range is the GPU box. #12 trains on GPU0-1; #17 arrives for GPU2-3.
+  const r = 18;
+  const eval17 = t >= 12.4;
+  // the ding travels from the bell down to the free burners
+  if (t >= 11.4 && t < 12.4) {
+    const p = ease(prog(t, 11.4, 12.4));
+    const x = lerp(109, 65, p), y = lerp(62, 100, p);
+    for (let k = 0; k < 4; k++) alpha(1 - k * 0.25, () => rect(half(x + k * 2 * (1 - p)), half(y - k * 1.5), 1.5, 1.5, C.brass));
+  }
+  rect(r, 107, 38, 13, "#3a3d44");
+  rect(r, 105.5, 38, 1.5, "#575b63");
+  [0, 1, 2, 3].forEach((i) => {
+    const bx = r + 1.5 + i * 9, on = i < 2 || t >= 12.8;
+    rect(bx, 109.5, 8, 5, "#2b2e34");
+    text(`${i}`, bx + 4, 110.5, { size: 12, color: on ? C.brass : "#6b6f78", align: "center" });
+    rect(bx + 1, 104.5, 6, 1, "#2b2e34");
+  });
+  flames(r + 3, 103.25, 7, t, 1);
+  rect(r + 2, 92, 17, 11, "#8d939c");
+  rect(r + 2, 92, 17, 0.75, C.steelHi);
+  rect(r, 94, 2, 1, "#8d939c");
+  rect(r + 19, 94, 2, 1, "#8d939c");
+  steam(r + 6, 87, t);
+  text("TRAIN", r + 10.5, 96, { size: 12, color: "#2a2d33", align: "center" });
+  if (eval17) {
+    const a = prog(t, 12.6, 13.0);
+    alpha(a, () => {
+      flames(r + 22, 103.25, 6, t, 7);
+      rect(r + 20, 98.5, 16, 5, "#4a4f57");
+      rect(r + 20, 98.5, 16, 0.75, "#8d939c");
+      rect(r + 36, 99.5, 3, 1, "#4a4f57");
+      text("EVAL", r + 28, 99.25, { size: 12, color: C.ink, align: "center" });
+    });
+    if (t >= 13.2) steam(r + 24, 93, t + 0.5);
+  }
+  text("GPU 0-3", r + 19, 116, { size: 12, color: C.muted, align: "center" });
+  cook(1, "#12", t, { phase: 0.1 });
+  if (eval17) {
+    const a = prog(t, 12.4, 12.8);
+    alpha(a, () => cook(57, "#17", t, { phase: 0.3 }));
+    if (t < 13.2) for (let k = 0; k < 6; k++) {
+      const ang = (k / 6) * Math.PI * 2, d = 4 + a * 8;
+      rect(half(65 + Math.cos(ang) * d), half(112 + Math.sin(ang) * d * 0.7), 1, 1, "#ffd36a");
+    }
+  }
+
+  // #13 writes code, passes its tests, opens a PR, and goes idle after the merge
+  rect(75, 113, 18, 2, "#7a5638");
+  rect(76, 115, 2, 7, "#5e4129");
+  rect(90, 115, 2, 7, "#5e4129");
+  sprite("laptop", 77, 104);
+  const done13 = t >= 23.0, passed = t >= 19 && !done13;
+  rect(79, 105, 10, 5, "#11141c");
+  if (passed) {
+    rect(79, 105, 10, 5, "#173a22");
+    check(81.5, 106, "#7fd18b");
+  } else if (!done13) {
+    const k = tick(t, 4);
+    const colors = ["#7fd18b", "#7aa2ff", "#e8c56a", "#c792ea"];
+    for (let row = 0; row < 4; row++) {
+      const n = k + row;
+      rect(79.5 + (n % 3) * 0.5, 105.5 + row, 2 + Math.floor(noise(n) * 6), 0.75, colors[n % 4]);
+    }
+  }
+  text("CODE", 84, 116.5, { size: 12, color: C.muted, align: "center" });
+  cook(94, done13 ? null : "#13", t, { idle: done13, phase: 0.4 });
+
+  // #14 sends a paid batch; it stops to ask the designer, then resumes
+  rect(112, 102, 15, 20, "#3a3d44");
+  rect(113.5, 104, 12, 6, "#11141c");
+  text("API", 119.5, 104.5, { size: 12, color: C.claude, align: "center" });
+  const calls = callsAt(t);
+  rect(113.5, 112, 12, 2, "#2a2621");
+  rect(113.5, 112, half(12 * Math.min(1, calls / 2000)), 2, C.claude);
+  text(`${calls}/2k`, 119.5, 115.5, { size: 12, color: C.muted, align: "center" });
+  const asking = t >= 14.5 && t < 17.7;
+  if (!asking) for (let k = 0; k < 2; k++) {
+    const rise = ((tick(t, 5) + k * 3) % 6) * 0.75;
+    rect(114 + k * 6, 98 - rise, 5, 3, "#efe6cf");
+  }
+  cook(128, "#14", t, { phase: 0.7 });
+  if (asking) {
+    rect(141, 90, 0.75, 9, "#9ea1aa");
+    rect(141.75, 90, 6, 4, "#f3d27a");
+    text("?", 144.75, 90.25, { size: 12, color: "#3b3326", align: "center" });
+  }
+  fly(t, 15.0, 15.9, [134, 96], [30, 58], "?", 10);
+  fly(t, 16.8, 17.7, [30, 58], [134, 96], "", 10);
+
+  // #15 runs a data job on six CPU cores
+  rect(146, 100, 16, 22, "#3a3d44");
+  rect(146, 100, 16, 1.5, "#575b63");
+  rect(148, 104, 12, 10, "#2b1a12");
+  const glow = tick(t, 3) % 2;
+  rect(149, 105, 10, 8, glow ? "#d9792b" : "#c96a22");
+  rect(149, 105, 10, 2, glow ? "#f6a033" : "#e8902b");
+  text("CPU×6", 154, 116, { size: 12, color: C.brass, align: "center" });
+  cook(163, "#15", t, { phase: 0.2 });
+}
+
+function resources(t) {
+  const x = 182, w = 55;
+  rect(x, 3, w, 118, "#16140f");
+  for (const [rx, ry, rw, rh] of [[x, 3, w, 0.5], [x, 120.5, w, 0.5], [x, 3, 0.5, 118], [x + w - 0.5, 3, 0.5, 118]])
+    rect(rx, ry, rw, rh, C.line);
+  text("RESOURCES", x + 3, 6, { size: 16 });
+  text("run by orchestrator", x + 3, 11, { size: 12, color: C.muted });
+  const busy = ease(prog(t, 12.8, 13.8));
+  const jitter = (i) => (noise(tick(t, 2) + i * 5) - 0.5) * 0.04;
+  [0.92 + jitter(0), 0.88 + jitter(1), 0.71 * busy, 0.68 * busy].forEach((value, i) => {
+    const y = 18 + i * 8.5;
+    text(`GPU${i}`, x + 3, y, { size: 12, color: C.muted });
+    rect(x + 3, y + 4, 36, 2, "#2a2621");
+    rect(x + 3, y + 4, half(36 * value), 2, C.brass);
+    const free = value < 0.02;
+    text(free ? "free" : `${Math.round(value * 100)}%`, x + 42, y + 3, { size: 12, color: free ? C.codex : C.ink });
+    if (i >= 2 && t >= 10 && t < 11 && tick(t, 6) % 2) rect(x + 1.5, y - 1, w - 3, 8, "rgba(92,134,248,0.18)");
+  });
+  const calls = callsAt(t);
+  const spent = 38 + (calls - 812) * 0.01;
+  [["API BUDGET", `$${spent.toFixed(0)} / $100`, spent / 100, C.claude],
+   ["TOKENS TODAY", `${(1.2 + REAL * 0.012).toFixed(2)}M`, 0.55 + REAL * 0.005, "#9fbf7a"],
+   ["CPU JOBS", "6 / 16", 0.375, C.codex]].forEach(([label, value, frac, color], i) => {
+    const y = 55 + i * 13;
+    text(label, x + 3, y, { size: 12, color: C.muted });
+    text(value, x + 3, y + 3.75, { size: 16 });
+    rect(x + 3, y + 9, 49, 1.5, "#2a2621");
+    rect(x + 3, y + 9, half(49 * frac), 1.5, color);
+  });
+  const clock = 2 * 3600 + 14 * 60 + 37 + Math.floor(REAL * 113);
+  const hh = String(Math.floor(clock / 3600)).padStart(2, "0"), mm = String(Math.floor(clock / 60) % 60).padStart(2, "0");
+  const ss = String(clock % 60).padStart(2, "0");
+  text("CLOCK", x + 3, 95, { size: 12, color: C.muted });
+  text(`${hh}:${mm}:${ss}`, x + 3, 98, { size: 32, font: "VT323" });
+  const waiting = t >= 24.5 && t < 26.6 ? 1 : 0;
+  if (waiting && tick(t, 4) % 2) rect(x + 1.5, 113.5, w - 3, 5, "rgba(246,98,42,0.25)");
+  text(`waiting on you: ${waiting}`, x + 3, 114.5, { size: 12, color: waiting ? C.claude : C.muted });
+}
+
+function caption(t) {
+  rect(0, 124, 240, 11, "#0f0e0d");
+  rect(0, 124, 240, 0.5, C.line);
+  const [start, str] = CAPTIONS.filter(([at]) => at <= t).pop();
+  const shown = str.slice(0, Math.floor((t - start) * 90));
+  const cursor = tick(t, 2) % 2 ? "▌" : "";
+  text(shown + (shown.length < str.length ? "▌" : cursor), 4, 125.5, { size: 30, font: "VT323", color: "#d8d2c4" });
+}
+
+function dim(t) {
+  ctx.fillStyle = "rgba(10,9,8,1)";
+  for (const [name, [x, y, w, h]] of Object.entries(REGIONS)) {
+    const a = (1 - lit(name, t)) * 0.6;
+    if (a > 0) { ctx.globalAlpha = a; ctx.fillRect(x * U, y * U, w * U, h * U); }
+  }
+  ctx.globalAlpha = 1;
+}
+
+const LOGO = new Image();
+LOGO.src = "../assets/dkitchen.png";
+
+function endCard(t) {
+  const a = prog(t, 28.6, 29.4);
+  if (a <= 0) return;
+  ctx.fillStyle = `rgba(10,9,8,${0.88 * a})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  alpha(a, () => {
+    ctx.imageSmoothingEnabled = true;
+    const w = 220, h = w * LOGO.height / LOGO.width;
+    ctx.drawImage(LOGO, (canvas.width - w) / 2, 70, w, h);
+    ctx.imageSmoothingEnabled = false;
+    text("dkitchen", 120, 72, { size: 40, align: "center" });
+    text("You decide what to cook. Your agents run the kitchen.", 120, 85, { size: 28, font: "VT323", align: "center", color: "#d8d2c4" });
+    text("pipx install dkitchen", 120, 97, { size: 28, font: "VT323", align: "center", color: C.brass });
+  });
+}
+
+function talk(r) {
+  if (r < 3 || r >= TALK_END) return;
+  // the idea
+  if (r < 4.8) alpha(prog(r, 3, 3.2) * (1 - prog(r, 4.6, 4.8)), () =>
+    bubble(18, 9, 56, 12, [["try method B"], ["on dataset X?"]], 72));
+  // the designer walks up from the pass, talks, and walks back
+  const p = ease(prog(r, 4.4, 5.4)) * (1 - ease(prog(r, 9.4, 10.2)));
+  const walking = (r >= 4.4 && r < 5.4) || (r >= 9.4 && r < 10.2);
+  if (r >= 4.4 && r < 10.2) {
+    const x = half(lerp(18, 117, p)), y = half(lerp(62, 21, p)) - (walking && tick(r, 8) % 2 ? 1 : 0);
+    sprite("crab", x, y);
+    sprite("toque", x + 3, y - 8);
+    sprite("scroll", x + 20, y + 1);
+  }
+  if (r >= 5.4 && r < 7.6) alpha(prog(r, 5.4, 5.6) * (1 - prog(r, 7.4, 7.6)), () =>
+    bubble(114, 1, 58, 11, [["PROPOSAL", "#c2532a"], ["new prompts for B?"]], 124));
+  if (r >= 7.6 && r < 9.4) alpha(prog(r, 7.6, 7.8) * (1 - prog(r, 9.2, 9.4)), () =>
+    bubble(14, 7, 62, 16, [["DECISION", "#2f7a3e"], ["yes. keep the old"], ["prompts as baseline"]], 72));
+  if (r >= 9.0 && r < 9.4) text("got it!", 126, 6, { size: 12, color: C.ink, align: "center" });
+}
+
+function renderAt(t) {
+  REAL = ((t % DURATION) + DURATION) % DURATION;
+  STORY = REAL < 3 ? REAL : REAL < TALK_END ? 2.99 : REAL - SHIFT;
+  t = STORY;
+  ctx.globalAlpha = 1;
+  background();
+  headChef(t);
+  pass(t);
+  line(t);
+  resources(t);
+  talk(REAL);
+  dim(REAL);
+  caption(REAL);
+  endCard(t);
+  // fade through black at the loop point
+  const black = Math.max(1 - prog(REAL, 0, 0.5), prog(REAL, DURATION - 0.6, DURATION));
+  if (black > 0) { ctx.fillStyle = `rgba(0,0,0,${black})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+}
+
+const query = new URLSearchParams(location.search);
+Promise.all([...["16px Silkscreen", "30px VT323"].map((font) => document.fonts.load(font)),
+             new Promise((resolve) => { LOGO.onload = resolve; LOGO.onerror = resolve; })])
+  .then(() => {
+    document.body.dataset.ready = "1";
+    if (query.has("t")) { renderAt(Number(query.get("t"))); return; }
+    const begin = performance.now();
+    const loop = (now) => { renderAt((now - begin) / 1000); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+</script>
+</body>
+</html>

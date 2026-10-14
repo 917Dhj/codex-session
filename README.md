@@ -34,6 +34,10 @@ dkitchen sets up your agents the same way. You are the head chef.
 
 ## 🧑‍🍳 The kitchen
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/kitchen.gif" width="100%" alt="A pixel-art kitchen: you talk a design through with the designer, the verifier checks the ticket, the orchestrator rings the bell to start a Codex executor on free GPUs, reviews and merges a PR, and brings you one decision to approve">
+</p>
+
 | Station | In a kitchen | What it does | Runs on |
 | --- | --- | --- | --- |
 | 👑 **You** | Head chef | Choose the direction, approve designs and budgets, decide what the results mean for your paper. | You |
