@@ -6,9 +6,9 @@ When a session is replaced, edit only this table. Everywhere else, write the sta
 
 | Station | Session name |
 | --- | --- |
-| Orchestrator | <!-- fill: session name --> |
-| Designer | <!-- fill: session name --> |
-| Verifier | <!-- fill: session name --> |
+| Orchestrator | (not yet opened) |
+| Designer | (not yet opened) |
+| Verifier | (not yet opened) |
 
 ## Duties
 

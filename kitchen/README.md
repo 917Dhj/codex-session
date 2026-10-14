@@ -21,7 +21,7 @@ Core files go into every kitchen. Each module is optional.
 ## Template markers
 
 - `<!-- module:NAME -->` … `<!-- /module:NAME -->` wraps text that belongs to module `NAME`. When the module is installed, keep the text and drop the markers. When it is not, drop the text too.
-- `<!-- fill: … -->` marks a gap the setup skill fills from the repo and the user's answers, such as hosts, GPUs, services, or session names.
+- `<!-- fill: … -->` marks a gap the setup skill fills from the repo and the user's answers, such as hosts, GPUs, or shared services.
 
 ## Vocabulary
 

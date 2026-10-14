@@ -1,0 +1,17 @@
+{
+  "name": "dkitchen",
+  "owner": {
+    "name": "917Dhj",
+    "url": "https://github.com/917Dhj"
+  },
+  "description": "dkitchen: a multi-agent workflow for research repos, installable as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "dkitchen",
+      "source": "./",
+      "description": "Install the dkitchen multi-agent workflow (stations, house rules, and repo scripts) into your repo with /setup-dkitchen.",
+      "category": "productivity",
+      "keywords": ["multi-agent", "workflow", "research", "codex", "claude-code"]
+    }
+  ]
+}

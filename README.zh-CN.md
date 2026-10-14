@@ -75,7 +75,21 @@ ding launch train -- python train.py                  # 在 tmux 里跑，退出
 
 指定会话可以用 UUID、会话名，或者 GitHub issue，比如 `'#42'`；`ding` 会找到认领这张票的会话。在 Linux 上，`ding board` 还会列出没用 `ding` 启动的长时间进程，方便你发现那些跑完了也没人会被唤醒的任务。
 
-`ding` 通过 Codex App Server 和 Codex 会话通信。完整用法见 [docs/ding.md](docs/ding.md)（英文）。
+`ding` 通过 Codex App Server 和 Codex 会话通信。完整用法见 [docs/ding.md](https://github.com/917Dhj/dkitchen/blob/main/docs/ding.md)（英文）。
+
+### 📋 厨房的日常流程
+
+各岗位每天要做的固定动作也做成了 `ding` 命令，每次都按同样稳妥的方式执行：
+
+- `ding relay` 给票的执行者发消息，确认送达后才在票里留记录。
+- `ding merge` 只在审过的那个 HEAD 上合并 PR。
+- `ding watch` 在总编排后台等着，票需要处理时唤醒它。
+- `ding log` 记下你不在时总编排做了什么。
+- `ding check-refs` 核对核查引用的每个文件、行号和摘要。
+
+### 📜 厨房规矩
+
+每个岗位遵守的规则在 [kitchen/](https://github.com/917Dhj/dkitchen/blob/main/kitchen/README.md)（英文）：谁负责什么、票怎么写、什么时候停下来问你，以及运行预算、模型提示词、正式产物登记、无人值守这几个可选模块。
 
 ## 🚀 开始使用
 
@@ -86,11 +100,28 @@ ding launch train -- python train.py                  # 在 tmux 里跑，退出
 - 一个 GitHub 仓库和 `gh` 命令行
 - Claude Code，以及在同一用户下运行着 App Server 的 Codex
 
-### 安装 `ding`
+### 1. 安装 `ding`
 
 ```bash
 pipx install dkitchen
 ```
+
+### 2. 把安装 skill 加进 Claude Code
+
+```bash
+claude plugin marketplace add 917Dhj/dkitchen
+claude plugin install dkitchen@dkitchen
+```
+
+### 3. 搭你自己的厨房
+
+在你的仓库里打开 Claude Code，运行：
+
+```text
+/setup-dkitchen
+```
+
+这个 skill 会先读你的仓库，了解你在做什么、已经有什么：agent 说明文件、测试、GPU、模型调用、长任务。然后一个话题一个话题地问你：用什么语言、要哪些岗位、哪些决定必须留给你、要哪些可选模块、有哪些算力。它会把打算写入的每一条规则、每个脚本和每项 GitHub 改动先拿给你看，你同意后才写。之后想改设置，随时再运行一次。
 
 ## ❓ 常见问题
 
@@ -98,7 +129,7 @@ pipx install dkitchen
 凡是会改变方向、结果或花费的事，它们都会停下；批准只认你在票里的原话。每个动作都是 GitHub 上的一条留言或一个 PR，第二天早上喝咖啡的时候就能把昨晚的事查一遍。
 
 **适合我的仓库吗？**
-这些规则是为计算类科研写的，其中大部分也适用于任何有长任务的仓库。
+这些规则是为计算类科研写的，其中大部分也适用于任何有长任务的仓库。安装 skill 会按你的仓库改写这些规则。
 
 **必须同时用 Claude Code 和 Codex 吗？**
 目前是的，这是我每天在用的组合。

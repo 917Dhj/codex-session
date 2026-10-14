@@ -77,6 +77,20 @@ You can address a session by its UUID, its name, or a GitHub issue such as `'#42
 
 `ding` talks to Codex sessions through the Codex App Server. The full guide is in [docs/ding.md](https://github.com/917Dhj/dkitchen/blob/main/docs/ding.md).
 
+### 📋 The kitchen's routines
+
+The stations' everyday steps are `ding` commands too, so they run the same careful way every time:
+
+- `ding relay` sends a message to a ticket's executor, and records it on the ticket only once delivery is confirmed.
+- `ding merge` merges a PR only at the HEAD that was reviewed.
+- `ding watch` waits in the orchestrator's background and wakes it when a ticket needs attention.
+- `ding log` keeps the orchestrator's log of what it did while you were away.
+- `ding check-refs` checks every file, line, and digest the verifier cites.
+
+### 📜 The house rules
+
+The rules every station follows live in [kitchen/](https://github.com/917Dhj/dkitchen/blob/main/kitchen/README.md): who owns what, how tickets are written, when to stop and ask, and optional modules for run budgets, model prompts, registered artifacts, and unattended work.
+
 ## 🚀 Get started
 
 ### Requirements
@@ -86,11 +100,28 @@ You can address a session by its UUID, its name, or a GitHub issue such as `'#42
 - A GitHub repo and the `gh` CLI
 - Claude Code, and Codex with its App Server running under the same user
 
-### Install `ding`
+### 1. Install `ding`
 
 ```bash
 pipx install dkitchen
 ```
+
+### 2. Add the setup skill to Claude Code
+
+```bash
+claude plugin marketplace add 917Dhj/dkitchen
+claude plugin install dkitchen@dkitchen
+```
+
+### 3. Set up your kitchen
+
+In Claude Code, inside your repo, run:
+
+```text
+/setup-dkitchen
+```
+
+The skill reads your repo to learn what you work on and what you already have: agent instructions, tests, GPUs, model calls, long jobs. Then it asks, one topic at a time, about language, stations, the calls that stay with you, optional modules, and your compute. It shows you every rule, script, and GitHub change it plans to make, and writes them only after you approve. Run it again any time to change the setup.
 
 ## ❓ FAQ
 
@@ -98,7 +129,7 @@ pipx install dkitchen
 They stop for anything that changes direction, results, or spending, and approvals only come from your own words on a ticket. Every action is a comment or a PR on GitHub, so you can audit the night's work over coffee.
 
 **Will it fit my repo?**
-The rules were written for computational research, and most of them carry over to any repo with long-running jobs.
+The rules were written for computational research, and most of them carry over to any repo with long-running jobs. The setup skill adapts them to your repo.
 
 **Do I need both Claude Code and Codex?**
 For now, yes. That is the combination I run every day.

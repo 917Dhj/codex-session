@@ -40,4 +40,4 @@ A comment asking to run models adds the run request fields from [run-budgets.md]
 
 A failure that involves no model call and leaves committed results untouched, such as a wrong path, a missing package, or a tool version: fix it, rerun, and note it in one line of your next comment.
 
-Stop and wait when the fix needs model calls or cost beyond the ticket, changes the ticket's scope<!-- module:artifacts -->, touches a frozen file<!-- /module:artifacts --><!-- module:model-text -->, or changes model-visible text<!-- /module:model-text -->.
+Stop and wait when the fix<!-- module:artifacts --> touches a frozen file,<!-- /module:artifacts --><!-- module:model-text --> changes model-visible text,<!-- /module:model-text --> needs model calls or cost beyond the ticket, or changes the ticket's scope.

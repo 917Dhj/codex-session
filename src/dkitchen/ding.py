@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+from importlib import metadata
 import json
 import math
 import os
@@ -1317,6 +1318,11 @@ def status_fields(value: str) -> tuple[str, ...]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ding", description=__doc__)
+    try:
+        installed = metadata.version("dkitchen")
+    except metadata.PackageNotFoundError:
+        installed = "unknown"
+    parser.add_argument("--version", action="version", version=f"ding {installed}")
     commands = parser.add_subparsers(dest="action", required=True)
     board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
