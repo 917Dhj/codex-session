@@ -27,15 +27,15 @@ You need:
 Install with pipx:
 
 ```bash
-pipx install git+https://github.com/917Dhj/dkitchen.git
+pipx install dkitchen
 ```
 
 Or into a virtual environment:
 
 ```bash
-python3 -m venv ~/.local/share/dkitchen
-~/.local/share/dkitchen/bin/python -m pip install git+https://github.com/917Dhj/dkitchen.git
-export PATH="$HOME/.local/share/dkitchen/bin:$PATH"
+python3 -m venv ~/.venvs/dkitchen
+~/.venvs/dkitchen/bin/python -m pip install dkitchen
+export PATH="$HOME/.venvs/dkitchen/bin:$PATH"
 ```
 
 `ding` finds the App Server by looking for a single socket under `/tmp/codex-daemon-<your uid>`. If there are several, pick one with `--socket PATH` (for `run` and `launch`, put it before the `--`). For sessions on another machine, SSH there and run `ding` on that machine.

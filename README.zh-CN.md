@@ -89,7 +89,7 @@ ding launch train -- python train.py                  # 在 tmux 里跑，退出
 ### 安装 `ding`
 
 ```bash
-pipx install git+https://github.com/917Dhj/dkitchen.git
+pipx install dkitchen
 ```
 
 ## ❓ 常见问题

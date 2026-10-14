@@ -89,7 +89,7 @@ You can address a session by its UUID, its name, or a GitHub issue such as `'#42
 ### Install `ding`
 
 ```bash
-pipx install git+https://github.com/917Dhj/dkitchen.git
+pipx install dkitchen
 ```
 
 ## ❓ FAQ
