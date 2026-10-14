@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <title>dkitchen</title>
 <style>
-  /* Silkscreen and VT323, both under the SIL Open Font License; see fonts/ */
+  /* Silkscreen, VT323, and Fusion Pixel, all under the SIL Open Font License; see fonts/ */
   @font-face { font-family: "Silkscreen"; src: url("fonts/Silkscreen-Regular.ttf"); }
   @font-face { font-family: "VT323"; src: url("fonts/VT323-Regular.ttf"); }
+  @font-face { font-family: "FusionPixel"; src: url("fonts/FusionPixel-12px-zh_hans.woff2"); }
   html, body { margin: 0; background: #0d1117; }
   canvas { display: block; image-rendering: pixelated; }
 </style>
@@ -14,9 +15,16 @@
 <body>
 <canvas id="kitchen" width="960" height="540"></canvas>
 <script>
-// Everything is drawn on a 240x135 grid of 4x4-pixel units; text is drawn in canvas pixels.
-const U = 4;
+// Two layouts and two languages, picked by ?layout=wide|tall&lang=en|zh.
+// wide: 960x540, a 240x135 grid of 4-pixel units. tall: 1080x1440, a 180x240 grid of 6-pixel units.
+// Shapes are drawn in units; text sizes are given for the wide layout and scaled with the unit.
+const PARAMS = new URLSearchParams(location.search);
+const LAYOUT = PARAMS.get("layout") === "tall" ? "tall" : "wide";
+const LANG = PARAMS.get("lang") === "zh" ? "zh" : "en";
+const L = (en, zh) => (LANG === "zh" ? zh : en);
+const U = LAYOUT === "tall" ? 6 : 4;
 const canvas = document.getElementById("kitchen");
+[canvas.width, canvas.height] = LAYOUT === "tall" ? [1080, 1440] : [960, 540];
 const ctx = canvas.getContext("2d");
 ctx.imageSmoothingEnabled = false;
 
@@ -231,8 +239,17 @@ function sprite(name, x, y, outline = true) {
   rows.forEach((row, j) => [...row].forEach((ch, i) => { if (ch !== " ") rect(x + i * s, y + j * s, s, s, map[ch]); }));
 }
 
+const CJK = /[\u3000-\u9fff\uff00-\uffef]/;
+
+// Chinese text uses Fusion Pixel at a multiple of its 12-pixel grid, so it stays sharp.
+function textFont(str, size, font) {
+  const px = size * U / 4;
+  if (LANG === "zh" && (font === "FusionPixel" || CJK.test(str))) return `${12 * Math.max(1, Math.round(px / 12))}px FusionPixel`;
+  return `${px}px ${font}`;
+}
+
 function text(str, x, y, { size = 16, color = C.ink, align = "left", font = "Silkscreen" } = {}) {
-  ctx.font = `${size}px ${font}`;
+  ctx.font = textFont(str, size, font);
   ctx.fillStyle = color;
   ctx.textAlign = align;
   ctx.textBaseline = "top";
@@ -255,7 +272,7 @@ const tick = (t, fps) => Math.floor((t - STORY + REAL) * fps);  // stepped idle 
 const noise = (n) => { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); };
 
 // ---- story --------------------------------------------------------------
-const CAPTIONS = [
+const CAPTIONS_EN = [
   [0.0, "$ ding board      4 cooking · GPU2-3 free · 5 tickets on the rail"],
   [3.0, 'you: "try method B on dataset X?"'],
   [4.4, "designer comes over: this one changes what the model sees"],
@@ -276,6 +293,28 @@ const CAPTIONS = [
   [31.2, 'orchestrator$ ding relay 14 --message "approved: +1.2k calls"'],
   [32.6, "$ ding board      5 cooking · GPU0-3 busy · you: 0 waiting"],
 ];
+const CAPTIONS_ZH = [
+  [0.0, "$ ding board      4 个在做 · GPU2-3 空闲 · 单轨上 5 张票"],
+  [3.0, "你：方法 B 在数据集 X 上试试？"],
+  [4.4, "总设计走过来：这件事会改模型看到的内容"],
+  [5.4, "总设计：提案，B 需要新的 prompt，你来定"],
+  [7.6, "你：可以，旧 prompt 留作 baseline"],
+  [10.2, '总设计$ gh issue create --title "Eval method B on X"  → #17'],
+  [12.1, "总核查$ ding check-refs check.md  → 0 个问题"],
+  [13.5, "总核查 → 总编排：#17 通过"],
+  [14.6, "总编排$ ding board  → GPU2、GPU3 空闲"],
+  [15.6, '总编排$ ding relay 17 --message "start #17 on GPU2-3"'],
+  [17.2, "codex #17$ ding launch eval17 -- python eval.py --gpus 2,3"],
+  [19.1, "总编排$ ding watch  → #14 在等设计"],
+  [21.4, "总设计 → 总编排：#14 已回复，见 ticket"],
+  [23.6, "codex #13$ pytest  → 48 passed · 已开 PR #31"],
+  [25.2, "总编排$ scripts/review_pr.py 31  → 可以合并"],
+  [26.4, "总编排$ ding merge 31 3f9c2a1  → 已合并"],
+  [28.6, "总编排 → 你：有 1 件事等你决定"],
+  [31.2, '总编排$ ding relay 14 --message "approved: +1.2k calls"'],
+  [32.6, "$ ding board      5 个在做 · GPU0-3 全忙 · 等你：0"],
+];
+const CAPTIONS = LANG === "zh" ? CAPTIONS_ZH : CAPTIONS_EN;
 
 // Which parts of the kitchen are lit; the rest is dimmed.
 // The resource panel is never dimmed.
@@ -332,7 +371,7 @@ function note(x, y, label) {
   rect(half(x), half(y), 6, 4, "#efe6cf");
   rect(half(x) + 1, half(y) + 1.25, 4, 0.5, "#9b8f78");
   rect(half(x) + 1, half(y) + 2.5, 3, 0.5, "#9b8f78");
-  if (label) text(label, half(x) + 3, half(y) - 4, { size: 12, color: C.ink, align: "center" });
+  if (label) text(label, half(x) + 3, half(y) - 4.5, { size: 12, color: C.ink, align: "center" });
 }
 
 function fly(t, a, b, from, to, label, lift = 10) {
@@ -355,7 +394,7 @@ function bubble(x, y, w, h, lines, tailX) {
 
 // ---- the kitchen ---------------------------------------------------------
 function background() {
-  rect(0, 0, 240, 135, C.wall);
+  rect(0, 0, 180, 124, C.wall);
   for (let y = 40; y < 80; y += 5) rect(0, y, 180, 0.25, C.tile);
   for (let x = 0; x < 180; x += 8) rect(x, 34, 0.25, 46, C.tile);
   rect(0, 0, 180, 34, C.band1);
@@ -367,7 +406,7 @@ function background() {
 const SIPS = [[1.0, 2.2], [13.2, 14.4], [20.8, 22.0], [26.2, 27.4]];  // REAL time
 
 function headChef(t) {
-  bandTitle("HEAD CHEF · YOU", 3, "#e8e2d6");
+  bandTitle(L("HEAD CHEF · YOU", "主厨 · 你"), 3, "#e8e2d6");
   sprite("chef", 82, 3);
   // the spoon gives way to a stamp while a decision is on the table
   const stamping = t >= 25.5 && t < 26.8;
@@ -389,12 +428,13 @@ function headChef(t) {
   // the report card
   if (t >= 24.9 && t < 26.9) {
     alpha(prog(t, 24.9, 25.1) * (1 - prog(t, 26.6, 26.9)), () => {
-      bubble(10, 6, 64, 25, [["REPORT", "#8a8378"], ["#13 merged, #17 running"], ["decide: #14 +1.2k calls?"],
-        ["cost about $12", "#8a8378"]], 72);
+      bubble(10, 6, 64, 25, LANG === "zh"
+        ? [["汇报", "#8a8378"], ["#13 已合并，#17 在跑"], ["待定：#14 再加 1.2k 次调用？"], ["约 $12", "#8a8378"]]
+        : [["REPORT", "#8a8378"], ["#13 merged, #17 running"], ["decide: #14 +1.2k calls?"], ["cost about $12", "#8a8378"]], 72);
       if (t >= 26.1) {
         rect(55, 22.5, 15, 7, "#3f8f4e");
         rect(56, 23.5, 13, 5, "#e9f6ea");
-        text("OK", 62.5, 24, { size: 12, color: "#2f7a3e", align: "center" });
+        text(L("OK", "批准"), 62.5, 24, { size: 12, color: "#2f7a3e", align: "center" });
       }
     });
   }
@@ -416,7 +456,7 @@ function crab(x, y, t, phase) {
 }
 
 function pass(t) {
-  bandTitle("THE PASS · CLAUDE CODE", 37, C.claude);
+  bandTitle(L("THE PASS · CLAUDE CODE", "出餐口 · CLAUDE CODE"), 37, C.claude);
   rect(70, 41, 104, 1.5, C.steelLo);
   rect(70, 41, 104, 0.75, C.steel);
   for (const k of tickets(t)) {
@@ -456,7 +496,7 @@ function pass(t) {
   const go = ease(prog(t, 7.5, 8.2)), back = ease(prog(t, 9.0, 9.6));
   const m = go * (1 - back);
   sprite("magnifier", half(lerp(163, 158, m)), half(lerp(61, 46, m)));
-  fly(t, 8.9, 9.7, [150, 58], [96, 56], "pass", 6);
+  fly(t, 8.9, 9.7, [150, 58], [96, 56], L("pass", "通过"), 6);
 
   // PR #31 arrives on the pass, gets reviewed, merged, and cleared
   if (t >= 19.6 && t < 23.2) {
@@ -471,11 +511,11 @@ function pass(t) {
       if (t >= 20.6 && t < 21.8 && tick(t, 6) % 2) rect(x - 1, y - 2, 16, 8.5, "rgba(255,255,255,0.15)");
       if (t >= 21.8) {
         rect(x + 1, y - 9, 12, 4.5, "#8957e5");
-        text("MERGED", x + 7, y - 8.75, { size: 12, color: "#ffffff", align: "center" });
+        text(L("MERGED", "已合并"), x + 7, y - 8.75, { size: 12, color: "#ffffff", align: "center" });
       }
     });
   }
-  ["DESIGNER", "ORCHESTRATOR", "VERIFIER"].forEach((label, i) =>
+  (LANG === "zh" ? ["总设计", "总编排", "总核查"] : ["DESIGNER", "ORCHESTRATOR", "VERIFIER"]).forEach((label, i) =>
     text(label, [27, 90, 153][i], 76, { size: 12, color: C.ink, align: "center" }));
 }
 
@@ -507,7 +547,7 @@ function steam(x, y, t) {
 }
 
 function line(t) {
-  bandTitle("THE LINE · CODEX", 82.5, C.codex);
+  bandTitle(L("THE LINE · CODEX", "灶台 · CODEX"), 82.5, C.codex);
   // A four-burner range is the GPU box. #12 trains on GPU0-1; #17 arrives for GPU2-3.
   const r = 18;
   const eval17 = t >= 12.4;
@@ -531,7 +571,7 @@ function line(t) {
   rect(r, 94, 2, 1, "#8d939c");
   rect(r + 19, 94, 2, 1, "#8d939c");
   steam(r + 6, 87, t);
-  text("TRAIN", r + 10.5, 96, { size: 12, color: "#2a2d33", align: "center" });
+  text(L("TRAIN", "训练"), r + 10.5, 96, { size: 12, color: "#2a2d33", align: "center" });
   if (eval17) {
     const a = prog(t, 12.6, 13.0);
     alpha(a, () => {
@@ -539,7 +579,7 @@ function line(t) {
       rect(r + 20, 98.5, 16, 5, "#4a4f57");
       rect(r + 20, 98.5, 16, 0.75, "#8d939c");
       rect(r + 36, 99.5, 3, 1, "#4a4f57");
-      text("EVAL", r + 28, 99.25, { size: 12, color: C.ink, align: "center" });
+      text(L("EVAL", "评测"), r + 28, 99.25, { size: 12, color: C.ink, align: "center" });
     });
     if (t >= 13.2) steam(r + 24, 93, t + 0.5);
   }
@@ -572,7 +612,7 @@ function line(t) {
       rect(79.5 + (n % 3) * 0.5, 105.5 + row, 2 + Math.floor(noise(n) * 6), 0.75, colors[n % 4]);
     }
   }
-  text("CODE", 84, 116.5, { size: 12, color: C.muted, align: "center" });
+  text(L("CODE", "写代码"), 84, 116.5, { size: 12, color: C.muted, align: "center" });
   cook(94, done13 ? null : "#13", t, { idle: done13, phase: 0.4 });
 
   // #14 sends a paid batch; it stops to ask the designer, then resumes
@@ -608,52 +648,121 @@ function line(t) {
   cook(163, "#15", t, { phase: 0.2 });
 }
 
+function meters(t) {
+  const busy = ease(prog(t, 12.8, 13.8));
+  const jitter = (i) => (noise(tick(t, 2) + i * 5) - 0.5) * 0.04;
+  const spent = 38 + (callsAt() - 812) * 0.01;
+  const clock = 2 * 3600 + 14 * 60 + 37 + Math.floor(REAL * 113);
+  const two = (n) => String(n).padStart(2, "0");
+  return {
+    gpus: [0.92 + jitter(0), 0.88 + jitter(1), 0.71 * busy, 0.68 * busy],
+    rows: [[L("API BUDGET", "API 预算"), `$${spent.toFixed(0)} / $100`, spent / 100, C.claude],
+           [L("TOKENS TODAY", "今日 TOKEN"), `${(1.2 + REAL * 0.012).toFixed(2)}M`, 0.55 + REAL * 0.005, "#9fbf7a"],
+           [L("CPU JOBS", "CPU 任务"), "6 / 16", 0.375, C.codex]],
+    clock: `${two(Math.floor(clock / 3600))}:${two(Math.floor(clock / 60) % 60)}:${two(clock % 60)}`,
+    waiting: t >= 24.5 && t < 26.6 ? 1 : 0,
+    gpuBlink: t >= 10 && t < 11 && tick(t, 6) % 2,
+    waitBlink: tick(t, 4) % 2,
+  };
+}
+
 function resources(t) {
+  if (LAYOUT === "tall") return resourcesTall(t);
   const x = 182, w = 55;
   rect(x, 3, w, 118, "#16140f");
   for (const [rx, ry, rw, rh] of [[x, 3, w, 0.5], [x, 120.5, w, 0.5], [x, 3, 0.5, 118], [x + w - 0.5, 3, 0.5, 118]])
     rect(rx, ry, rw, rh, C.line);
-  text("RESOURCES", x + 3, 6, { size: 16 });
-  text("run by orchestrator", x + 3, 11, { size: 12, color: C.muted });
-  const busy = ease(prog(t, 12.8, 13.8));
-  const jitter = (i) => (noise(tick(t, 2) + i * 5) - 0.5) * 0.04;
-  [0.92 + jitter(0), 0.88 + jitter(1), 0.71 * busy, 0.68 * busy].forEach((value, i) => {
+  const m = meters(t);
+  text(L("RESOURCES", "资源"), x + 3, 6, { size: 16 });
+  text(L("run by orchestrator", "由总编排调度"), x + 3, 11, { size: 12, color: C.muted });
+  m.gpus.forEach((value, i) => {
     const y = 18 + i * 8.5;
     text(`GPU${i}`, x + 3, y, { size: 12, color: C.muted });
     rect(x + 3, y + 4, 36, 2, "#2a2621");
     rect(x + 3, y + 4, half(36 * value), 2, C.brass);
     const free = value < 0.02;
-    text(free ? "free" : `${Math.round(value * 100)}%`, x + 42, y + 3, { size: 12, color: free ? C.codex : C.ink });
-    if (i >= 2 && t >= 10 && t < 11 && tick(t, 6) % 2) rect(x + 1.5, y - 1, w - 3, 8, "rgba(92,134,248,0.18)");
+    text(free ? L("free", "空闲") : `${Math.round(value * 100)}%`, x + 42, y + 3, { size: 12, color: free ? C.codex : C.ink });
+    if (i >= 2 && m.gpuBlink) rect(x + 1.5, y - 1, w - 3, 8, "rgba(92,134,248,0.18)");
   });
-  const calls = callsAt(t);
-  const spent = 38 + (calls - 812) * 0.01;
-  [["API BUDGET", `$${spent.toFixed(0)} / $100`, spent / 100, C.claude],
-   ["TOKENS TODAY", `${(1.2 + REAL * 0.012).toFixed(2)}M`, 0.55 + REAL * 0.005, "#9fbf7a"],
-   ["CPU JOBS", "6 / 16", 0.375, C.codex]].forEach(([label, value, frac, color], i) => {
+  m.rows.forEach(([label, value, frac, color], i) => {
     const y = 55 + i * 13;
     text(label, x + 3, y, { size: 12, color: C.muted });
     text(value, x + 3, y + 3.75, { size: 16 });
     rect(x + 3, y + 9, 49, 1.5, "#2a2621");
     rect(x + 3, y + 9, half(49 * frac), 1.5, color);
   });
-  const clock = 2 * 3600 + 14 * 60 + 37 + Math.floor(REAL * 113);
-  const hh = String(Math.floor(clock / 3600)).padStart(2, "0"), mm = String(Math.floor(clock / 60) % 60).padStart(2, "0");
-  const ss = String(clock % 60).padStart(2, "0");
-  text("CLOCK", x + 3, 95, { size: 12, color: C.muted });
-  text(`${hh}:${mm}:${ss}`, x + 3, 98, { size: 32, font: "VT323" });
-  const waiting = t >= 24.5 && t < 26.6 ? 1 : 0;
-  if (waiting && tick(t, 4) % 2) rect(x + 1.5, 113.5, w - 3, 5, "rgba(246,98,42,0.25)");
-  text(`waiting on you: ${waiting}`, x + 3, 114.5, { size: 12, color: waiting ? C.claude : C.muted });
+  text(L("CLOCK", "时钟"), x + 3, 95, { size: 12, color: C.muted });
+  text(m.clock, x + 3, 98, { size: 32, font: "VT323" });
+  if (m.waiting && m.waitBlink) rect(x + 1.5, 113.5, w - 3, 5, "rgba(246,98,42,0.25)");
+  text(`${L("waiting on you", "等你决定")}: ${m.waiting}`, x + 3, 114.5, { size: 12, color: m.waiting ? C.claude : C.muted });
+}
+
+// tall layout: the panel lies under the kitchen, GPUs on the left, budgets on the right
+function resourcesTall(t) {
+  const y0 = 156, x = 3, w = 174, h = 48;
+  const m = meters(t);
+  rect(x, y0, w, h, "#16140f");
+  for (const [rx, ry, rw, rh] of [[x, y0, w, 0.5], [x, y0 + h - 0.5, w, 0.5], [x, y0, 0.5, h], [x + w - 0.5, y0, 0.5, h]])
+    rect(rx, ry, rw, rh, C.line);
+  text(L("RESOURCES", "资源"), x + 4, y0 + 2.5, { size: 16 });
+  text(L("run by orchestrator", "由总编排调度"), x + 44, y0 + 3.5, { size: 12, color: C.muted });
+  text(m.clock, x + w - 4, y0 + 0.5, { size: 32, font: "VT323", align: "right" });
+  m.gpus.forEach((value, i) => {
+    const y = y0 + 12 + i * 8.5;
+    text(`GPU${i}`, x + 4, y, { size: 12, color: C.muted });
+    rect(x + 20, y + 0.5, 46, 2.5, "#2a2621");
+    rect(x + 20, y + 0.5, half(46 * value), 2.5, C.brass);
+    const free = value < 0.02;
+    text(free ? L("free", "空闲") : `${Math.round(value * 100)}%`, x + 69, y, { size: 12, color: free ? C.codex : C.ink });
+    if (i >= 2 && m.gpuBlink) rect(x + 2, y - 1.5, 82, 6, "rgba(92,134,248,0.18)");
+  });
+  const rx = x + 90, rw = w - 94;
+  m.rows.forEach(([label, value, frac, color], i) => {
+    const y = y0 + 12 + i * 8.5;
+    text(label, rx, y, { size: 12, color: C.muted });
+    text(value, rx + rw, y - 0.25, { size: 12, align: "right" });
+    rect(rx, y + 4, rw, 1.5, "#2a2621");
+    rect(rx, y + 4, half(rw * frac), 1.5, color);
+  });
+  const y = y0 + 12 + 3 * 8.5;
+  if (m.waiting && m.waitBlink) rect(rx - 2, y - 1.5, rw + 4, 6, "rgba(246,98,42,0.25)");
+  text(L("waiting on you", "等你决定"), rx, y, { size: 12, color: m.waiting ? C.claude : C.muted });
+  text(`${m.waiting}`, rx + rw, y, { size: 12, color: m.waiting ? C.claude : C.muted, align: "right" });
+}
+
+// Splits a caption into lines that fit; Chinese can break anywhere, English breaks at spaces.
+function wrap(str, width) {
+  const lines = [""];
+  for (const token of str.match(/[\u3000-\u9fff\uff00-\uffef]|[^\s\u3000-\u9fff\uff00-\uffef]+|\s+/g) || []) {
+    const next = lines[lines.length - 1] + token;
+    if (ctx.measureText(next).width > width && lines[lines.length - 1].trim()) lines.push(token.trimStart());
+    else lines[lines.length - 1] = next;
+  }
+  return lines;
 }
 
 function caption(t) {
-  rect(0, 124, 240, 11, "#0f0e0d");
-  rect(0, 124, 240, 0.5, C.line);
+  const tall = LAYOUT === "tall";
+  const [top, height] = tall ? [206, 34] : [124, 11];
+  rect(0, top, canvas.width / U, height, "#0f0e0d");
+  rect(0, top, canvas.width / U, 0.5, C.line);
   const [start, str] = CAPTIONS.filter(([at]) => at <= t).pop();
-  const shown = str.slice(0, Math.floor((t - start) * 90));
+  const font = LANG === "zh" ? "FusionPixel" : "VT323";
+  const size = LANG === "zh" ? 24 : 30;   // zh snaps to 24 px (wide) or 36 px (tall)
+  ctx.font = textFont(str, size, font);
+  const lines = tall ? wrap(str, canvas.width - 8 * U) : [str];
+  let left = Math.floor((t - start) * 90);
   const cursor = tick(t, 2) % 2 ? "▌" : "";
-  text(shown + (shown.length < str.length ? "▌" : cursor), 4, 125.5, { size: 30, font: "VT323", color: "#d8d2c4" });
+  const lineHeight = tall ? 8 : 0;
+  lines.forEach((line, i) => {
+    const shown = line.slice(0, Math.max(0, left));
+    const typing = left > 0 && left <= line.length;
+    left -= line.length;
+    if (!shown && i > 0) return;
+    const last = i === lines.length - 1;
+    text(shown + (typing && shown.length < line.length ? "▌" : last && left >= 0 ? cursor : ""), 4,
+         top + (tall ? 4 : 1.5) + i * lineHeight, { size, font, color: "#d8d2c4" });
+  });
 }
 
 function dim(t) {
@@ -668,27 +777,48 @@ function dim(t) {
 const LOGO = new Image();
 LOGO.src = "../assets/dkitchen.png";
 
+const TAGLINE = L(["You decide what to cook.", "Your agents run the kitchen."], ["你决定做什么菜，", "agent 们把厨房转起来。"]);
+
 function endCard(t) {
   const a = prog(t, 28.6, 29.4);
   if (a <= 0) return;
   ctx.fillStyle = `rgba(10,9,8,${0.88 * a})`;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const tall = LAYOUT === "tall", cx = canvas.width / U / 2;
   alpha(a, () => {
     ctx.imageSmoothingEnabled = true;
-    const w = 220, h = w * LOGO.height / LOGO.width;
-    ctx.drawImage(LOGO, (canvas.width - w) / 2, 70, w, h);
+    const w = tall ? 420 : 220, h = w * LOGO.height / LOGO.width, top = tall ? 300 : 70;
+    ctx.drawImage(LOGO, (canvas.width - w) / 2, top, w, h);
     ctx.imageSmoothingEnabled = false;
-    text("dkitchen", 120, 72, { size: 40, align: "center" });
-    text("You decide what to cook. Your agents run the kitchen.", 120, 85, { size: 28, font: "VT323", align: "center", color: "#d8d2c4" });
-    text("pipx install dkitchen", 120, 97, { size: 28, font: "VT323", align: "center", color: C.brass });
+    let y = (top + h) / U + 4;
+    text("dkitchen", cx, y, { size: 40, align: "center" });
+    y += 13;
+    const font = LANG === "zh" ? "FusionPixel" : "VT323", size = LANG === "zh" ? 24 : 28;
+    const lines = tall ? TAGLINE : [TAGLINE.join(" ")];
+    lines.forEach((line) => { text(line, cx, y, { size, font, align: "center", color: "#d8d2c4" }); y += tall ? 7 : 8; });
+    text("pipx install dkitchen", cx, y + 4, { size: 28, font: "VT323", align: "center", color: C.brass });
   });
+}
+
+// tall layout: a title bar above the kitchen
+function header() {
+  rect(0, 0, 180, 30, "#16140f");
+  rect(0, 29.5, 180, 0.5, C.line);
+  ctx.imageSmoothingEnabled = true;
+  const h = 26 * U, w = h * LOGO.width / LOGO.height;
+  ctx.drawImage(LOGO, 4 * U, 2 * U, w, h);
+  ctx.imageSmoothingEnabled = false;
+  const x = 4 + w / U + 4;
+  text("dkitchen", x, 4, { size: 40 });
+  const font = LANG === "zh" ? "FusionPixel" : "VT323", size = LANG === "zh" ? 24 : 26;
+  TAGLINE.forEach((line, i) => text(line, x, 15 + i * 6.5, { size, font, color: "#d8d2c4" }));
 }
 
 function talk(r) {
   if (r < 3 || r >= TALK_END) return;
   // the idea
   if (r < 4.8) alpha(prog(r, 3, 3.2) * (1 - prog(r, 4.6, 4.8)), () =>
-    bubble(18, 9, 56, 12, [["try method B"], ["on dataset X?"]], 72));
+    bubble(18, 9, 56, 12, LANG === "zh" ? [["方法 B 在数据集 X"], ["上试试？"]] : [["try method B"], ["on dataset X?"]], 72));
   // the designer walks up from the pass, talks, and walks back
   const p = ease(prog(r, 4.4, 5.4)) * (1 - ease(prog(r, 9.4, 10.2)));
   const walking = (r >= 4.4 && r < 5.4) || (r >= 9.4 && r < 10.2);
@@ -699,10 +829,11 @@ function talk(r) {
     sprite("scroll", x + 20, y + 1);
   }
   if (r >= 5.4 && r < 7.6) alpha(prog(r, 5.4, 5.6) * (1 - prog(r, 7.4, 7.6)), () =>
-    bubble(114, 1, 58, 11, [["PROPOSAL", "#c2532a"], ["new prompts for B?"]], 124));
+    bubble(114, 1, 58, 11, [[L("PROPOSAL", "提案"), "#c2532a"], [L("new prompts for B?", "B 要换新 prompt？")]], 124));
   if (r >= 7.6 && r < 9.4) alpha(prog(r, 7.6, 7.8) * (1 - prog(r, 9.2, 9.4)), () =>
-    bubble(14, 7, 62, 16, [["DECISION", "#2f7a3e"], ["yes. keep the old"], ["prompts as baseline"]], 72));
-  if (r >= 9.0 && r < 9.4) text("got it!", 126, 6, { size: 12, color: C.ink, align: "center" });
+    bubble(14, 7, 62, 16, LANG === "zh" ? [["决定", "#2f7a3e"], ["可以，旧 prompt"], ["留作 baseline"]]
+      : [["DECISION", "#2f7a3e"], ["yes. keep the old"], ["prompts as baseline"]], 72));
+  if (r >= 9.0 && r < 9.4) text(L("got it!", "收到！"), 126, 6, { size: 12, color: C.ink, align: "center" });
 }
 
 function renderAt(t) {
@@ -710,13 +841,19 @@ function renderAt(t) {
   STORY = REAL < 3 ? REAL : REAL < TALK_END ? 2.99 : REAL - SHIFT;
   t = STORY;
   ctx.globalAlpha = 1;
+  ctx.fillStyle = C.wall;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (LAYOUT === "tall") header();
+  ctx.save();
+  ctx.translate(0, (LAYOUT === "tall" ? 30 : 0) * U);
   background();
   headChef(t);
   pass(t);
   line(t);
-  resources(t);
   talk(REAL);
   dim(REAL);
+  ctx.restore();
+  resources(t);
   caption(REAL);
   endCard(t);
   // fade through black at the loop point
@@ -724,12 +861,11 @@ function renderAt(t) {
   if (black > 0) { ctx.fillStyle = `rgba(0,0,0,${black})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
 }
 
-const query = new URLSearchParams(location.search);
-Promise.all([...["16px Silkscreen", "30px VT323"].map((font) => document.fonts.load(font)),
+Promise.all([...["16px Silkscreen", "30px VT323", "12px FusionPixel"].map((font) => document.fonts.load(font, "a中")),
              new Promise((resolve) => { LOGO.onload = resolve; LOGO.onerror = resolve; })])
   .then(() => {
     document.body.dataset.ready = "1";
-    if (query.has("t")) { renderAt(Number(query.get("t"))); return; }
+    if (PARAMS.has("t")) { renderAt(Number(PARAMS.get("t"))); return; }
     const begin = performance.now();
     const loop = (now) => { renderAt((now - begin) / 1000); requestAnimationFrame(loop); };
     requestAnimationFrame(loop);

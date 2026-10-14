@@ -35,7 +35,7 @@ dkitchen 就这样组织你的 agent。你是主厨。
 ## 🧑‍🍳 厨房里的岗位
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/kitchen.gif" width="100%" alt="像素风的厨房：你和总设计讨论方案，总核查检查 ticket，总编排按铃让 Codex 执行者用上空闲 GPU，审查并合并 PR，再把一个需要你决定的事带给你">
+  <img src="https://raw.githubusercontent.com/917Dhj/dkitchen/main/docs/assets/kitchen-zh.gif" width="100%" alt="像素风的厨房：你和总设计讨论方案，总核查检查 ticket，总编排按铃让 Codex 执行者用上空闲 GPU，审查并合并 PR，再把一个需要你决定的事带给你">
 </p>
 
 | 岗位 | 在后厨相当于 | 做什么 | 由谁担任 |
