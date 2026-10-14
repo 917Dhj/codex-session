@@ -102,7 +102,25 @@ data-cleanup      /work/repo/.wt/issue57  idle    #57    Merged the loader fix. 
 By default the board shows loaded sessions and sessions with registered jobs in the current Git repo and its worktrees (or the current directory outside Git). Options:
 
 - `--all` shows every non-archived session in every directory. It is slower.
-- `--status` replaces `HEAD` with the status block from the session's latest issue comment, when that comment opens with four non-empty lines `状态:`, `在等:`, `关键数字:`, `下一步:` in that order. Otherwise it falls back to the final reply.
+- `--status` replaces `HEAD` with the status block from the session's latest issue comment. Otherwise it falls back to the final reply.
+
+### Status blocks
+
+A status block is the first few lines of an executor's comment, one field per line, in a fixed order:
+
+```text
+Status: running
+Waiting on: none
+Key numbers: 412/500 samples
+Next: finish stage 1, then post results
+```
+
+`board --status` shows it only when every field is present, in order, with a non-empty value. The default fields are `Status`, `Waiting on`, `Key numbers`, and `Next`. To use your own, set them once for your environment, or per command:
+
+```bash
+export DING_STATUS_FIELDS='状态,在等,关键数字,下一步'
+ding board --status --status-fields 'State,Blocked by,Next'
+```
 
 `board` only reads. It never restores a session or retries a message.
 

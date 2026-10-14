@@ -25,6 +25,7 @@ import fcntl
 
 
 ISSUE_REPOSITORY = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+STATUS_FIELDS = "Status,Waiting on,Key numbers,Next"
 SHELL_PROGRAMS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
 
 
@@ -599,7 +600,7 @@ def run_state(run: dict) -> str:
         return "unknown"
 
 
-def executor_comment_heads(mapping: dict[str, set[int]]) -> dict[str, str]:
+def executor_comment_heads(mapping: dict[str, set[int]], fields: tuple[str, ...]) -> dict[str, str]:
     numbers = sorted({number for issues in mapping.values() for number in issues})
     if not numbers:
         return {}
@@ -655,9 +656,9 @@ def executor_comment_heads(mapping: dict[str, set[int]]) -> dict[str, str]:
     heads = {}
     for thread_id, (_, body) in latest.items():
         lines = body.replace("\r\n", "\n").lstrip().splitlines()
-        if thread_id not in uncertain and len(lines) >= 4 and all(re.match(rf"^[ \t]*{label}:[ \t]*\S", line)
-                                  for label, line in zip(("状态", "在等", "关键数字", "下一步"), lines)):
-            heads[thread_id] = " ".join(line.strip() for line in lines[:4])
+        if thread_id not in uncertain and len(lines) >= len(fields) and all(
+                re.match(rf"^[ \t]*{re.escape(label)}:[ \t]*\S", line) for label, line in zip(fields, lines)):
+            heads[thread_id] = " ".join(line.strip() for line in lines[:len(fields)])
     return heads
 
 
@@ -944,7 +945,7 @@ def nonnegative_number(value: str) -> float:
     return number
 
 
-def show_board(path: str | None, *, all_threads: bool = False, status: bool = False) -> None:
+def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str, ...] | None = None) -> None:
     roots = [] if all_threads else repository_roots()
     runs = latest_runs()
     try:
@@ -995,7 +996,7 @@ def show_board(path: str | None, *, all_threads: bool = False, status: bool = Fa
                 for thread_id, run in runs.items()
                 if all_threads or any(Path(run["cwd"]).resolve().is_relative_to(root) for root in roots)]
     mapping = issue_map()
-    heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}) if status else {}
+    heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}, status) if status else {}
     print("NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN")
     for name, cwd, status, thread_id, head in rows:
         issue = ",".join(f"#{number}" for number in sorted(mapping.get(thread_id, set())))
@@ -1307,19 +1308,33 @@ def launch_task(args, command: list[str]) -> int:
     return 0
 
 
+def status_fields(value: str) -> tuple[str, ...]:
+    fields = tuple(field.strip() for field in value.split(","))
+    if not all(fields):
+        raise argparse.ArgumentTypeError("must be comma-separated nonempty field names")
+    return fields
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ding", description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
     board.add_argument("--status", action="store_true", help="Show the latest executor comment status block")
+    board.add_argument("--status-fields", type=status_fields, default=os.environ.get("DING_STATUS_FIELDS", STATUS_FIELDS),
+                       help="Comma-separated field names that open a status block "
+                            f"(default: $DING_STATUS_FIELDS, or '{STATUS_FIELDS}')")
     board.add_argument("--socket", help="Existing local App Server Unix socket path")
     board.add_argument("--min-age", type=nonnegative_number, default=600,
                        help="Minimum age in seconds for the local unwrapped process audit (default: 600)")
     board.add_argument("--min-cpu", type=nonnegative_number, default=10,
                        help="Minimum lifetime CPU percent per core outside tmux panes (default: 10)")
-    for action in ("read", "status", "send", "run", "launch"):
-        sub = commands.add_parser(action)
+    for action, summary in (("read", "Print a session's latest final reply"),
+                            ("status", "Print a session's App Server status as JSON"),
+                            ("send", "Send a message to a session"),
+                            ("run", "Run a command and message a session when it exits"),
+                            ("launch", "Run a command in a new tmux session and wake this Codex session when it exits")):
+        sub = commands.add_parser(action, help=summary)
         if action == "launch":
             sub.add_argument("name", help="Name of the dedicated ding-NAME tmux session and its first window")
         else:
@@ -1353,7 +1368,7 @@ def main(argv=None) -> int:
         if args.action == "board":
             findings = unwrapped_tasks(min_age=args.min_age, min_cpu=args.min_cpu)
             try:
-                show_board(args.socket, all_threads=args.all, status=args.status)
+                show_board(args.socket, all_threads=args.all, status=args.status_fields if args.status else None)
             finally:
                 show_unwrapped(findings)
             return 0

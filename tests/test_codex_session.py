@@ -2092,7 +2092,8 @@ def executor_comment(text, session=THREAD_ID, created="2026-10-12T10:00:00Z"):
     return {"body": text + f"\n\nCodex session: {session}", "createdAt": created}
 
 
-STATUS_BLOCK = "状态: 完成\n在等: 无\n关键数字: 12/12\n下一步: 合并"
+STATUS_BLOCK = "Status: done\nWaiting on: none\nKey numbers: 12/12\nNext: merge"
+FIELDS = ding.status_fields(ding.STATUS_FIELDS)
 
 
 def test_executor_comments_select_latest_own_across_tickets_with_last_owner_authoritative(monkeypatch):
@@ -2101,8 +2102,8 @@ def test_executor_comments_select_latest_own_across_tickets_with_last_owner_auth
         186: [executor_comment(STATUS_BLOCK, created="2026-10-12T11:00:00Z"),
               executor_comment(STATUS_BLOCK + f"\nCodex owner: {THREAD_ID}\nCodex owner: {OTHER_ID}",
                                created="2026-10-12T12:00:00Z"),
-              executor_comment("状态: 旧\n在等: 无\n关键数字: 1\n下一步: 查", created="2026-10-11T10:00:00Z")],
-        193: [executor_comment("\r\n  " + STATUS_BLOCK.replace("完成", "运行中").replace("\n", "\r\n"),
+              executor_comment("Status: old\nWaiting on: none\nKey numbers: 1\nNext: check", created="2026-10-11T10:00:00Z")],
+        193: [executor_comment("\r\n  " + STATUS_BLOCK.replace("done", "running").replace("\n", "\r\n"),
                                created="2026-10-12T11:30:00Z")],
     }
 
@@ -2114,27 +2115,27 @@ def test_executor_comments_select_latest_own_across_tickets_with_last_owner_auth
 
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", gh)
-    heads = ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}})
-    assert heads == {THREAD_ID: STATUS_BLOCK.replace("完成", "运行中").replace("\n", " "),
+    heads = ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}}, FIELDS)
+    assert heads == {THREAD_ID: STATUS_BLOCK.replace("done", "running").replace("\n", " "),
                      OTHER_ID: STATUS_BLOCK.replace("\n", " ")}
     assert sorted(int(arguments[2]) for arguments in calls) == [186, 193]
 
 
-@pytest.mark.parametrize("latest", ["Details only", "状态: 完成\n在等: 无\n\n关键数字: 1\n下一步: 查",
-                                    "状态: \n在等: 无\n关键数字: 1\n下一步: 查"])
+@pytest.mark.parametrize("latest", ["Details only", "Status: done\nWaiting on: none\n\nKey numbers: 1\nNext: check",
+                                    "Status: \nWaiting on: none\nKey numbers: 1\nNext: check"])
 def test_latest_own_comment_without_complete_block_never_uses_stale_status(monkeypatch, latest):
     comments = [executor_comment(STATUS_BLOCK, created="2026-10-11T10:00:00Z"),
                 executor_comment(latest), executor_comment(STATUS_BLOCK, session=OTHER_ID)]
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": comments})
-    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+    assert ding.executor_comment_heads({THREAD_ID: {186}}, FIELDS) == {}
 
 
 def test_bad_own_comment_timestamp_falls_back_instead_of_showing_older_status(monkeypatch, capsys):
     comments = [executor_comment(STATUS_BLOCK), executor_comment(STATUS_BLOCK, created="invalid")]
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": comments})
-    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+    assert ding.executor_comment_heads({THREAD_ID: {186}}, FIELDS) == {}
     assert "invalid executor comment timestamp" in capsys.readouterr().err
 
 
@@ -2162,6 +2163,52 @@ def test_board_status_option_replaces_head_and_default_never_fetches_comments(mo
     assert len(calls) == int(status)
 
 
+@pytest.mark.parametrize("option, env", [(["--status-fields", " 状态,在等 ,关键数字,下一步"], None),
+                                         ([], "状态,在等,关键数字,下一步")])
+def test_board_status_fields_come_from_option_or_environment(monkeypatch, capsys, option, env):
+    block = "状态: 完成\n在等: 无\n关键数字: 12/12\n下一步: 合并"
+
+    def call(method, params):
+        if method == "thread/list":
+            return {"data": [thread()]}
+        return {"data": [{"items": [final("Final fallback")]}]}
+
+    if env is None:
+        monkeypatch.delenv("DING_STATUS_FIELDS", raising=False)
+    else:
+        monkeypatch.setenv("DING_STATUS_FIELDS", env)
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    monkeypatch.setattr(ding, "issue_map", lambda: {THREAD_ID: {186}})
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": [executor_comment(block)]})
+    assert ding.main(["board", "--all", "--socket", "/fake.sock", "--status", *option]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split("\t")[4] == block.replace("\n", " ")
+
+
+def test_status_fields_are_literal_and_need_a_full_match(monkeypatch):
+    monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"comments": [executor_comment("Xa: 1\nb: 2\nc: 3")]})
+    assert ding.executor_comment_heads({THREAD_ID: {186}}, (".a", "b")) == {}
+    assert ding.executor_comment_heads({THREAD_ID: {186}}, ("Xa", "b")) == {THREAD_ID: "Xa: 1 b: 2"}
+
+
+@pytest.mark.parametrize("value", ["", "Status,,Next", "Status, "])
+def test_empty_status_fields_are_rejected(capsys, value):
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["board", "--status", "--status-fields", value])
+    assert exc.value.code == 2
+    assert "comma-separated nonempty field names" in capsys.readouterr().err
+
+
+def test_help_summarizes_every_command(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(["--help"])
+    out = capsys.readouterr().out
+    for summary in ("List sessions", "latest final reply", "status as JSON", "Send a message",
+                    "message a session when it exits", "new tmux session"):
+        assert summary in out
+
+
 @pytest.mark.parametrize("failure", [ValueError("bad JSON"), FileNotFoundError("gh"),
                                       subprocess.TimeoutExpired(["gh"], 60), {"comments": "bad"}])
 def test_executor_comment_failures_warn_and_fall_back(monkeypatch, capsys, failure):
@@ -2172,7 +2219,7 @@ def test_executor_comment_failures_warn_and_fall_back(monkeypatch, capsys, failu
 
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", gh)
-    assert ding.executor_comment_heads({THREAD_ID: {186}}) == {}
+    assert ding.executor_comment_heads({THREAD_ID: {186}}, FIELDS) == {}
     assert "executor comment lookup failed for #186" in capsys.readouterr().err
 
 
@@ -2196,7 +2243,7 @@ def test_executor_comment_calls_are_deduplicated_and_bounded(monkeypatch):
 
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", gh)
-    assert ding.executor_comment_heads({THREAD_ID: set(range(1, 10)), OTHER_ID: {1, 2}}) == {}
+    assert ding.executor_comment_heads({THREAD_ID: set(range(1, 10)), OTHER_ID: {1, 2}}, FIELDS) == {}
     assert sorted(calls) == list(range(1, 10))
     assert 2 <= peak <= 4
 
@@ -2209,7 +2256,7 @@ def test_comment_failure_on_one_ticket_does_not_show_stale_other_ticket_status(m
 
     monkeypatch.setattr(ding, "github_repository", lambda: "owner/repo")
     monkeypatch.setattr(ding, "gh_json", gh)
-    assert ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}}) == {}
+    assert ding.executor_comment_heads({THREAD_ID: {186, 193}, OTHER_ID: {186}}, FIELDS) == {}
     assert "executor comment lookup failed for #193" in capsys.readouterr().err
 
 
