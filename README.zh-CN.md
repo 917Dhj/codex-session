@@ -12,6 +12,14 @@
   <b>你决定做什么菜，agent 们把厨房转起来。</b> 🧑‍🍳
 </p>
 
+<p align="center">
+  <a href="https://pypi.org/project/dkitchen/"><img src="https://img.shields.io/pypi/v/dkitchen" alt="PyPI"></a>
+  <a href="https://pypi.org/project/dkitchen/"><img src="https://img.shields.io/pypi/pyversions/dkitchen" alt="Python"></a>
+  <a href="https://github.com/917Dhj/dkitchen/actions/workflows/tests.yml"><img src="https://github.com/917Dhj/dkitchen/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/917Dhj/dkitchen/blob/main/LICENSE"><img src="https://img.shields.io/github/license/917Dhj/dkitchen" alt="License"></a>
+  <a href="https://x.com/dahuoji09"><img src="https://img.shields.io/badge/follow-%40dahuoji09-000000?logo=x" alt="X: @dahuoji09"></a>
+</p>
+
 dkitchen 是我每天用来跑科研仓库的多 agent 工作流。它给一组 Claude Code 和 Codex 会话分好岗位，约定它们怎么通过 GitHub issue 交接工作、什么时候必须停下来问你，并配齐把这一切串起来的工具。只有你能做的决定留给你：研究什么、试什么、花多少。
 
 ## 🍽️ 为什么是厨房
