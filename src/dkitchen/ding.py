@@ -1321,9 +1321,9 @@ def main(argv=None) -> int:
     board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
     board.add_argument("--status", action="store_true", help="Show the latest executor comment status block")
-    board.add_argument("--status-fields", type=status_fields, default=os.environ.get("DING_STATUS_FIELDS", STATUS_FIELDS),
-                       help="Comma-separated field names that open a status block "
-                            f"(default: $DING_STATUS_FIELDS, or '{STATUS_FIELDS}')")
+    board.add_argument("--status-fields", type=status_fields,
+                       help="Comma-separated field names that open a status block (default: $DING_STATUS_FIELDS, "
+                            f"then [status] fields in .dkitchen.toml, then '{STATUS_FIELDS}')")
     board.add_argument("--socket", help="Existing local App Server Unix socket path")
     board.add_argument("--min-age", type=nonnegative_number, default=600,
                        help="Minimum age in seconds for the local unwrapped process audit (default: 600)")
@@ -1353,6 +1353,42 @@ def main(argv=None) -> int:
             sub.add_argument("--record", required=action == "run", help="Append-only local exit/notification JSONL")
             sub.epilog = ("Task command follows --, for example: launch NAME -- python task.py" if action == "launch" else
                           "Task command follows --, for example: run UUID --message TEXT --record exit.jsonl -- python task.py")
+    sub = commands.add_parser("relay", help="Send a message to a ticket's executor, then leave it on the ticket")
+    sub.add_argument("ticket", type=int, help="Ticket number in this repository")
+    message = sub.add_mutually_exclusive_group(required=True)
+    message.add_argument("--message", help="What the executor receives, or '-' to read stdin")
+    message.add_argument("--message-file", help="UTF-8 message file")
+    sub.add_argument("--comment", help="Ticket comment (default: the message itself)")
+    sub.add_argument("--no-comment", action="store_true", help="Send only; leave no ticket comment")
+    sub.add_argument("--to", help="Executor session UUID or name, when the ticket has no Codex owner line")
+    sub.add_argument("--socket", help="Existing local App Server Unix socket path")
+    sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD")
+    sub.add_argument("pr", type=int, help="PR number")
+    sub.add_argument("sha", help="The HEAD that was reviewed (full or prefix)")
+    sub = commands.add_parser("log", help="Post an entry to the orchestrator log ticket")
+    sub.add_argument("--item", action="append", required=True, help="One automatic action; repeat for more")
+    sub.add_argument("--pending", action="append", default=[], help="One matter waiting for the user; repeat for more")
+    sub.add_argument("--issue", type=int, help="Orchestrator log ticket (default: [log] issue in .dkitchen.toml)")
+    sub = commands.add_parser("watch", help="Wait for GitHub activity the orchestrator must handle, then exit",
+                                description="Wait for GitHub activity the orchestrator must handle, print it, and exit. "
+                                            "Read-only; calls no model.")
+    sub.add_argument("--state", type=Path, help="JSON file holding the last reported time "
+                                                  "(default: ~/.local/state/ding/watch/OWNER-REPO.json)")
+    sub.add_argument("--since", help="Start time for the first run (ISO, UTC; default: now)")
+    sub.add_argument("--skip-issue", type=int, action="append", default=[],
+                       help="Ticket to ignore; the orchestrator log ticket is always ignored")
+    sub.add_argument("--checkout", type=Path, help="Checkout where `ding board` lists ticket sessions (default: this repository)")
+    sub.add_argument("--interval", type=float, default=90, help="Seconds between polls (default: 90)")
+    sub.add_argument("--settle", type=float, default=300, help="After the first trigger, seconds to wait to batch more (default: 300)")
+    sub.add_argument("--stale-hours", type=float, default=6, help="Executor silence that counts as stale (default: 6)")
+    sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale checks (default: 3600)")
+    sub.add_argument("--max-errors", type=int, default=10, help="Consecutive failed polls before exiting (default: 10)")
+    sub = commands.add_parser("check-refs", help="Check `file:line` and sha256 references in a draft comment")
+    sub.add_argument("draft", help="Draft comment file")
+    where = sub.add_mutually_exclusive_group()
+    where.add_argument("--ref", default="origin/main", help="Git revision the references point into (default: origin/main)")
+    where.add_argument("--root", type=Path, help="Directory to read files from instead, such as a worktree or output folder")
+    sub.add_argument("--tolerance", type=int, default=0, help="Lines around a reference that may hold its name (default: 0)")
     argv = list(sys.argv[1:] if argv is None else argv)
     command = []
     if argv and argv[0] in {"run", "launch"} and "--" in argv:
@@ -1360,15 +1396,33 @@ def main(argv=None) -> int:
         command = argv[separator + 1:]
         argv = argv[:separator]
     args = parser.parse_args(argv)
-    if args.action not in {"board", "launch"} and args.issue is not None and args.issue <= 0:
+    if getattr(args, "issue", None) is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
     if args.action in {"run", "launch"} and not command:
         parser.error(f"{args.action} requires a task command after --")
     try:
+        if args.action == "check-refs":
+            from dkitchen import refs
+            return refs.check_refs(args)
+        if args.action in {"relay", "merge", "log", "watch"}:
+            from dkitchen import config, orchestrate, watch
+            settings = config.load()
+            handler = watch.watch if args.action == "watch" else getattr(orchestrate, args.action)
+            return handler(args, settings)
         if args.action == "board":
+            fields = args.status_fields
+            if args.status and fields is None:
+                environment = os.environ.get("DING_STATUS_FIELDS")
+                try:
+                    fields = status_fields(environment) if environment is not None else None
+                except argparse.ArgumentTypeError as exc:
+                    parser.error(f"DING_STATUS_FIELDS {exc}")
+                if fields is None:
+                    from dkitchen import config
+                    fields = config.load().status.fields
             findings = unwrapped_tasks(min_age=args.min_age, min_cpu=args.min_cpu)
             try:
-                show_board(args.socket, all_threads=args.all, status=args.status_fields if args.status else None)
+                show_board(args.socket, all_threads=args.all, status=fields if args.status else None)
             finally:
                 show_unwrapped(findings)
             return 0

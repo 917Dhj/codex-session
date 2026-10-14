@@ -12,7 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "917Dhj"}]
 keywords = ["agents", "multi-agent", "codex", "claude-code", "workflow", "research", "tmux", "cli"]
-dependencies = ["websocket-client>=1.9,<2"]
+dependencies = ["websocket-client>=1.9,<2", "tomli>=1.1; python_version < '3.11'"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

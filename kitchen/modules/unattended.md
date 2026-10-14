@@ -7,7 +7,7 @@ When the user is away, an issue watcher wakes the orchestrator, which moves forw
 The orchestrator runs the watch in the background of its main checkout, always with the same command. After handling each batch it starts the watch again; that is the last step of every round.
 
 ```bash
-ding watch --state ~/.local/state/ding/watch/<!-- fill: repo name -->.json --skip-issue <orchestrator log ticket>
+ding watch
 ```
 
 The watch only reads GitHub, `ding board`, and tmux; it calls no model. It exits, waking the orchestrator, about 5 minutes after the first of these appears, so that related changes arrive as one batch:
@@ -18,7 +18,7 @@ The watch only reads GitHub, `ding board`, and tmux; it calls no model. It exits
 - a new PR;
 - an executor gone quiet: `in progress` for over 6 hours without a comment, with no running `ding run` and no live tmux job whose session name contains `issue<ticket number>`.
 
-Verifier comments never wake it on their own, since the verifier also messages the orchestrator; they are listed in the next batch for reference. One watch runs per state file; a second exits at once. Run `ding watch --help` for the full rules.
+Verifier comments never wake it on their own, since the verifier also messages the orchestrator; they are listed in the next batch for reference. It skips the orchestrator log ticket set in `.dkitchen.toml`. One watch runs at a time; a second exits at once. `ding watch --help` lists the timing options.
 
 A closed session or a host reboot stops the watch silently. When the user is back, the orchestrator's background tasks show whether it is still running.
 

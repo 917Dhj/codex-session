@@ -12,6 +12,7 @@ It talks to Codex sessions through the Codex App Server. Claude Code sessions ca
 - [Send a message: `send`](#send-a-message-send)
 - [Run a long job: `launch`](#run-a-long-job-launch)
 - [Wrap a command yourself: `run`](#wrap-a-command-yourself-run)
+- [Kitchen commands](#kitchen-commands)
 - [Files `ding` keeps](#files-ding-keeps)
 - [When a wake-up does not arrive](#when-a-wake-up-does-not-arrive)
 
@@ -249,6 +250,54 @@ It never reruns the job. The wrapped job and everything it starts see `DING_RUN_
 | `lost` | The wrapper died before the job exited, for example after a reboot or `kill -9`. |
 | `unknown` | The record could not be read. `board` prints a warning. |
 
+## Kitchen commands
+
+These commands carry out the kitchen's routine steps, as the house rules in [kitchen/](../kitchen/) describe them. They read the repo's vocabulary from [`.dkitchen.toml`](#dkitchentoml).
+
+| Command | Who runs it | What it does |
+| --- | --- | --- |
+| `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
+| `ding merge 57 a1b2c3d` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d` and it is not a draft, then confirms the merge and prints the merge commit. |
+| `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
+| `ding watch` | Orchestrator, in the background | Waits for GitHub activity the orchestrator must handle, prints it as one batch, and exits. See [While the user is away](../kitchen/modules/unattended.md). |
+| `ding check-refs draft.md` | Verifier | Checks every `` `file:line` `` in a draft comment (a name written right next to it must appear on that line) and every `sha256`, against `origin/main` or `--root DIR`. Exits 1 when something is wrong. |
+
+`ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. Run `ding watch --help` for the timing options.
+
+### .dkitchen.toml
+
+Put this file at the repo root to change the kitchen's words. Every key is optional; these are the defaults:
+
+```toml
+repo = "owner/name"                  # default: the repository gh sees here
+
+[stations]
+orchestrator = "Orchestrator"
+designer = "Designer"
+verifier = "Verifier"
+executor = "Executor"
+user = "User"
+separator = ": "                     # written after a station name to sign a comment
+
+[status]
+fields = ["Status", "Waiting on", "Key numbers", "Next"]   # first: the state; second: who it waits on
+in_progress = "in progress"
+waiting_on_design = "waiting on design"
+blocked = "blocked"
+done = "done"
+none = "none"                        # a "Waiting on" value that names nobody
+
+[labels]
+prefix = "status:"
+awaiting_user = "status:awaiting-user"
+
+[log]
+issue = 1                            # the pinned orchestrator log ticket
+pending = "Waiting for the user"
+```
+
+`ding board --status` also uses `[status] fields`, after `--status-fields` and `DING_STATUS_FIELDS`. A misspelled key is an error, so a typo cannot silently fall back to a default.
+
 ## Files `ding` keeps
 
 Everything lives under `${XDG_STATE_HOME:-~/.local/state}/ding/`, readable only by you.
@@ -259,6 +308,7 @@ Everything lives under `${XDG_STATE_HOME:-~/.local/state}/ding/`, readable only 
 | `runs.jsonl` | One `run_start` line per wrapped job, used by `board` to find jobs |
 | `launch-records/<id>.jsonl` | Default record for each `launch`: `task_exit` and `notification` events |
 | `launch-records/<id>.message.txt` | The wake-up message for that launch |
+| `watch/OWNER-REPO.json` | Where `ding watch` left off |
 | `run-locks/<run id>.lock` | Held while a wrapper is alive; this is how `board` tells `running` from `lost` |
 
 A `runs.jsonl` line looks like this:

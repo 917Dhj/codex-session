@@ -25,7 +25,7 @@ Core files go into every kitchen. Each module is optional.
 
 ## Vocabulary
 
-The rules and the `ding` commands share one vocabulary. The defaults are below. A kitchen in another language changes these words in the rules and in the repo's `.dkitchen.toml` together, so that people, agents, and scripts keep agreeing.
+The rules and the `ding` commands share one vocabulary. The defaults are below. A kitchen in another language changes these words in the rules and in the repo's [`.dkitchen.toml`](../docs/ding.md#dkitchentoml) together, so that people, agents, and scripts keep agreeing.
 
 | Word | Default | Read by |
 | --- | --- | --- |
