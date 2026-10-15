@@ -135,6 +135,16 @@ def read_status(call, thread_id: str) -> dict:
     return status
 
 
+def read_info(call, thread_id: str) -> dict:
+    """A session's ID, name (None when unnamed), working directory, and status."""
+    result = call("thread/read", {"threadId": thread_id, "includeTurns": False})
+    thread = result.get("thread")
+    info = thread_metadata(thread)
+    if info["id"] != thread_id:
+        raise ValueError("App Server returned a different thread.")
+    return {**info, "name": thread.get("name") or None}
+
+
 def read_reply(call, thread_id: str) -> str:
     cursor = None
     seen_cursors = set()
@@ -1392,6 +1402,7 @@ def main(argv=None) -> int:
                        help="Minimum lifetime CPU percent per core outside tmux panes (default: 10)")
     for action, summary in (("read", "Print a session's latest final reply"),
                             ("status", "Print a session's App Server status as JSON"),
+                            ("info", "Print a session's ID, name, working directory, and status as JSON"),
                             ("rename", "Change a session's name without starting a model turn"),
                             ("send", "Send a message to a session"),
                             ("run", "Run a command and message a session when it exits"),
@@ -1515,6 +1526,10 @@ def main(argv=None) -> int:
             with app_server(path) as call:
                 call("thread/name/set", {"threadId": args.thread_id, "name": args.name})
             print(args.thread_id)
+            return 0
+        if args.action == "info":
+            with app_server(path) as call:
+                print(json.dumps(read_info(call, args.thread_id), ensure_ascii=False))
             return 0
         result = query(args.thread_id, path, status_only=args.action == "status")
         if args.action == "read" and args.head:
