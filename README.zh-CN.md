@@ -103,7 +103,7 @@ ding launch train -- python train.py                  # 在 tmux 里跑，退出
 各岗位每天要做的固定动作也做成了 `ding` 命令，每次都按同样稳妥的方式执行：
 
 - `ding relay` 给票的执行者发消息，确认送达后才在票里留记录。
-- `ding merge` 只在审过的那个 HEAD 上合并 PR。
+- `ding merge` 只在审过的那个 HEAD 上合并 PR，而且要等票的执行者表示在等总编排合入。
 - `ding watch` 在总编排后台等着，票需要处理时唤醒它。
 - `ding log` 记下你不在时总编排做了什么。
 - `ding check-refs` 核对核查引用的每个文件、行号和摘要。

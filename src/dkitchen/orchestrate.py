@@ -1,6 +1,7 @@
 """The orchestrator's routine GitHub writes, each checked step by step.
 
-- merge: merge a reviewed PR at the reviewed HEAD and print the merge commit; refuses drafts and moved HEADs.
+- merge: merge a reviewed PR at the reviewed HEAD and print the merge commit; refuses drafts, moved HEADs,
+  and tickets whose executor's latest status block is not waiting on the orchestrator.
 - relay: send a message to a ticket's executor with `ding send`, then leave the matching ticket comment.
 - log: post one entry to the orchestrator log, stamped with the current UTC time.
 Every comment is signed with the orchestrator's station name, so `ding watch` can tell who wrote it.
@@ -9,10 +10,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import re
 import subprocess
 import sys
 
-from dkitchen import ding
+from dkitchen import ding, watch
 from dkitchen.config import Config
 
 
@@ -47,11 +49,36 @@ def comment(config: Config, repo: str, issue: int, body: str) -> int:
     return 0
 
 
+def executor_status(config: Config, repo: str, issue: int) -> dict | None:
+    """The latest executor comment on a ticket: its status block, whether it waits on the orchestrator, and its link."""
+    result = call(config, "gh", "api", "--paginate", "--slurp", f"repos/{repo}/issues/{issue}/comments?per_page=100")
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    comments = [comment for page in json.loads(result.stdout) for comment in page]
+    executor = [comment for comment in comments if watch.role(comment["body"], config) == config.stations.executor]
+    if not executor:
+        return None
+    latest = executor[-1]
+    names = config.status.fields
+    block = "\n".join(line for line in latest["body"].splitlines()[:len(names)] if line.strip())
+    _, waiting = watch.state_and_waiting(latest["body"], config)
+    ready = not waiting.startswith(config.status.none) and config.stations.orchestrator in waiting
+    return {"block": block, "url": latest["html_url"], "ready": ready}
+
+
+def ticket_references(body: str, repo: str, pr: int) -> list[int]:
+    """Ticket numbers a PR body mentions, as #N or as a link to this repository."""
+    links = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d+)"
+    numbers = {int(n) for n in re.findall(rf"(?<![\w/&])#(\d+)\b", body or "")}
+    numbers |= {int(n) for n in re.findall(links, body or "")}
+    return sorted(numbers - {pr})
+
+
 def merge(args, config: Config) -> int:
     repo = config.repository()
 
     def view() -> dict:
-        result = call(config, "gh", "pr", "view", str(args.pr), "--repo", repo, "--json", "isDraft,state,headRefOid,mergeCommit")
+        result = call(config, "gh", "pr", "view", str(args.pr), "--repo", repo, "--json", "isDraft,state,headRefOid,mergeCommit,body")
         if result.returncode:
             raise RuntimeError(result.stderr.strip())
         return json.loads(result.stdout)
@@ -64,6 +91,28 @@ def merge(args, config: Config) -> int:
             return fail(f"PR #{args.pr} HEAD is now {pr['headRefOid']}, not the reviewed {args.sha}; review it again")
         if pr["isDraft"]:
             return fail(f"PR #{args.pr} is a draft and cannot be merged; its author marks it ready with gh pr ready first")
+        if not getattr(args, "no_ticket", False):
+            ticket, status = getattr(args, "ticket", None), None
+            if ticket is None:
+                found = {}
+                for number in ticket_references(pr.get("body"), repo, args.pr):
+                    candidate = executor_status(config, repo, number)
+                    if candidate is not None:
+                        found[number] = candidate
+                if len(found) != 1:
+                    listed = ", ".join(f"#{number}" for number in found) or "none"
+                    return fail(f"cannot tell PR #{args.pr}'s ticket: tickets with executor comments mentioned in it: "
+                                f"{listed}; pass --ticket N, or --no-ticket for a PR without one")
+                (ticket, status), = found.items()
+            else:
+                status = executor_status(config, repo, ticket)
+                if status is None:
+                    return fail(f"#{ticket} has no executor comment; pass the PR's ticket with --ticket, "
+                                "or --no-ticket for a PR without one")
+            print(f"#{ticket} latest executor status ({status['url']}):\n{status['block']}")
+            if not status["ready"]:
+                return fail(f"#{ticket}'s executor is not waiting on {config.stations.orchestrator} to merge; "
+                            "read its latest comment and wait until it asks for the merge. Nothing merged")
         result = call(config, "gh", "pr", "merge", str(args.pr), "--repo", repo, "--merge",
                       "--match-head-commit", pr["headRefOid"])
         if result.returncode:

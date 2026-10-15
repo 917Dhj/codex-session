@@ -315,10 +315,12 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 | Command | Who runs it | What it does |
 | --- | --- | --- |
 | `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
-| `ding merge 57 a1b2c3d` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d` and it is not a draft, then confirms the merge and prints the merge commit. |
+| `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator to merge (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
 | `ding watch` | Orchestrator, in the background | Waits for GitHub activity the orchestrator must handle, prints it as one batch, and exits. See [While the user is away](../kitchen/modules/unattended.md). |
 | `ding check-refs draft.md` | Verifier | Checks every `` `file:line` `` in a draft comment (a name written right next to it must appear on that line) and every `sha256`, against `origin/main` or `--root DIR`. Exits 1 when something is wrong. |
+
+**Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
 `ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. Run `ding watch --help` for the timing options.
 
