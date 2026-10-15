@@ -266,39 +266,71 @@ def test_new_requires_options(tmp_path, monkeypatch, capsys, missing):
     assert missing in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("invalid", ["missing-dir", "file", "blank-name", "empty-name",
-                                   "blank-message", "empty-message", "blank-stdin", "empty-stdin"])
+def test_new_rejects_message_and_message_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    note = tmp_path / "note.md"
+    note.write_text("Start", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--name", "Build",
+                   "--message", "Start", "--message-file", str(note)])
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["", " \t\n", "\u2003"])
+def test_new_rejects_blank_name_like_rename(tmp_path, monkeypatch, capsys, name):
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("blank name must not look up"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--name", name, "--message", "Start"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--name must contain non-whitespace text" in captured.err
+
+
+@pytest.mark.parametrize("invalid", ["missing-dir", "file", "empty-cwd",
+                                   "blank-message", "empty-message", "blank-stdin", "empty-stdin",
+                                   "blank-file", "empty-file", "missing-file"])
 def test_new_validates_before_socket_lookup(tmp_path, monkeypatch, capsys, invalid):
     monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must validate before socket lookup"))
-    cwd, name, message = tmp_path, "Build", "Start"
+    monkeypatch.chdir(tmp_path)
+    cwd, message_option = str(tmp_path), ["--message", "Start"]
     if invalid == "missing-dir":
-        cwd = tmp_path / "missing"
+        cwd = str(tmp_path / "missing")
     elif invalid == "file":
-        cwd = tmp_path / "file"
-        cwd.touch()
-    elif invalid.endswith("name"):
-        name = " \t\n" if invalid.startswith("blank") else ""
+        cwd = str(tmp_path / "file")
+        Path(cwd).touch()
+    elif invalid == "empty-cwd":
+        cwd = ""
     else:
-        message = " \t\r\n" if invalid.startswith("blank") else ""
+        text = " \t\r\n" if invalid.startswith("blank") else ""
         if invalid.endswith("stdin"):
-            monkeypatch.setattr(ding.sys, "stdin", io.StringIO(message))
-            message = "-"
-    assert ding.main(["new", "--cwd", str(cwd), "--name", name, "--message", message]) == 1
+            monkeypatch.setattr(ding.sys, "stdin", io.StringIO(text))
+            message_option = ["--message", "-"]
+        elif invalid.endswith("file"):
+            note = tmp_path / "note.md"
+            if invalid != "missing-file":
+                note.write_text(text, encoding="utf-8")
+            message_option = ["--message-file", str(note)]
+        else:
+            message_option = ["--message", text]
+    assert ding.main(["new", "--cwd", cwd, "--name", "Build", *message_option]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "new validation" in captured.err
-    assert ("--cwd" if invalid in {"missing-dir", "file"} else
-            "--name" if invalid.endswith("name") else "--message") in captured.err
+    assert ("--cwd" if invalid in {"missing-dir", "file", "empty-cwd"} else
+            "note.md" if invalid == "missing-file" else "--message") in captured.err
 
 
-@pytest.mark.parametrize("stdin, status, explicit_socket", [
-    (False, "inProgress", True), (True, "completed", False),
+@pytest.mark.parametrize("source, status, explicit_socket", [
+    ("argument", "inProgress", True), ("stdin", "completed", False), ("file", "inProgress", False),
 ])
-def test_new_protocol_and_exact_text(tmp_path, monkeypatch, capsys, stdin, status, explicit_socket):
+def test_new_protocol_and_exact_text(tmp_path, monkeypatch, capsys, source, status, explicit_socket):
     cwd = tmp_path / "project space" / "nested"
     cwd.mkdir(parents=True)
     (tmp_path / "work").symlink_to(cwd, target_is_directory=True)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     message = '  Review "quoted"; $(not-shell)\r\n世界\n'
     name = "  检查\n配置  "
     thread_id = "00000000-0000-4000-8000-0000000000ab"
@@ -327,11 +359,15 @@ def test_new_protocol_and_exact_text(tmp_path, monkeypatch, capsys, stdin, statu
     monkeypatch.setattr(ding, "resolve_target", lambda *a: pytest.fail("new has no target"))
     monkeypatch.setattr(ding, "deliver_message", lambda *a: pytest.fail("first message must not queue"))
     monkeypatch.setattr(ding, "send_task", lambda *a: pytest.fail("first message must not use send"))
-    if stdin:
+    message_option = ["--message", message]
+    if source == "stdin":
         monkeypatch.setattr(ding.sys, "stdin", io.StringIO(message))
+        message_option = ["--message", "-"]
+    elif source == "file":
+        (tmp_path / "note.md").write_bytes(message.encode("utf-8"))
+        message_option = ["--message-file", "note.md"]
     options = ["--socket", "/test.sock"] if explicit_socket else []
-    assert ding.main(["new", "--cwd", "work", "--name", name,
-                      "--message", "-" if stdin else message, *options]) == 0
+    assert ding.main(["new", "--cwd", "work", "--name", name, *message_option, *options]) == 0
     assert requests == [
         ("thread/start", {"cwd": str(cwd), "ephemeral": False}),
         ("thread/name/set", {"threadId": thread_id, "name": name}),

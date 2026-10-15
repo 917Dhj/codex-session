@@ -1166,14 +1166,12 @@ def new_task(args) -> int:
     thread_id = None
     stage = "validation"
     try:
-        cwd = args.cwd.expanduser().resolve()
-        if not cwd.is_dir():
+        cwd = Path(args.cwd).expanduser().resolve() if args.cwd else None
+        if cwd is None or not cwd.is_dir():
             raise ValueError("--cwd must name an existing directory.")
-        if not args.name.strip():
-            raise ValueError("--name must not be empty.")
-        message = message_text(args.message, None, None)
+        message = message_text(args.message, args.message_file, None)
         if not message.strip():
-            raise ValueError("--message must not be empty.")
+            raise ValueError("The first message (--message or --message-file) must not be empty.")
         stage = "connection"
         with app_server(socket_path(args.socket)) as call:
             stage = "thread/start"
@@ -1365,9 +1363,11 @@ def main(argv=None) -> int:
     parser.add_argument("--version", action="version", version=f"ding {installed}")
     commands = parser.add_subparsers(dest="action", required=True)
     sub = commands.add_parser("new", help="Create a saved Codex session and start its first message")
-    sub.add_argument("--cwd", type=Path, required=True, help="Existing working directory for the session")
+    sub.add_argument("--cwd", required=True, help="Existing working directory for the session")
     sub.add_argument("--name", required=True, help="Session title")
-    sub.add_argument("--message", required=True, help="First message text, or '-' to read stdin")
+    message = sub.add_mutually_exclusive_group(required=True)
+    message.add_argument("--message", help="First message text, or '-' to read stdin")
+    message.add_argument("--message-file", help="UTF-8 file holding the first message")
     sub.add_argument("--socket", help="Existing local App Server Unix socket path")
     board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
@@ -1453,6 +1453,8 @@ def main(argv=None) -> int:
         parser.error(f"{args.action} requires a task command after --")
     try:
         if args.action == "new":
+            if not args.name.strip():
+                parser.error("--name must contain non-whitespace text")
             return new_task(args)
         if args.action == "check-refs":
             from dkitchen import refs

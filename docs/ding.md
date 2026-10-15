@@ -57,11 +57,12 @@ ding launch eval-42 -- python evaluate.py            # run in tmux; wake me when
 ```bash
 session_id=$(ding new --cwd /work/repo --name 'Evaluation runner' --message 'Review the evaluation config.')
 printf '%s\n' 'Review the evaluation config.' | ding new --cwd /work/repo --name 'Evaluation runner' --message -
+ding new --cwd /work/repo --name 'Evaluation runner' --message-file brief.md
 ```
 
 `new` creates a saved, interactive session through the existing Codex Desktop SSH App Server. Run it on the same host and under the same user as that App Server. The session appears in Desktop and can be continued there.
 
-`--cwd`, `--name`, and `--message` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin. `--socket PATH` selects an existing App Server socket.
+`--cwd`, `--name`, and one of `--message` or `--message-file` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin, and `--message-file PATH` reads it from a UTF-8 file. `--socket PATH` selects an existing App Server socket.
 
 After the App Server accepts the first turn, `new` prints only the session UUID to stdout and exits with code 0. It does not wait for the reply. Use that UUID to continue or inspect the session:
 
