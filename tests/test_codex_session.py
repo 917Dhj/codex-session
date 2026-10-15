@@ -3054,3 +3054,98 @@ def test_pane_representative_skips_empty_ancestor_command_and_breaks_ties_by_pid
     panes = {10: {"pane_id": "%1", "session": "work", "window": "task"}}
     assert [row["pid"] for row in ding.unwrapped_processes(
         processes, panes, min_age=600, min_cpu=10, proc=tmp_path)] == [11]
+
+
+@pytest.mark.parametrize("arguments", [
+    [], [THREAD_ID], ["--name", "New name"], [THREAD_ID, "--name"],
+    [THREAD_ID, "--issue", "42", "--name", "New name"],
+])
+def test_rename_requires_one_target_and_name(monkeypatch, capsys, arguments):
+    monkeypatch.setattr(ding, "resolve_target", lambda *a: pytest.fail("invalid arguments must not resolve"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["rename", *arguments])
+    assert exc.value.code == 2
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("name", ["", " \t\n", "\u2003"])
+@pytest.mark.parametrize("target", [["Build"], ["--issue", "42"]])
+def test_rename_rejects_blank_name_before_lookup(monkeypatch, capsys, name, target):
+    for function in ("resolve_target", "socket_path", "app_server", "github_repository", "gh_json"):
+        monkeypatch.setattr(ding, function, lambda *a: pytest.fail("blank name must not look up"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["rename", *target, "--name", name])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--name must contain non-whitespace text" in captured.err
+
+
+@pytest.mark.parametrize("target,issue", [
+    (THREAD_ID, None), ("Build", None), (None, 42), ("#42", None),
+    ("example/project#42", None), ("https://github.com/example/project/issues/42", None),
+])
+def test_rename_delegates_target_resolution(monkeypatch, capsys, target, issue):
+    resolved = []
+    calls = []
+
+    def resolve(value, number, path):
+        resolved.append((value, number, path))
+        return THREAD_ID
+
+    def call(method, params):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(ding, "resolve_target", resolve)
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    arguments = [target] if target is not None else ["--issue", str(issue)]
+    assert ding.main(["rename", *arguments, "--name", "New name", "--socket", "/test.sock"]) == 0
+    assert resolved == [(target, issue, "/test.sock")]
+    assert calls == [("thread/name/set", {"threadId": THREAD_ID, "name": "New name"})]
+    captured = capsys.readouterr()
+    assert captured.out == THREAD_ID + "\n"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("reply,status,error", [
+    ({"result": {}}, 0, None),
+    ({"error": {"code": -32602, "message": "name refused"}}, 1, "name refused"),
+    ("", 1, "closed the connection"),
+    ({"result": None}, 1, "Malformed App Server result"),
+])
+def test_rename_rpc_acknowledgement_and_failure(tmp_path, monkeypatch, capsys, reply, status, error):
+    websocket = pytest.importorskip("websocket")
+    ws = Connection([{"result": {}}, reply])
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **kw: ws)
+    name = '  评测 "quoted" $(not-shell)\nnext  '
+    path = str(tmp_path / "server")
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(path)
+        server.listen(1)
+        assert ding.main(["rename", "{" + THREAD_ID + "}", "--name", name, "--socket", path]) == status
+    captured = capsys.readouterr()
+    assert captured.out == (THREAD_ID + "\n" if status == 0 else "")
+    assert (error in captured.err) if error else captured.err == ""
+    assert [request["method"] for request in ws.requests] == ["initialize", "initialized", "thread/name/set"]
+    assert ws.requests[-1]["params"] == {"threadId": THREAD_ID, "name": name}
+    assert ws.closed
+
+
+@pytest.mark.parametrize("target", ["Build", "#42"])
+def test_rename_refuses_ambiguous_targets(issue_data, monkeypatch, capsys, target):
+    issue, comments = issue_data
+    comments.append({"body": f"Codex session: {OTHER_ID}"})
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        assert method == "thread/list"
+        return {"data": [thread(), thread(OTHER_ID, "Build")]}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["rename", target, "--name", "New name", "--socket", "/test.sock"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert THREAD_ID in captured.err and OTHER_ID in captured.err
+    assert calls == ["thread/list"]

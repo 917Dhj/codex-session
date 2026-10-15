@@ -1382,6 +1382,7 @@ def main(argv=None) -> int:
                        help="Minimum lifetime CPU percent per core outside tmux panes (default: 10)")
     for action, summary in (("read", "Print a session's latest final reply"),
                             ("status", "Print a session's App Server status as JSON"),
+                            ("rename", "Change a session's name without starting a model turn"),
                             ("send", "Send a message to a session"),
                             ("run", "Run a command and message a session when it exits"),
                             ("launch", "Run a command in a new tmux session and wake this Codex session when it exits")):
@@ -1395,6 +1396,8 @@ def main(argv=None) -> int:
         sub.add_argument("--socket", help="Existing local App Server Unix socket path")
         if action == "read":
             sub.add_argument("--head", action="store_true", help="Print only the first paragraph of the final reply")
+        if action == "rename":
+            sub.add_argument("--name", required=True, help="New session name, preserved exactly as supplied")
         if action in {"send", "run", "launch"}:
             message = sub.add_mutually_exclusive_group(required=action != "launch")
             message.add_argument("--message", help="Message text, or '-' to read stdin")
@@ -1447,6 +1450,8 @@ def main(argv=None) -> int:
         command = argv[separator + 1:]
         argv = argv[:separator]
     args = parser.parse_args(argv)
+    if args.action == "rename" and not args.name.strip():
+        parser.error("--name must contain non-whitespace text")
     if getattr(args, "issue", None) is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
     if args.action in {"run", "launch"} and not command:
@@ -1491,6 +1496,11 @@ def main(argv=None) -> int:
         if args.action == "run":
             return run_task(args, command)
         path = socket_path(args.socket)
+        if args.action == "rename":
+            with app_server(path) as call:
+                call("thread/name/set", {"threadId": args.thread_id, "name": args.name})
+            print(args.thread_id)
+            return 0
         result = query(args.thread_id, path, status_only=args.action == "status")
         if args.action == "read" and args.head:
             result = reply_head(result)
