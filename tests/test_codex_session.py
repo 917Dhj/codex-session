@@ -252,6 +252,231 @@ def test_status_cli(capsys, monkeypatch):
     assert json.loads(capsys.readouterr().out) == {"type": "active", "activeFlags": []}
 
 
+@pytest.mark.parametrize("missing", ["--cwd", "--name", "--message"])
+def test_new_requires_options(tmp_path, monkeypatch, capsys, missing):
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    options = {"--cwd": str(tmp_path), "--name": "Build", "--message": "Start"}
+    argv = ["new"]
+    for flag, value in options.items():
+        if flag != missing:
+            argv.extend([flag, value])
+    with pytest.raises(SystemExit) as exc:
+        ding.main(argv)
+    assert exc.value.code == 2
+    assert missing in capsys.readouterr().err
+
+
+def test_new_rejects_message_and_message_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    note = tmp_path / "note.md"
+    note.write_text("Start", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--name", "Build",
+                   "--message", "Start", "--message-file", str(note)])
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["", " \t\n", "\u2003"])
+def test_new_rejects_blank_name_like_rename(tmp_path, monkeypatch, capsys, name):
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("blank name must not look up"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--name", name, "--message", "Start"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--name must contain non-whitespace text" in captured.err
+
+
+@pytest.mark.parametrize("invalid", ["missing-dir", "file", "empty-cwd",
+                                   "blank-message", "empty-message", "blank-stdin", "empty-stdin",
+                                   "blank-file", "empty-file", "missing-file"])
+def test_new_validates_before_socket_lookup(tmp_path, monkeypatch, capsys, invalid):
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must validate before socket lookup"))
+    monkeypatch.chdir(tmp_path)
+    cwd, message_option = str(tmp_path), ["--message", "Start"]
+    if invalid == "missing-dir":
+        cwd = str(tmp_path / "missing")
+    elif invalid == "file":
+        cwd = str(tmp_path / "file")
+        Path(cwd).touch()
+    elif invalid == "empty-cwd":
+        cwd = ""
+    else:
+        text = " \t\r\n" if invalid.startswith("blank") else ""
+        if invalid.endswith("stdin"):
+            monkeypatch.setattr(ding.sys, "stdin", io.StringIO(text))
+            message_option = ["--message", "-"]
+        elif invalid.endswith("file"):
+            note = tmp_path / "note.md"
+            if invalid != "missing-file":
+                note.write_text(text, encoding="utf-8")
+            message_option = ["--message-file", str(note)]
+        else:
+            message_option = ["--message", text]
+    assert ding.main(["new", "--cwd", cwd, "--name", "Build", *message_option]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "new validation" in captured.err
+    assert ("--cwd" if invalid in {"missing-dir", "file", "empty-cwd"} else
+            "note.md" if invalid == "missing-file" else "--message") in captured.err
+
+
+@pytest.mark.parametrize("source, status, explicit_socket", [
+    ("argument", "inProgress", True), ("stdin", "completed", False), ("file", "inProgress", False),
+])
+def test_new_protocol_and_exact_text(tmp_path, monkeypatch, capsys, source, status, explicit_socket):
+    cwd = tmp_path / "project space" / "nested"
+    cwd.mkdir(parents=True)
+    (tmp_path / "work").symlink_to(cwd, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    message = '  Review "quoted"; $(not-shell)\r\n世界\n'
+    name = "  检查\n配置  "
+    thread_id = "00000000-0000-4000-8000-0000000000ab"
+    requests, opened, closed = [], [], []
+
+    def call(method, params):
+        requests.append((method, params))
+        return {"thread/start": {"thread": {"id": "{" + thread_id.upper() + "}"}},
+                "thread/name/set": {}, "turn/start": {"turn": {"id": "turn-1", "status": status}}}[method]
+
+    @contextmanager
+    def server(path):
+        opened.append(path)
+        try:
+            yield call
+        finally:
+            closed.append(path)
+
+    def discover(directory):
+        assert not explicit_socket
+        assert directory == Path(f"/tmp/codex-daemon-{ding.os.getuid()}")
+        return "/test.sock"
+
+    monkeypatch.setattr(ding, "app_server", server)
+    monkeypatch.setattr(ding, "discover_socket", discover)
+    monkeypatch.setattr(ding, "resolve_target", lambda *a: pytest.fail("new has no target"))
+    monkeypatch.setattr(ding, "deliver_message", lambda *a: pytest.fail("first message must not queue"))
+    monkeypatch.setattr(ding, "send_task", lambda *a: pytest.fail("first message must not use send"))
+    message_option = ["--message", message]
+    if source == "stdin":
+        monkeypatch.setattr(ding.sys, "stdin", io.StringIO(message))
+        message_option = ["--message", "-"]
+    elif source == "file":
+        (tmp_path / "note.md").write_bytes(message.encode("utf-8"))
+        message_option = ["--message-file", "note.md"]
+    options = ["--socket", "/test.sock"] if explicit_socket else []
+    assert ding.main(["new", "--cwd", "work", "--name", name, *message_option, *options]) == 0
+    assert requests == [
+        ("thread/start", {"cwd": str(cwd), "ephemeral": False}),
+        ("thread/name/set", {"threadId": thread_id, "name": name}),
+        ("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": message}]}),
+    ]
+    assert opened == closed == ["/test.sock"]
+    captured = capsys.readouterr()
+    assert captured.out == thread_id + "\n"
+    assert captured.err == ""
+    assert not (tmp_path / "state/ding").exists()
+
+
+@pytest.mark.parametrize("point", ["socket lookup", "connection"])
+@pytest.mark.parametrize("error", [OSError("unavailable"), KeyboardInterrupt()])
+def test_new_connection_failure_never_creates(tmp_path, monkeypatch, capsys, point, error):
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(ding, "socket_path", fail if point == "socket lookup" else lambda *a: "/test.sock")
+    monkeypatch.setattr(ding, "app_server", fail if point == "connection" else
+                        lambda *a: pytest.fail("socket lookup failed"))
+    assert ding.main(["new", "--cwd", str(tmp_path), "--name", "Build", "--message", "Start"]) == (
+        130 if isinstance(error, KeyboardInterrupt) else 1)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "new connection" in captured.err
+    assert "creation is unconfirmed" not in captured.err
+    assert THREAD_ID not in captured.err
+
+
+@pytest.mark.parametrize("stage", ["thread/start", "thread/name/set", "turn/start"])
+@pytest.mark.parametrize("error", [ding.AppServerError("request rejected"), TimeoutError("response lost"),
+                                  ding.AppServerUnavailable("connection closed"), KeyboardInterrupt()])
+def test_new_failure_preserves_session_without_retry(tmp_path, monkeypatch, capsys, stage, error):
+    requests, connections = [], []
+    stages = ["thread/start", "thread/name/set", "turn/start"]
+
+    def call(method, params):
+        requests.append(method)
+        if method == stage:
+            raise error
+        return {"thread": {"id": THREAD_ID}}
+
+    def server(path):
+        connections.append(path)
+        return server_calls(call)
+
+    monkeypatch.setattr(ding, "app_server", server)
+    assert ding.main(["new", "--cwd", str(tmp_path), "--name", "Build", "--message", "Start",
+                      "--socket", "/test.sock"]) == (130 if isinstance(error, KeyboardInterrupt) else 1)
+    assert requests == stages[:stages.index(stage) + 1]
+    assert connections == ["/test.sock"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"new {stage}" in captured.err
+    assert (str(error) or type(error).__name__) in captured.err
+    assert "inspect Desktop or ding board before retrying" in captured.err
+    if stage == "thread/start":
+        assert "session creation is unconfirmed" in captured.err
+        assert THREAD_ID not in captured.err
+    else:
+        assert f"session {THREAD_ID}" in captured.err
+
+
+@pytest.mark.parametrize("reply", [{}, {"thread": None}, {"thread": []}, {"thread": {}},
+                                   {"thread": {"id": None}}, {"thread": {"id": 7}},
+                                   {"thread": {"id": "invalid"}}])
+def test_new_rejects_invalid_thread_before_naming(tmp_path, monkeypatch, capsys, reply):
+    requests = []
+
+    def call(method, params):
+        requests.append(method)
+        return reply
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["new", "--cwd", str(tmp_path), "--name", "Build", "--message", "Start",
+                      "--socket", "/test.sock"]) == 1
+    assert requests == ["thread/start"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "new thread/start: Malformed App Server thread ID" in captured.err
+    assert "session creation is unconfirmed" in captured.err
+
+
+@pytest.mark.parametrize("turn", [None, [], {}, {"id": None, "status": "inProgress"},
+                                  {"id": "", "status": "inProgress"}, {"id": 7, "status": "inProgress"},
+                                  {"id": "turn-1"}, {"id": "turn-1", "status": "failed"},
+                                  {"id": "turn-1", "status": "interrupted"},
+                                  {"id": "turn-1", "status": "future-state"},
+                                  {"id": "turn-1", "status": {}}])
+def test_new_rejects_unaccepted_turn_and_keeps_id(tmp_path, monkeypatch, capsys, turn):
+    requests = []
+
+    def call(method, params):
+        requests.append(method)
+        return {"thread/start": {"thread": {"id": THREAD_ID}},
+                "thread/name/set": {}, "turn/start": {"turn": turn}}[method]
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["new", "--cwd", str(tmp_path), "--name", "Build", "--message", "Start",
+                      "--socket", "/test.sock"]) == 1
+    assert requests == ["thread/start", "thread/name/set", "turn/start"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "new turn/start: App Server did not return an accepted turn" in captured.err
+    assert f"session {THREAD_ID}" in captured.err
+    assert "inspect Desktop or ding board before retrying" in captured.err
+
+
 def test_send_persists_intent_before_delivery(monkeypatch, tmp_path):
     calls = []
     message = 'text "quoted"; $(not-shell)\nnext'

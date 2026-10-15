@@ -1,11 +1,12 @@
 # 🛎️ ding
 
-`ding` is the bell in the kitchen. It lets one agent session message another, and it wakes a session when the long job it started has finished.
+`ding` is the bell in the kitchen. It creates Codex sessions, lets one agent session message another, and wakes a session when the long job it started has finished.
 
 It talks to Codex sessions through the Codex App Server. Claude Code sessions can use it to message Codex sessions, but `ding` cannot wake a Claude Code session.
 
 - [Before you start](#before-you-start)
 - [A quick tour](#a-quick-tour)
+- [Create a session: `new`](#create-a-session-new)
 - [Choosing a session](#choosing-a-session)
 - [See what everyone is doing: `board`](#see-what-everyone-is-doing-board)
 - [Read a session: `read` and `status`](#read-a-session-read-and-status)
@@ -44,11 +45,34 @@ export PATH="$HOME/.venvs/dkitchen/bin:$PATH"
 ## A quick tour
 
 ```bash
+ding new --cwd /work/repo --name 'Evaluation runner' --message 'Review the evaluation config.'
 ding board                                           # sessions in this repo, their tickets and jobs
 ding read --head '#42'                               # first paragraph of the latest reply on ticket #42
 ding send '#42' --from orchestrator --message 'GPU 5 is free now; go ahead with stage 2.'
 ding launch eval-42 -- python evaluate.py            # run in tmux; wake me when it exits
 ```
+
+## Create a session: `new`
+
+```bash
+session_id=$(ding new --cwd /work/repo --name 'Evaluation runner' --message 'Review the evaluation config.')
+printf '%s\n' 'Review the evaluation config.' | ding new --cwd /work/repo --name 'Evaluation runner' --message -
+ding new --cwd /work/repo --name 'Evaluation runner' --message-file brief.md
+```
+
+`new` creates a saved, interactive session through the existing Codex Desktop SSH App Server. Run it on the same host and under the same user as that App Server. The session appears in Desktop and can be continued there.
+
+`--cwd`, `--name`, and one of `--message` or `--message-file` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin, and `--message-file PATH` reads it from a UTF-8 file. `--socket PATH` selects an existing App Server socket.
+
+After the App Server accepts the first turn, `new` prints only the session UUID to stdout and exits with code 0. It does not wait for the reply. Use that UUID to continue or inspect the session:
+
+```bash
+ding status "$session_id"
+ding read "$session_id"
+ding send "$session_id" --message 'Also check the dataset paths.'
+```
+
+On failure, `new` exits with a nonzero code and prints the failed stage to stderr, along with the UUID if creation was confirmed. A lost or malformed creation reply can leave a session whose UUID is unknown. Inspect Desktop or `ding board` before retrying. If naming or the first turn fails, the created session remains available. `ding` never retries these requests or deletes the session.
 
 ## Choosing a session
 
