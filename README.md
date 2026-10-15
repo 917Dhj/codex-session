@@ -88,7 +88,7 @@ A research repo has more resources than any single agent sees: GPUs on several s
 `ding` passes messages between agent sessions and wakes a session when its long job ends.
 
 ```bash
-ding new --cwd . --name 'Ticket 42' --message-file brief.md   # start a Codex session; prints its UUID
+ding new --cwd . --issue 42 --message-file brief.md   # start a Codex session for #42; prints its UUID
 ding board                                            # who is working on what, in this repo
 ding send '#42' --from orchestrator --message-file note.md
 ding launch train -- python train.py                  # run in tmux, wake me when it exits

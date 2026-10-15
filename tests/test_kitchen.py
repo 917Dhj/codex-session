@@ -70,6 +70,28 @@ def test_bad_config_is_refused_with_its_key(tmp_path, text, error):
         settings(tmp_path, text)
 
 
+def test_session_name_template_defaults_and_fills_titles_verbatim(tmp_path):
+    assert settings(tmp_path).sessions.session_name(issue=57, title="Fix {x} 100%", repo="o/r") == \
+        "【#57】Fix {x} 100%"
+    loaded = settings(tmp_path, '[sessions]\nname = "{repo}#{issue:04d} {title}"')
+    assert loaded.sessions.session_name(issue=7, title="Plot", repo="o/r") == "o/r#0007 Plot"
+
+
+@pytest.mark.parametrize("template, error", [
+    ("", "nonempty string"),
+    ("{ticket} {title}", r"uses \{ticket\}; use only \{issue\}, \{title\}, \{repo\}"),
+    ("{} {title}", r"uses \{\}"),
+    ("{title.upper}", r"uses \{title.upper\}"),
+    ("{title!r}", "without a conversion"),
+    ("{title", "not a valid template"),
+    ("{title:d}", "not a valid template"),
+    ("{issue:{title}}", "nested field"),
+])
+def test_bad_session_name_template_is_refused_on_load(tmp_path, template, error):
+    with pytest.raises(ValueError, match=error):
+        settings(tmp_path, f"[sessions]\nname = {json.dumps(template)}")
+
+
 def test_board_status_falls_back_to_the_config_fields(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / config.FILE).write_text(CHINESE, encoding="utf-8")

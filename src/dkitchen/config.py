@@ -27,12 +27,16 @@ Every key is optional. The defaults match the English templates in kitchen/:
     [log]
     issue = 1                            # the pinned orchestrator log ticket
     pending = "Waiting for the user"
+
+    [sessions]
+    name = "【#{issue}】{title}"          # `ding new --issue N` and `ding rename` without --name; also {repo}
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, fields as dataclass_fields, replace
 from pathlib import Path
 import re
+import string
 import subprocess
 import sys
 
@@ -82,6 +86,38 @@ class Log:
 
 
 @dataclass(frozen=True)
+class Sessions:
+    name: str = "【#{issue}】{title}"
+
+    def session_name(self, *, issue: int, title: str, repo: str) -> str:
+        return self.name.format(issue=issue, title=title, repo=repo)
+
+
+SESSION_FIELDS = ("issue", "title", "repo")
+
+
+def session_template(value: object) -> str:
+    """A session name template using only SESSION_FIELDS, checked when the config is read."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{FILE}: [sessions] name must be a nonempty string")
+    allowed = ", ".join(f"{{{field}}}" for field in SESSION_FIELDS)
+    try:
+        for _, field, spec, conversion in string.Formatter().parse(value):
+            if field is None:
+                continue
+            if field not in SESSION_FIELDS:
+                raise ValueError(f"{FILE}: [sessions] name uses {{{field}}}; use only {allowed}")
+            if conversion or "{" in spec:
+                raise ValueError(f"{FILE}: [sessions] name: write {{{field}}} without a conversion or nested field")
+        Sessions(value).session_name(issue=1, title="title", repo="owner/name")
+    except ValueError as exc:
+        if str(exc).startswith(FILE):
+            raise
+        raise ValueError(f"{FILE}: [sessions] name is not a valid template: {exc}") from exc
+    return value
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path
     repo: str | None = None
@@ -89,6 +125,7 @@ class Config:
     status: Status = Status()
     labels: Labels = Labels()
     log: Log = Log()
+    sessions: Sessions = Sessions()
 
     def repository(self) -> str:
         """The configured repository, or the one gh sees from the repository root."""
@@ -116,6 +153,8 @@ def section(cls, values: object, name: str):
             if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() for item in value):
                 raise ValueError(f"{FILE}: [{name}] fields must be a nonempty list of field names")
             value = tuple(item.strip() for item in value)
+        elif key == "name" and cls is Sessions:
+            value = session_template(value)
         elif key == "issue":
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{FILE}: [{name}] issue must be a positive issue number")
@@ -141,7 +180,7 @@ def load(cwd: Path | None = None) -> Config:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
-    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log}
+    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

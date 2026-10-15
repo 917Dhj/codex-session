@@ -322,6 +322,83 @@ def test_new_validates_before_socket_lookup(tmp_path, monkeypatch, capsys, inval
             "note.md" if invalid == "missing-file" else "--message") in captured.err
 
 
+def ticket_repo(tmp_path, template=None):
+    text = 'repo = "example/project"\n'
+    if template is not None:
+        text += f"[sessions]\nname = {json.dumps(template)}\n"
+    (tmp_path / ".dkitchen.toml").write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_new_issue_names_from_template_and_asks_for_owner_line(tmp_path, monkeypatch, capsys):
+    cwd = ticket_repo(tmp_path)
+    requests, fetched = [], []
+
+    def gh(arguments):
+        fetched.append(arguments)
+        return {"title": "Fix {braces} 100%"}
+
+    def call(method, params):
+        requests.append((method, params))
+        return {"thread/start": {"thread": {"id": THREAD_ID}}, "thread/name/set": {},
+                "turn/start": {"turn": {"id": "turn-1", "status": "inProgress"}}}[method]
+
+    monkeypatch.setattr(ding, "gh_json", gh)
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--message", "Brief",
+                      "--socket", "/test.sock"]) == 0
+    assert fetched == [["api", "repos/example/project/issues/57"]]
+    assert requests[1] == ("thread/name/set", {"threadId": THREAD_ID, "name": "【#57】Fix {braces} 100%"})
+    assert requests[2][1]["input"] == [{"type": "text", "text":
+        f"You own ticket example/project#57. Before anything else, post a comment on it "
+        f"with the line `Codex owner: {THREAD_ID}`.\n\nBrief"}]
+    assert capsys.readouterr().out == THREAD_ID + "\n"
+
+
+def test_new_takes_name_or_issue_not_both(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ding, "gh_json", lambda *a: pytest.fail("must not look up the ticket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--name", "Build", "--issue", "57", "--message", "Start"])
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("issue", ["0", "-3"])
+def test_new_issue_must_be_positive(tmp_path, monkeypatch, capsys, issue):
+    monkeypatch.setattr(ding, "gh_json", lambda *a: pytest.fail("must not look up the ticket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--issue", issue, "--message", "Start"])
+    assert exc.value.code == 2
+    assert "positive issue number" in capsys.readouterr().err
+
+
+def test_new_issue_with_blank_generated_name_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    cwd = ticket_repo(tmp_path, "{title}")
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"title": " \t"})
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not look up a socket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--message", "Start"])
+    assert exc.value.code == 2
+    assert "non-whitespace text" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", ["gh", "malformed", "template"])
+def test_new_issue_lookup_failure_creates_nothing(tmp_path, monkeypatch, capsys, failure):
+    cwd = ticket_repo(tmp_path, "{ticket}" if failure == "template" else None)
+
+    def gh(arguments):
+        if failure == "gh":
+            raise ValueError("gh failed: not found")
+        return {"number": 57}
+
+    monkeypatch.setattr(ding, "gh_json", gh)
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    assert ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--message", "Start"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert {"gh": "not found", "malformed": "Malformed gh issue", "template": "{ticket}"}[failure] in captured.err
+
+
 @pytest.mark.parametrize("source, status, explicit_socket", [
     ("argument", "inProgress", True), ("stdin", "completed", False), ("file", "inProgress", False),
 ])
@@ -3057,7 +3134,7 @@ def test_pane_representative_skips_empty_ancestor_command_and_breaks_ties_by_pid
 
 
 @pytest.mark.parametrize("arguments", [
-    [], [THREAD_ID], ["--name", "New name"], [THREAD_ID, "--name"],
+    [], ["--name", "New name"], [THREAD_ID, "--name"],
     [THREAD_ID, "--issue", "42", "--name", "New name"],
 ])
 def test_rename_requires_one_target_and_name(monkeypatch, capsys, arguments):
@@ -3106,6 +3183,58 @@ def test_rename_delegates_target_resolution(monkeypatch, capsys, target, issue):
     captured = capsys.readouterr()
     assert captured.out == THREAD_ID + "\n"
     assert captured.err == ""
+
+
+@pytest.mark.parametrize("target,issue,expected", [
+    (None, 42, "example/project#42"), ("#42", None, "example/project#42"),
+    ("other/repo#42", None, "other/repo#42"),
+    ("https://github.com/other/repo/issues/42", None, "other/repo#42"),
+])
+def test_rename_without_name_uses_the_template_for_ticket_targets(tmp_path, monkeypatch, capsys,
+                                                                 target, issue, expected):
+    monkeypatch.chdir(tmp_path)
+    resolved, calls, fetched = [], [], []
+    repo = expected.split("#")[0]
+
+    def gh(arguments):
+        fetched.append(arguments)
+        return {"title": "Ablation {seed}"}
+
+    def resolve(value, number, path):
+        resolved.append((value, number))
+        return THREAD_ID
+
+    monkeypatch.setattr(ding, "github_repository", lambda: "example/project")
+    monkeypatch.setattr(ding, "gh_json", gh)
+    monkeypatch.setattr(ding, "resolve_target", resolve)
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *a: calls.append(a) or {}))
+    arguments = [target] if target is not None else ["--issue", str(issue)]
+    assert ding.main(["rename", *arguments, "--socket", "/test.sock"]) == 0
+    assert fetched == [["api", f"repos/{repo}/issues/42"]]
+    assert resolved == [(expected, None)]
+    assert calls == [("thread/name/set", {"threadId": THREAD_ID, "name": "【#42】Ablation {seed}"})]
+    assert capsys.readouterr().out == THREAD_ID + "\n"
+
+
+@pytest.mark.parametrize("target", [THREAD_ID, "Build"])
+def test_rename_without_name_needs_a_ticket_target(monkeypatch, capsys, target):
+    for function in ("resolve_target", "app_server", "github_repository", "gh_json"):
+        monkeypatch.setattr(ding, function, lambda *a: pytest.fail("must not look up"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["rename", target])
+    assert exc.value.code == 2
+    assert "rename needs --name unless the target is a ticket" in capsys.readouterr().err
+
+
+def test_rename_with_blank_generated_name_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    ticket_repo(tmp_path, "{title}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ding, "gh_json", lambda arguments: {"title": "\u2003"})
+    monkeypatch.setattr(ding, "resolve_target", lambda *a: pytest.fail("must not resolve"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["rename", "example/project#42"])
+    assert exc.value.code == 2
+    assert "non-whitespace text" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("reply,status,error", [
