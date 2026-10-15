@@ -6,7 +6,8 @@ Wakes on:
 - status labels being added, and newly opened PRs;
 - stale tickets: no status label, last comment an executor "in progress" older than --stale-hours,
   no running `ding run` for the ticket, and no live tmux job whose session name holds issue<N>.
-On tickets labelled awaiting-user, executor comments wake only for blocked, done, and waiting on design.
+On tickets labelled awaiting-user, executor comments wake only for blocked, done, and waiting on design,
+or when their "waiting on" names the orchestrator, designer, or verifier.
 Verifier comments never wake on their own, since the verifier also messages the orchestrator;
 they are listed in the next batch for reference.
 The state file keeps the time already reported, so rerunning the same command loses nothing.
@@ -87,10 +88,11 @@ def state_and_waiting(body: str, config: Config) -> tuple[str, str]:
 def executor_wakes(body: str, waiting_user: bool, config: Config) -> bool:
     state, waiting = state_and_waiting(body, config)
     status, stations = config.status, config.stations
+    names = lambda *who: not waiting.startswith(status.none) and any(name in waiting for name in who)
+    kitchen = (stations.orchestrator, stations.designer, stations.verifier)
     if waiting_user:
-        return state in {status.blocked, status.done, status.waiting_on_design}
-    names = (stations.orchestrator, stations.designer, stations.verifier, stations.user)
-    return state != status.in_progress or (not waiting.startswith(status.none) and any(name in waiting for name in names))
+        return state in {status.blocked, status.done, status.waiting_on_design} or names(*kitchen)
+    return state != status.in_progress or names(*kitchen, stations.user)
 
 
 def summary(body: str, config: Config) -> str:

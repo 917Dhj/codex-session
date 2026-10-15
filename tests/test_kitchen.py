@@ -206,6 +206,8 @@ def executor(block):
     ("Status: in progress\nWaiting on: Designer, for the prompt\nKey numbers: 1\nNext: wait", False, True),
     ("Status: done\nWaiting on: none\nKey numbers: 1\nNext: merge", False, True),
     ("Status: waiting on user\nWaiting on: User\nKey numbers: 1\nNext: wait", True, False),
+    ("Status: waiting on user\nWaiting on: User to approve; Orchestrator to merge PR #3\nKey numbers: 1\nNext: merge",
+     True, True),
     ("Status: blocked\nWaiting on: none\nKey numbers: 1\nNext: fix", True, True),
 ])
 def test_executor_comments_wake_by_status_and_waiting_on(tmp_path, block, waiting_user, wakes):
@@ -220,6 +222,14 @@ def test_chinese_status_words_and_full_width_colons(tmp_path):
     assert watch.executor_wakes(body, False, loaded)
     assert watch.summary(body, loaded) == "状态：进行中; 在等：总设计，要提示词"
     assert not watch.executor_wakes(executor("状态: 进行中\n在等: 无\n关键数字: 1\n下一步: 跑"), False, loaded)
+
+
+def test_an_awaiting_user_ticket_wakes_when_the_comment_also_waits_on_the_kitchen(tmp_path):
+    # #209 issuecomment-6179869282: still waiting on the user, but also asking the orchestrator to merge
+    loaded = settings(tmp_path, CHINESE)
+    body = executor("状态: 等用户\n在等: 用户批准说话人 1,329 次单次作答；总编排重审合入 PR #314\n关键数字: 0\n下一步: 合入")
+    assert watch.executor_wakes(body, True, loaded)
+    assert not watch.executor_wakes(executor("状态: 等用户\n在等: 用户批准\n关键数字: 0\n下一步: 等"), True, loaded)
 
 
 @pytest.fixture
