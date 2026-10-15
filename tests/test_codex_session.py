@@ -252,6 +252,59 @@ def test_status_cli(capsys, monkeypatch):
     assert json.loads(capsys.readouterr().out) == {"type": "active", "activeFlags": []}
 
 
+@pytest.mark.parametrize("name, expected", [("【#57】消融实验", "【#57】消融实验"), (None, None), ("", None)])
+def test_info_protocol_keeps_unnamed_sessions_unnamed(name, expected):
+    status = {"type": "idle", "activeFlags": []}
+    ws = Connection([{"result": {}}, {"result": {"thread": {
+        "id": THREAD_ID.upper(), "name": name, "cwd": "/work/worktree-57", "status": status, "turns": []}}}])
+    assert ding.read_info(ding.initialize(ws), THREAD_ID) == {
+        "id": THREAD_ID, "name": expected, "cwd": "/work/worktree-57", "status": status}
+    assert [r["method"] for r in ws.requests] == ["initialize", "initialized", "thread/read"]
+    assert ws.requests[-1]["params"] == {"threadId": THREAD_ID, "includeTurns": False}
+
+
+@pytest.mark.parametrize("thread, error", [
+    (None, "Malformed App Server thread"),
+    ({"id": "nope", "cwd": "/w", "status": {"type": "idle"}}, "thread ID"),
+    ({"id": THREAD_ID, "name": 3, "cwd": "/w", "status": {"type": "idle"}}, "thread metadata"),
+    ({"id": THREAD_ID, "cwd": "relative", "status": {"type": "idle"}}, "thread metadata"),
+    ({"id": THREAD_ID, "cwd": "/w", "status": {}}, "thread metadata"),
+    ({"id": OTHER_ID, "cwd": "/w", "status": {"type": "idle"}}, "different thread"),
+])
+def test_invalid_info(thread, error):
+    ws = Connection([{"result": {}}, {"result": {"thread": thread}}])
+    with pytest.raises(ValueError, match=error):
+        ding.read_info(ding.initialize(ws), THREAD_ID)
+
+
+@pytest.mark.parametrize("target", [["#42"], ["--issue", "42"], ["Build"]])
+def test_info_cli_resolves_targets_and_prints_json(issue_data, monkeypatch, capsys, target):
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/list":
+            return {"data": [thread()]}
+        return {"thread": thread(name="【#42】构建", cwd="/work/repo")}
+
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["info", *target, "--socket", "/test.sock"]) == 0
+    assert calls[-1] == ("thread/read", {"threadId": THREAD_ID, "includeTurns": False})
+    assert all(method in {"thread/list", "thread/read"} for method, _ in calls)
+    captured = capsys.readouterr()
+    assert captured.out == '{"id": "%s", "name": "【#42】构建", "cwd": "/work/repo", ' \
+                           '"status": {"type": "idle"}}\n' % THREAD_ID
+    assert captured.err == ""
+
+
+def test_info_cli_reports_failures(monkeypatch, capsys):
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *a: {"thread": None}))
+    assert ding.main(["info", THREAD_ID, "--socket", "/test.sock"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Malformed App Server thread" in captured.err
+
+
 @pytest.mark.parametrize("missing", ["--cwd", "--name", "--message"])
 def test_new_requires_options(tmp_path, monkeypatch, capsys, missing):
     monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))

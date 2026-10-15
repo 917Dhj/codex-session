@@ -10,7 +10,7 @@ It talks to Codex sessions through the Codex App Server. Claude Code sessions ca
 - [Choosing a session](#choosing-a-session)
 - [Rename a session: `rename`](#rename-a-session-rename)
 - [See what everyone is doing: `board`](#see-what-everyone-is-doing-board)
-- [Read a session: `read` and `status`](#read-a-session-read-and-status)
+- [Read a session: `read`, `status`, and `info`](#read-a-session-read-status-and-info)
 - [Send a message: `send`](#send-a-message-send)
 - [Run a long job: `launch`](#run-a-long-job-launch)
 - [Wrap a command yourself: `run`](#wrap-a-command-yourself-run)
@@ -86,7 +86,7 @@ On failure, `new` exits with a nonzero code and prints the failed stage to stder
 
 ## Choosing a session
 
-Every command that talks to one session (`read`, `status`, `rename`, `send`, `run`) takes a target in any of these forms:
+Every command that talks to one session (`read`, `status`, `info`, `rename`, `send`, `run`) takes a target in any of these forms:
 
 | Target | Example |
 | --- | --- |
@@ -195,13 +195,22 @@ Editors, language servers, Codex, Claude, tmux itself, and SSH tunnels are ignor
 
 This is a heuristic. Outside tmux it can miss GPU jobs that use little CPU, and it never looks at GPUs or other machines.
 
-## Read a session: `read` and `status`
+## Read a session: `read`, `status`, and `info`
 
 ```bash
 ding read '#42'            # the latest final reply, in full
 ding read --head '#42'     # only its first paragraph
 ding status '#42'          # the App Server's status for the session, as JSON
+ding info '#42'            # the session's ID, name, working directory, and status, as JSON
 ```
+
+`info` prints one line of JSON, for example after `new` or `rename` to check the name, or to see which session a UUID or ticket points to:
+
+```json
+{"id": "019a2b3c-...", "name": "【#42】Ablation", "cwd": "/work/worktree-42", "status": {"type": "idle", "activeFlags": []}}
+```
+
+`name` is `null` for a session that has never been named. `info` only reads: it starts no model turn and writes nothing to GitHub.
 
 ## Send a message: `send`
 
