@@ -322,6 +322,85 @@ def test_new_validates_before_socket_lookup(tmp_path, monkeypatch, capsys, inval
             "note.md" if invalid == "missing-file" else "--message") in captured.err
 
 
+def ticket_repo(tmp_path, template=None):
+    text = 'repo = "example/project"\n'
+    if template is not None:
+        text += f"[sessions]\nname = {json.dumps(template)}\n"
+    (tmp_path / ".dkitchen.toml").write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.parametrize("template, expected", [
+    (None, "【#57】Ablation {seed}"), ("{repo}#{issue:04d} {name}", "example/project#0057 Ablation {seed}"),
+])
+def test_new_issue_formats_name_and_asks_for_owner_line(tmp_path, monkeypatch, capsys, template, expected):
+    cwd = ticket_repo(tmp_path, template)
+    requests = []
+
+    def call(method, params):
+        requests.append((method, params))
+        return {"thread/start": {"thread": {"id": THREAD_ID}}, "thread/name/set": {},
+                "turn/start": {"turn": {"id": "turn-1", "status": "inProgress"}}}[method]
+
+    for function in ("gh_json", "gh_records", "github_repository"):
+        monkeypatch.setattr(ding, function, lambda *a: pytest.fail("must not read GitHub"))
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    assert ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--name", "Ablation {seed}",
+                      "--message", "Brief", "--socket", "/test.sock"]) == 0
+    assert requests[1] == ("thread/name/set", {"threadId": THREAD_ID, "name": expected})
+    assert requests[2][1]["input"] == [{"type": "text", "text":
+        f"You own ticket example/project#57. Before anything else, post a comment on it "
+        f"with the line `Codex owner: {THREAD_ID}`.\n\nBrief"}]
+    assert capsys.readouterr().out == THREAD_ID + "\n"
+
+
+def test_new_issue_still_needs_a_name(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not look up a socket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(ticket_repo(tmp_path)), "--issue", "57", "--message", "Start"])
+    assert exc.value.code == 2
+    assert "--name" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("issue", ["0", "-3"])
+def test_new_issue_must_be_positive(tmp_path, monkeypatch, capsys, issue):
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not look up a socket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(tmp_path), "--issue", issue, "--name", "Build", "--message", "Start"])
+    assert exc.value.code == 2
+    assert "positive issue number" in capsys.readouterr().err
+
+
+def test_new_issue_with_blank_name_is_refused_before_the_template(tmp_path, monkeypatch, capsys):
+    cwd = ticket_repo(tmp_path, "#{issue} {name}")
+    monkeypatch.setattr(ding, "socket_path", lambda *a: pytest.fail("must not look up a socket"))
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--name", " \t", "--message", "Start"])
+    assert exc.value.code == 2
+    assert "--name must contain non-whitespace text" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", ["template", "repository"])
+def test_new_issue_config_failure_creates_nothing(tmp_path, monkeypatch, capsys, failure):
+    if failure == "template":
+        cwd = ticket_repo(tmp_path, "{title}")
+    else:
+        cwd = tmp_path
+        real_run = subprocess.run
+
+        def gh_repo_view(argv, *args, **kwargs):
+            if argv[:3] == ["gh", "repo", "view"]:
+                return subprocess.CompletedProcess(argv, 1, "", "no git remotes found")
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", gh_repo_view)
+    monkeypatch.setattr(ding, "app_server", lambda *a: pytest.fail("must not connect"))
+    assert ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--name", "Build", "--message", "Start"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert ("{title}" if failure == "template" else "no git remotes found") in captured.err
+
+
 @pytest.mark.parametrize("source, status, explicit_socket", [
     ("argument", "inProgress", True), ("stdin", "completed", False), ("file", "inProgress", False),
 ])

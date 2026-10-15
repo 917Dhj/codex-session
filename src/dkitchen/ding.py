@@ -324,6 +324,11 @@ def github_repository() -> str:
     return repo
 
 
+def ownership_note(repo: str, number: int, thread_id: str) -> str:
+    return (f"You own ticket {repo}#{number}. Before anything else, post a comment on it "
+            f"with the line `Codex owner: {thread_id}`.\n\n")
+
+
 def session_references(body: str | None, label: str = "session") -> list[str]:
     if body is None:
         return []
@@ -1182,6 +1187,8 @@ def new_task(args) -> int:
                 raise ValueError("Malformed App Server thread ID.") from exc
             stage = "thread/name/set"
             call(stage, {"threadId": thread_id, "name": args.name})
+            if args.issue is not None:
+                message = ownership_note(args.repo, args.issue, thread_id) + message
             stage = "turn/start"
             turn = call(stage, {"threadId": thread_id,
                                 "input": [{"type": "text", "text": message}]}).get("turn")
@@ -1364,7 +1371,10 @@ def main(argv=None) -> int:
     commands = parser.add_subparsers(dest="action", required=True)
     sub = commands.add_parser("new", help="Create a saved Codex session and start its first message")
     sub.add_argument("--cwd", required=True, help="Existing working directory for the session")
-    sub.add_argument("--name", required=True, help="Session title")
+    sub.add_argument("--name", required=True, help="Session title; with --issue, filled into the "
+                                                   "[sessions] name template")
+    sub.add_argument("--issue", type=int, help="Ticket this session owns: formats --name with the [sessions] "
+                                               "name template and asks the session to post its Codex owner line")
     message = sub.add_mutually_exclusive_group(required=True)
     message.add_argument("--message", help="First message text, or '-' to read stdin")
     message.add_argument("--message-file", help="UTF-8 file holding the first message")
@@ -1460,6 +1470,11 @@ def main(argv=None) -> int:
         if args.action == "new":
             if not args.name.strip():
                 parser.error("--name must contain non-whitespace text")
+            if args.issue is not None and args.cwd and Path(args.cwd).expanduser().is_dir():
+                from dkitchen import config
+                settings = config.load(Path(args.cwd).expanduser().resolve())
+                args.repo = settings.repository()
+                args.name = settings.sessions.session_name(issue=args.issue, name=args.name, repo=args.repo)
             return new_task(args)
         if args.action == "check-refs":
             from dkitchen import refs

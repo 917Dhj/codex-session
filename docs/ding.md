@@ -59,11 +59,20 @@ ding launch eval-42 -- python evaluate.py            # run in tmux; wake me when
 session_id=$(ding new --cwd /work/repo --name 'Evaluation runner' --message 'Review the evaluation config.')
 printf '%s\n' 'Review the evaluation config.' | ding new --cwd /work/repo --name 'Evaluation runner' --message -
 ding new --cwd /work/repo --name 'Evaluation runner' --message-file brief.md
+ding new --cwd /work/worktree-57 --issue 57 --name 'Ablation' --message-file brief.md   # named 【#57】Ablation
 ```
 
 `new` creates a saved, interactive session through the existing Codex Desktop SSH App Server. Run it on the same host and under the same user as that App Server. The session appears in Desktop and can be continued there.
 
 `--cwd`, `--name`, and one of `--message` or `--message-file` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin, and `--message-file PATH` reads it from a UTF-8 file. `--socket PATH` selects an existing App Server socket.
+
+`--issue N` starts the session for ticket `#N` in the repository of `--cwd`. `--name` is still required and should be a short title; `ding` fills it into the `[sessions] name` template from [.dkitchen.toml](#dkitchentoml), by default `【#{issue}】{name}`, so `--issue 57 --name 'Ablation'` names the session `【#57】Ablation`. `ding` writes nothing to GitHub. Instead, the first message opens with one paragraph asking the new session to claim the ticket:
+
+```text
+You own ticket 917Dhj/my-repo#57. Before anything else, post a comment on it with the line `Codex owner: 019a2b3c-...`.
+```
+
+Until that comment is posted, `'#57'` does not resolve to the new session; pass its UUID instead.
 
 After the App Server accepts the first turn, `new` prints only the session UUID to stdout and exits with code 0. It does not wait for the reply. Use that UUID to continue or inspect the session:
 
@@ -334,7 +343,12 @@ awaiting_user = "status:awaiting-user"
 [log]
 issue = 1                            # the pinned orchestrator log ticket
 pending = "Waiting for the user"
+
+[sessions]
+name = "【#{issue}】{name}"           # session name for `ding new --issue N --name NAME`
 ```
+
+`[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.
 
 `ding board --status` also uses `[status] fields`, after `--status-fields` and `DING_STATUS_FIELDS`. A misspelled key is an error, so a typo cannot silently fall back to a default.
 

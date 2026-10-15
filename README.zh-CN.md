@@ -88,7 +88,7 @@ dkitchen 就这样组织你的 agent。你是主厨。
 `ding` 在 agent 会话之间传话，并在长任务结束时唤醒对应的会话。
 
 ```bash
-ding new --cwd . --name 'Ticket 42' --message-file brief.md   # 新建 Codex 会话，打印它的 UUID
+ding new --cwd . --issue 42 --name '消融实验' --message-file brief.md   # 为 #42 新建 Codex 会话，打印它的 UUID
 ding board                                            # 这个仓库里谁在做什么
 ding send '#42' --from orchestrator --message-file note.md
 ding launch train -- python train.py                  # 在 tmux 里跑，退出时唤醒我
