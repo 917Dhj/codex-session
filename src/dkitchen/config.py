@@ -29,7 +29,7 @@ Every key is optional. The defaults match the English templates in kitchen/:
     pending = "Waiting for the user"
 
     [sessions]
-    name = "【#{issue}】{title}"          # `ding new --issue N` and `ding rename` without --name; also {repo}
+    name = "【#{issue}】{name}"           # `ding new --issue N --name NAME`; also {repo}
 """
 from __future__ import annotations
 
@@ -87,13 +87,13 @@ class Log:
 
 @dataclass(frozen=True)
 class Sessions:
-    name: str = "【#{issue}】{title}"
+    name: str = "【#{issue}】{name}"
 
-    def session_name(self, *, issue: int, title: str, repo: str) -> str:
-        return self.name.format(issue=issue, title=title, repo=repo)
+    def session_name(self, *, issue: int, name: str, repo: str) -> str:
+        return self.name.format(issue=issue, name=name, repo=repo)
 
 
-SESSION_FIELDS = ("issue", "title", "repo")
+SESSION_FIELDS = ("issue", "name", "repo")
 
 
 def session_template(value: object) -> str:
@@ -109,7 +109,7 @@ def session_template(value: object) -> str:
                 raise ValueError(f"{FILE}: [sessions] name uses {{{field}}}; use only {allowed}")
             if conversion or "{" in spec:
                 raise ValueError(f"{FILE}: [sessions] name: write {{{field}}} without a conversion or nested field")
-        Sessions(value).session_name(issue=1, title="title", repo="owner/name")
+        Sessions(value).session_name(issue=1, name="name", repo="owner/name")
     except ValueError as exc:
         if str(exc).startswith(FILE):
             raise

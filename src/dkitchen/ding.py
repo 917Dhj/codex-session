@@ -324,15 +324,6 @@ def github_repository() -> str:
     return repo
 
 
-def ticket_session_name(repo: str, number: int, settings) -> str:
-    """The session name the [sessions] template gives ticket REPO#NUMBER, from its current title."""
-    issue = gh_json(["api", f"repos/{repo}/issues/{number}"])
-    title = issue.get("title") if isinstance(issue, dict) else None
-    if not isinstance(title, str):
-        raise ValueError("Malformed gh issue.")
-    return settings.sessions.session_name(issue=number, title=title, repo=repo)
-
-
 def ownership_note(repo: str, number: int, thread_id: str) -> str:
     return (f"You own ticket {repo}#{number}. Before anything else, post a comment on it "
             f"with the line `Codex owner: {thread_id}`.\n\n")
@@ -1380,10 +1371,10 @@ def main(argv=None) -> int:
     commands = parser.add_subparsers(dest="action", required=True)
     sub = commands.add_parser("new", help="Create a saved Codex session and start its first message")
     sub.add_argument("--cwd", required=True, help="Existing working directory for the session")
-    title = sub.add_mutually_exclusive_group(required=True)
-    title.add_argument("--name", help="Session title")
-    title.add_argument("--issue", type=int, help="Ticket this session owns: names the session with the "
-                                                 "[sessions] name template and asks it to post its Codex owner line")
+    sub.add_argument("--name", required=True, help="Session title; with --issue, filled into the "
+                                                   "[sessions] name template")
+    sub.add_argument("--issue", type=int, help="Ticket this session owns: formats --name with the [sessions] "
+                                               "name template and asks the session to post its Codex owner line")
     message = sub.add_mutually_exclusive_group(required=True)
     message.add_argument("--message", help="First message text, or '-' to read stdin")
     message.add_argument("--message-file", help="UTF-8 file holding the first message")
@@ -1416,8 +1407,7 @@ def main(argv=None) -> int:
         if action == "read":
             sub.add_argument("--head", action="store_true", help="Print only the first paragraph of the final reply")
         if action == "rename":
-            sub.add_argument("--name", help="New session name, preserved exactly as supplied "
-                                            "(default for a ticket target: the [sessions] name template)")
+            sub.add_argument("--name", required=True, help="New session name, preserved exactly as supplied")
         if action in {"send", "run", "launch"}:
             message = sub.add_mutually_exclusive_group(required=action != "launch")
             message.add_argument("--message", help="Message text, or '-' to read stdin")
@@ -1470,7 +1460,7 @@ def main(argv=None) -> int:
         command = argv[separator + 1:]
         argv = argv[:separator]
     args = parser.parse_args(argv)
-    if args.action == "rename" and args.name is not None and not args.name.strip():
+    if args.action == "rename" and not args.name.strip():
         parser.error("--name must contain non-whitespace text")
     if getattr(args, "issue", None) is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
@@ -1478,16 +1468,13 @@ def main(argv=None) -> int:
         parser.error(f"{args.action} requires a task command after --")
     try:
         if args.action == "new":
+            if not args.name.strip():
+                parser.error("--name must contain non-whitespace text")
             if args.issue is not None and args.cwd and Path(args.cwd).expanduser().is_dir():
                 from dkitchen import config
                 settings = config.load(Path(args.cwd).expanduser().resolve())
                 args.repo = settings.repository()
-                args.name = ticket_session_name(args.repo, args.issue, settings)
-                if not args.name.strip():
-                    parser.error(f"the [sessions] name template gave #{args.issue} a name without "
-                                 "non-whitespace text")
-            elif args.name is not None and not args.name.strip():
-                parser.error("--name must contain non-whitespace text")
+                args.name = settings.sessions.session_name(issue=args.issue, name=args.name, repo=args.repo)
             return new_task(args)
         if args.action == "check-refs":
             from dkitchen import refs
@@ -1520,16 +1507,6 @@ def main(argv=None) -> int:
             args.message = message_text(args.message, args.message_file, args.sender)
         if args.action == "send":
             return send_task(args)
-        if args.action == "rename" and args.name is None:
-            target = normalize_target(args.thread_id, args.issue)
-            ticket = re.fullmatch(rf"({ISSUE_REPOSITORY})#([1-9][0-9]*)", target or "")
-            if not ticket:
-                parser.error("rename needs --name unless the target is a ticket")
-            from dkitchen import config
-            args.name = ticket_session_name(ticket[1], int(ticket[2]), config.load())
-            if not args.name.strip():
-                parser.error(f"the [sessions] name template gave {target} a name without non-whitespace text")
-            args.thread_id, args.issue = target, None
         args.thread_id = resolve_target(args.thread_id, args.issue, args.socket)
         if args.action == "run":
             return run_task(args, command)

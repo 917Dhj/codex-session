@@ -59,14 +59,14 @@ ding launch eval-42 -- python evaluate.py            # run in tmux; wake me when
 session_id=$(ding new --cwd /work/repo --name 'Evaluation runner' --message 'Review the evaluation config.')
 printf '%s\n' 'Review the evaluation config.' | ding new --cwd /work/repo --name 'Evaluation runner' --message -
 ding new --cwd /work/repo --name 'Evaluation runner' --message-file brief.md
-ding new --cwd /work/worktree-57 --issue 57 --message-file brief.md   # named from ticket #57's title
+ding new --cwd /work/worktree-57 --issue 57 --name 'Ablation' --message-file brief.md   # named 【#57】Ablation
 ```
 
 `new` creates a saved, interactive session through the existing Codex Desktop SSH App Server. Run it on the same host and under the same user as that App Server. The session appears in Desktop and can be continued there.
 
-`--cwd`, one of `--name` or `--issue`, and one of `--message` or `--message-file` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin, and `--message-file PATH` reads it from a UTF-8 file. `--socket PATH` selects an existing App Server socket.
+`--cwd`, `--name`, and one of `--message` or `--message-file` are required. The working directory must exist. `ding` resolves its path and uses that directory, including a subdirectory or a directory outside Git. The title and first message must contain non-whitespace text; their text is sent unchanged. `--message -` reads the first message from stdin, and `--message-file PATH` reads it from a UTF-8 file. `--socket PATH` selects an existing App Server socket.
 
-`--issue N` starts the session for ticket `#N` in the repository of `--cwd`. `ding` reads the ticket's title (read-only; it writes nothing to GitHub) and names the session with the `[sessions] name` template from [.dkitchen.toml](#dkitchentoml), by default `【#57】<title>`. A template that leaves the name blank is a usage error (exit code 2). The first message then opens with one paragraph asking the new session to claim the ticket:
+`--issue N` starts the session for ticket `#N` in the repository of `--cwd`. `--name` is still required and should be a short title; `ding` fills it into the `[sessions] name` template from [.dkitchen.toml](#dkitchentoml), by default `【#{issue}】{name}`, so `--issue 57 --name 'Ablation'` names the session `【#57】Ablation`. `ding` writes nothing to GitHub. Instead, the first message opens with one paragraph asking the new session to claim the ticket:
 
 ```text
 You own ticket 917Dhj/my-repo#57. Before anything else, post a comment on it with the line `Codex owner: 019a2b3c-...`.
@@ -120,10 +120,7 @@ ding rename 019a2b3c-0000-4000-8000-000000000001 --name 'Evaluation runner'
 ding rename 'Evaluation runner' --name 'Evaluation complete'
 ding rename --issue 42 --name 'Ticket 42 executor'
 ding rename https://github.com/917Dhj/my-repo/issues/42 --name 'Ticket 42 executor' --socket /path/to/app-server.sock
-ding rename '#42'                                    # rename from the [sessions] name template and #42's current title
 ```
-
-Without `--name`, the target must be a ticket (`'#42'`, `--issue 42`, `OWNER/REPO#42`, or a link). `ding` reads that ticket's current title and builds the name from the `[sessions] name` template in this directory's `.dkitchen.toml`, so a session can follow a retitled ticket. Any other target needs `--name`.
 
 The new name must contain non-whitespace text. `ding` sends the supplied name unchanged, including Unicode and leading or trailing spaces. The session keeps its UUID and history, and no model turn starts. On confirmed success, stdout contains only the session UUID followed by a newline.
 
@@ -348,10 +345,10 @@ issue = 1                            # the pinned orchestrator log ticket
 pending = "Waiting for the user"
 
 [sessions]
-name = "【#{issue}】{title}"          # `ding new --issue` and `ding rename` without --name
+name = "【#{issue}】{name}"           # session name for `ding new --issue N --name NAME`
 ```
 
-`[sessions] name` may use `{issue}`, `{title}`, and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The ticket title is filled in as is, so braces in it are kept.
+`[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.
 
 `ding board --status` also uses `[status] fields`, after `--status-fields` and `DING_STATUS_FIELDS`. A misspelled key is an error, so a typo cannot silently fall back to a default.
 
