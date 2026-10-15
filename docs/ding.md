@@ -7,6 +7,7 @@ It talks to Codex sessions through the Codex App Server. Claude Code sessions ca
 - [Before you start](#before-you-start)
 - [A quick tour](#a-quick-tour)
 - [Choosing a session](#choosing-a-session)
+- [Rename a session: `rename`](#rename-a-session-rename)
 - [See what everyone is doing: `board`](#see-what-everyone-is-doing-board)
 - [Read a session: `read` and `status`](#read-a-session-read-and-status)
 - [Send a message: `send`](#send-a-message-send)
@@ -52,7 +53,7 @@ ding launch eval-42 -- python evaluate.py            # run in tmux; wake me when
 
 ## Choosing a session
 
-Every command that talks to one session (`read`, `status`, `send`, `run`) takes a target in any of these forms:
+Every command that talks to one session (`read`, `status`, `rename`, `send`, `run`) takes a target in any of these forms:
 
 | Target | Example |
 | --- | --- |
@@ -78,6 +79,21 @@ Codex session: 019a2b3c-...    # "this comment came from me"
 3. If they name different sessions, `ding` refuses and lists the candidates with their status and latest comment. Pick one by UUID or name.
 
 When a name matches several sessions, or none, `ding` shows the candidates instead of guessing.
+
+## Rename a session: `rename`
+
+```bash
+ding rename 019a2b3c-0000-4000-8000-000000000001 --name 'Evaluation runner'
+ding rename 'Evaluation runner' --name 'Evaluation complete'
+ding rename --issue 42 --name 'Ticket 42 executor'
+ding rename https://github.com/917Dhj/my-repo/issues/42 --name 'Ticket 42 executor' --socket /path/to/app-server.sock
+```
+
+The new name must contain non-whitespace text. `ding` sends the supplied name unchanged, including Unicode and leading or trailing spaces. The session keeps its UUID and history, and no model turn starts. On confirmed success, stdout contains only the session UUID followed by a newline.
+
+Targets use the same rules as other session commands. Ambiguous names or issues are refused before renaming. `--socket PATH` selects an existing App Server socket as usual.
+
+If the connection fails before confirmation, the name may already have changed. `ding` reports an error and does not retry. Inspect the current name with `ding board --all` before deciding whether to try again.
 
 ## See what everyone is doing: `board`
 
