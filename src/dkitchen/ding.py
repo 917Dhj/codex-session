@@ -1440,6 +1440,11 @@ def main(argv=None) -> int:
     sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD")
     sub.add_argument("pr", type=int, help="PR number")
     sub.add_argument("sha", help="The HEAD that was reviewed (full or prefix)")
+    ticket = sub.add_mutually_exclusive_group()
+    ticket.add_argument("--ticket", type=int, help="The PR's ticket, whose executor must be waiting on the "
+                                                   "orchestrator (default: the one ticket the PR body mentions "
+                                                   "that has executor comments)")
+    ticket.add_argument("--no-ticket", action="store_true", help="Merge a PR that belongs to no ticket")
     sub = commands.add_parser("log", help="Post an entry to the orchestrator log ticket")
     sub.add_argument("--item", action="append", required=True, help="One automatic action; repeat for more")
     sub.add_argument("--pending", action="append", default=[], help="One matter waiting for the user; repeat for more")
@@ -1475,6 +1480,8 @@ def main(argv=None) -> int:
         parser.error("--name must contain non-whitespace text")
     if getattr(args, "issue", None) is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
+    if args.action == "merge" and args.ticket is not None and args.ticket <= 0:
+        parser.error("--ticket must be a positive issue number")
     if args.action in {"run", "launch"} and not command:
         parser.error(f"{args.action} requires a task command after --")
     try:
