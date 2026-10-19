@@ -15,7 +15,7 @@ When a session is replaced, edit only this table. Everywhere else, write the sta
 - **Orchestrator** (Claude Code, the strongest model available): reports progress, starting from `ding board`. Tells the user facts and schedules.
 - **Designer** (Claude Code, the strongest model available): writes tickets.<!-- module:model-text --> Owns model-visible text ([model-text.md](model-text.md)).<!-- /module:model-text -->
 - **Verifier** (Claude Code, a cheaper model): checks facts and makes no decisions. Reads code and data and runs scripts that call no model. Runs no models and edits no repo files.
-- **Executor** (Codex): one session per ticket, in its own worktree. Carries out the ticket.<!-- module:model-text --> Stops and hands back to the designer when it needs new or changed model-visible text; copies text given in the ticket verbatim.<!-- /module:model-text -->
+- **Executor** (Codex): one sub-ticket and one session per run, in its own worktree (`ding new --parent <ticket>`). Carries out the sub-ticket. The parent ticket holds only the design, rulings, and summary; execution and run requests go on the sub-ticket.<!-- module:model-text --> Stops and hands back to the designer when it needs new or changed model-visible text; copies text given in the ticket verbatim.<!-- /module:model-text -->
 
 ## Who owns what
 
@@ -83,7 +83,7 @@ All stations post from one GitHub account, so comments are told apart by how the
 
 The orchestrator runs the repo's review script on every PR: `scripts/review_pr.py <PR> [test files…]`. It trial-merges the PR and runs the given tests, then reports the reviewed HEAD, whether the PR is a draft, names the PR deletes that are still referenced, tests that did not actually run, and tickets the merge will close<!-- module:artifacts -->, as well as frozen files the PR changes<!-- /module:artifacts -->.
 
-When the review passes, the orchestrator merges with `ding merge <PR> <reviewed HEAD> --ticket <N>`, without waiting for the user. It merges only while the executor's latest status block on the ticket is waiting on the orchestrator; when it refuses, read that comment and wait for the executor instead of merging another way. A PR with no ticket uses `--no-ticket`. It prints the merge commit only after the merge has really happened, and logs and notices go by that line.<!-- module:artifacts --> When the script reports a changed frozen file, confirm with the designer before merging.<!-- /module:artifacts --><!-- module:model-text --> When the ticket gives prompt text, also check it with `scripts/check_prompt_in_issue.py` ([model-text.md](model-text.md)).<!-- /module:model-text -->
+When the review passes, the orchestrator merges with `ding merge <PR> <reviewed HEAD> --ticket <N>`, without waiting for the user. It merges only while the executor's latest status block on the ticket is waiting on the orchestrator or lists the PR under *Pending merge*; when it refuses, read that comment and wait for the executor instead of merging another way. A PR with no ticket uses `--no-ticket`. It prints the merge commit only after the merge has really happened, and logs and notices go by that line.<!-- module:artifacts --> When the script reports a changed frozen file, confirm with the designer before merging.<!-- /module:artifacts --><!-- module:model-text --> When the ticket gives prompt text, also check it with `scripts/check_prompt_in_issue.py` ([model-text.md](model-text.md)).<!-- /module:model-text -->
 <!-- module:artifacts -->
 
 ## Registered artifacts

@@ -1,7 +1,8 @@
 """The orchestrator's routine GitHub writes, each checked step by step.
 
 - merge: merge a reviewed PR at the reviewed HEAD and print the merge commit; refuses drafts, moved HEADs,
-  and tickets whose executor's latest status block is not waiting on the orchestrator.
+  and tickets whose executor's latest status block neither waits on the orchestrator nor lists the PR as
+  pending merge.
 - relay: send a message to a ticket's executor with `ding send`, then leave the matching ticket comment. By default
   the message goes into the executor's current turn and replaces the orchestrator's relays still queued for it.
 - log: post one entry to the orchestrator log, stamped with the current UTC time.
@@ -64,7 +65,11 @@ def executor_status(config: Config, repo: str, issue: int) -> dict | None:
     block = "\n".join(line for line in latest["body"].splitlines()[:len(names)] if line.strip())
     _, waiting = watch.state_and_waiting(latest["body"], config)
     ready = not waiting.startswith(config.status.none) and config.stations.orchestrator in waiting
-    return {"block": block, "url": latest["html_url"], "ready": ready}
+    listed = watch.fields(latest["body"], config).get(config.status.pending_merge, "")
+    pending = {int(number) for number in re.findall(r"(?i)(?:PR\s*#?|#)\s*(\d+)", listed)}
+    if listed and config.status.pending_merge not in names:
+        block += "\n" + next(line for line in latest["body"].splitlines() if line.startswith(config.status.pending_merge))
+    return {"block": block, "url": latest["html_url"], "ready": ready, "pending_merge": pending}
 
 
 def ticket_references(body: str, repo: str, pr: int) -> list[int]:
@@ -111,9 +116,10 @@ def merge(args, config: Config) -> int:
                     return fail(f"#{ticket} has no executor comment; pass the PR's ticket with --ticket, "
                                 "or --no-ticket for a PR without one")
             print(f"#{ticket} latest executor status ({status['url']}):\n{status['block']}")
-            if not status["ready"]:
-                return fail(f"#{ticket}'s executor is not waiting on {config.stations.orchestrator} to merge; "
-                            "read its latest comment and wait until it asks for the merge. Nothing merged")
+            if not status["ready"] and args.pr not in status.get("pending_merge", ()):
+                return fail(f"#{ticket}'s executor is not waiting on {config.stations.orchestrator} to merge, and its "
+                            f"{config.status.pending_merge} field does not list PR #{args.pr}; read its latest "
+                            "comment and wait until it asks for the merge. Nothing merged")
         result = call(config, "gh", "pr", "merge", str(args.pr), "--repo", repo, "--merge",
                       "--match-head-commit", pr["headRefOid"])
         if result.returncode:

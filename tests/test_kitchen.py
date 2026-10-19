@@ -162,6 +162,16 @@ def test_relay_queue_keeps_plain_message_and_interrupt_passes_through(tmp_path, 
     assert sends == [["send", "o/r#42", "--from", "总编排", "--message", text, *tail]]
 
 
+@pytest.mark.parametrize("listed, code", [("待合并：PR#7, PR#9", 0), ("待合并：PR#9", 1), ("", 1)])
+def test_merge_accepts_a_pr_the_executor_lists_as_pending_merge(tmp_path, monkeypatch, capsys, listed, code):
+    loaded = settings(tmp_path, CHINESE.replace("[status]\n", '[status]\npending_merge = "待合并"\n'))
+    status = "状态：进行中\n在等：无\n关键数字：—\n下一步：跑 9B\n" + listed + "\n\nCodex session: x"
+    calls = []
+    monkeypatch.setattr(orchestrate, "call", fake_call([view(), thread_comments(status), (0, ""), view("MERGED")], calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", ticket=42, no_ticket=False), loaded) == code
+    assert ("待合并" in capsys.readouterr().out) == bool(listed)
+
+
 def view(state="OPEN", head="abc123", draft=False, body=""):
     return 0, json.dumps({"isDraft": draft, "state": state, "headRefOid": head, "mergeCommit": {"oid": "m1"},
                           "body": body})

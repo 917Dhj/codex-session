@@ -339,6 +339,45 @@ def ownership_note(repo: str, number: int, thread_id: str) -> str:
             f"with the line `Codex owner: {thread_id}`.\n\n")
 
 
+def ticket_owners(repo: str, number: int) -> list[str]:
+    """Every distinct session a `Codex owner:` line on the ticket has named, oldest first."""
+    issue = gh_json(["api", f"repos/{repo}/issues/{number}"])
+    if not isinstance(issue, dict):
+        raise ValueError("Malformed gh issue.")
+    owners = []
+    for record in [issue, *gh_records(f"repos/{repo}/issues/{number}/comments?per_page=100")]:
+        for value in session_references(record.get("body"), "owner"):
+            try:
+                owner = str(UUID(value))
+            except ValueError:
+                continue
+            if owner not in owners:
+                owners.append(owner)
+    return owners
+
+
+def live_owners(call, owners: list[str]) -> list[dict]:
+    """The owners whose sessions are not archived."""
+    if not owners:
+        return []
+    live = {thread["id"]: thread for thread in list_threads(call)}
+    return [live[owner] for owner in owners if owner in live]
+
+
+def create_sub_issue(repo: str, parent: int, title: str, first_line: str) -> int:
+    """Open a ticket whose body starts with first_line and attach it to parent as a sub-issue."""
+    child = gh_json(["api", f"repos/{repo}/issues", "-X", "POST", "-f", f"title={title}", "-f", f"body={first_line}\n"])
+    if not isinstance(child, dict) or not isinstance(child.get("number"), int) or not isinstance(child.get("id"), int):
+        raise ValueError("Malformed gh issue.")
+    try:
+        gh_json(["api", f"repos/{repo}/issues/{parent}/sub_issues", "-X", "POST", "-F", f"sub_issue_id={child['id']}"])
+    except ValueError as exc:
+        raise ValueError(f"opened #{child['number']} but could not attach it to #{parent} ({exc}); attach it by hand, "
+                         f"then rerun with --issue {child['number']}") from exc
+    print(f"ding: opened #{child['number']} under #{parent}", file=sys.stderr)
+    return child["number"]
+
+
 def session_references(body: str | None, label: str = "session") -> list[str]:
     if body is None:
         return []
@@ -1232,6 +1271,14 @@ def new_task(args) -> int:
             raise ValueError("The first message (--message or --message-file) must not be empty.")
         stage = "connection"
         with app_server(socket_path(args.socket)) as call:
+            if args.issue is not None and not getattr(args, "replace", False):
+                stage = "owner check"
+                owners = live_owners(call, ticket_owners(args.repo, args.issue))
+                if owners:
+                    named = ", ".join(f"{owner['id']} ({owner.get('name') or 'unnamed'})" for owner in owners)
+                    raise ValueError(f"#{args.issue} already has an executor that is not archived: {named}. "
+                                     f"Open a sub-ticket for the new run with --parent {args.issue}, "
+                                     "or pass --replace to hand the ticket to a new session")
             stage = "thread/start"
             thread = call(stage, {"cwd": str(cwd), "ephemeral": False}).get("thread")
             try:
@@ -1492,8 +1539,14 @@ def main(argv=None) -> int:
     sub.add_argument("--cwd", required=True, help="Existing working directory for the session")
     sub.add_argument("--name", required=True, help="Session title; with --issue, filled into the "
                                                    "[sessions] name template")
-    sub.add_argument("--issue", type=int, help="Ticket this session owns: formats --name with the [sessions] "
-                                               "name template and asks the session to post its Codex owner line")
+    owned = sub.add_mutually_exclusive_group()
+    owned.add_argument("--issue", type=int, help="Ticket this session owns: formats --name with the [sessions] "
+                                                 "name template and asks the session to post its Codex owner line; "
+                                                 "refused while another unarchived session owns it")
+    owned.add_argument("--parent", type=int, help="First open a sub-ticket of this ticket for the run, then own it "
+                                                  "as with --issue")
+    sub.add_argument("--title", help="With --parent: the sub-ticket's title (default: --name)")
+    sub.add_argument("--replace", action="store_true", help="With --issue: take over a ticket another session owns")
     message = sub.add_mutually_exclusive_group(required=True)
     message.add_argument("--message", help="First message text, or '-' to read stdin")
     message.add_argument("--message-file", help="UTF-8 file holding the first message")
@@ -1601,6 +1654,8 @@ def main(argv=None) -> int:
         parser.error("--name must contain non-whitespace text")
     if getattr(args, "issue", None) is not None and args.issue <= 0:
         parser.error("--issue must be a positive issue number")
+    if getattr(args, "parent", None) is not None and args.parent <= 0:
+        parser.error("--parent must be a positive issue number")
     if args.action == "merge" and args.ticket is not None and args.ticket <= 0:
         parser.error("--ticket must be a positive issue number")
     if args.action in {"run", "launch"} and not command:
@@ -1609,10 +1664,18 @@ def main(argv=None) -> int:
         if args.action == "new":
             if not args.name.strip():
                 parser.error("--name must contain non-whitespace text")
-            if args.issue is not None and args.cwd and Path(args.cwd).expanduser().is_dir():
+            if args.parent is None and (args.title is not None or args.replace and args.issue is None):
+                parser.error("--title goes with --parent, and --replace with --issue")
+            if (args.issue is not None or args.parent is not None) and args.cwd and Path(args.cwd).expanduser().is_dir():
                 from dkitchen import config
                 settings = config.load(Path(args.cwd).expanduser().resolve())
                 args.repo = settings.repository()
+                if args.parent is not None:
+                    args.message, args.message_file = message_text(args.message, args.message_file, None), None
+                    if not args.message.strip():
+                        raise ValueError("The first message (--message or --message-file) must not be empty.")
+                    args.issue = create_sub_issue(args.repo, args.parent, (args.title or args.name).strip(),
+                                                  settings.sessions.parent.format(parent=args.parent))
                 args.name = settings.sessions.session_name(issue=args.issue, name=args.name, repo=args.repo)
             return new_task(args)
         if args.action == "check-refs":
