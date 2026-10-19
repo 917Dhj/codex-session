@@ -1215,6 +1215,9 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
     def confirm(turn):
         result.update(outcome="steered" if mutation == "steer" else "started",
                       turn_id=turn["id"], turn_status=turn["status"])
+        if result["error"] is not None:
+            # Found in history after an error (e.g. Codex started the queued message first): delivered once.
+            result["recovered_error"], result["error"] = result["error"], None
         return result
 
     try:

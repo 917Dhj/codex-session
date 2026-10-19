@@ -3480,3 +3480,27 @@ def test_run_registers_its_progress_file(tmp_path, monkeypatch):
         pass
     run, = ding.latest_runs().values()
     assert run["progress"] == str((tmp_path / "out/progress.json").resolve())
+
+
+def test_codex_starting_the_queued_message_first_is_a_clean_start(monkeypatch):
+    calls = []
+    submitted = [False]
+
+    def call(method, params):
+        calls.append(method)
+        if method == "thread/read":
+            return {"thread": thread()}
+        if method == "thread/queue/add":
+            submitted[0] = True
+            return {"queuedSubmission": {"id": "q", "clientUserMessageId": MESSAGE_ID, "input": params["input"]}}
+        if method == "thread/queue/start":
+            raise ding.AppServerError("App Server error: queued submission not found: q")
+        if method == "thread/turns/list":
+            return {"data": [started_turn(status="completed")] if submitted[0] and "thread/queue/start" in calls else []}
+        pytest.fail(method)
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=5)
+    assert result["outcome"] == "started" and result["error"] is None
+    assert "queued submission not found" in result["recovered_error"]
+    assert calls.count("thread/queue/start") == 1
