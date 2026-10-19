@@ -138,7 +138,7 @@ def board_running(output: str) -> set[int]:
         if not line.strip():
             break  # the unwrapped-process table follows a blank line
         cells = line.split("\t")
-        if len(cells) == 6 and cells[5] == "running":
+        if len(cells) >= 6 and cells[5] == "running":
             running.update(int(number) for number in re.findall(r"#(\d+)", cells[3]))
     return running
 

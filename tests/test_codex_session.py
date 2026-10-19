@@ -1,5 +1,6 @@
 import builtins
 import json
+from datetime import datetime
 import io
 import stat
 import socket
@@ -3440,3 +3441,42 @@ def test_new_parent_attach_failure_starts_no_session(tmp_path, monkeypatch, caps
     monkeypatch.setattr(ding, "app_server", lambda path: pytest.fail("no session before the ticket is attached"))
     assert ding.main(["new", "--cwd", str(cwd), "--parent", "57", "--name", "27B", "--message", "Brief"]) == 1
     assert "rerun with --issue 90" in capsys.readouterr().err
+
+
+def progress_file(tmp_path, **changes):
+    data = {"schema": "progress-v1", "state": "running", "stage": "answer",
+            "current": {"name": "answer", "unit": "item", "total": 500, "done": 120, "resumed": 100, "failed": 0,
+                        "by_stage": {}, "state": "running", "started": {"utc": "2026-10-19T10:00:00Z"}},
+            "rate_per_hour": 34.4, "eta": {"utc": "2026-10-19T21:10:00Z", "beijing": "2026-10-20T05:10:00+08:00"},
+            "phases": [], "invocation_started": {"utc": "2026-10-19T10:00:00Z"},
+            "updated": {"utc": "2026-10-19T12:00:00Z"}, "pid": 1, "host": "h"}
+    data.update(changes)
+    path = tmp_path / "progress.json"
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+NOON = datetime.fromisoformat("2026-10-19T12:00:00+00:00").timestamp()
+
+
+@pytest.mark.parametrize("changes, now, expected", [
+    ({}, NOON + 60, "answer 120/500 34/h ETA 10-20 05:10"),
+    ({}, NOON + 601, "answer 120/500 34/h ETA 10-20 05:10 STALE 10m"),
+    ({"state": "interrupted", "eta": None, "rate_per_hour": None}, NOON + 9999, "answer 120/500 interrupted"),
+    ({"current": None, "stage": "prepare", "rate_per_hour": 2.25, "eta": None}, NOON, "prepare 2.2/h"),
+    ({"schema": "progress-v0"}, NOON, "progress: unknown format"),
+])
+def test_progress_summary_shows_stage_rate_eta_and_staleness(tmp_path, changes, now, expected):
+    assert ding.progress_summary(progress_file(tmp_path, **changes), now) == expected
+
+
+def test_progress_summary_without_a_file(tmp_path):
+    assert ding.progress_summary(str(tmp_path / "missing.json")) == "progress: no file yet"
+
+
+def test_run_registers_its_progress_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    with ding.registered_run(THREAD_ID, tmp_path / "r.jsonl", tmp_path / "out/progress.json"):
+        pass
+    run, = ding.latest_runs().values()
+    assert run["progress"] == str((tmp_path / "out/progress.json").resolve())
