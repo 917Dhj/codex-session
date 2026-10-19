@@ -1,4 +1,5 @@
-"""Check the `path:line` and `sha256` references in a draft comment against the files they cite."""
+"""Check the references in a draft comment: `path:line` and `sha256` against the files they cite, and ticket
+numbers, PR links, and comment links against GitHub."""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +16,66 @@ SHA = re.compile(r"sha256[\s:=`]*`?([0-9a-f]{8,64})(?:…([0-9a-f]{4,64}))?", re
 PATH = re.compile(r"^[\w./\-]+\.\w+$")
 DEFINITION = re.compile(r"\s*(?:async\s+)?(?:def|class)\s+(\w+)")
 IDENTIFIER = re.compile(r"^[A-Za-z_][\w.]{3,}$")
+URL = re.compile(r"https?://\S+")
+LINK = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/(issues|pull)/(\d+)(?:#([\w-]+))?")
+TICKET = re.compile(r"(?<![A-Za-z0-9_/&.-])(?:([\w.-]+/[\w.-]+)#|(?i:(PR)\s*)?#)(\d+)\b")
+KINDS = ("file:line", "sha256", "ticket", "PR", "PR link", "ticket link", "comment link")
+
+
+def github_api(path: str) -> dict | None:
+    """A GitHub API record, or None when it does not exist; raises when GitHub cannot be asked."""
+    result = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        if "Not Found" in result.stderr or "HTTP 404" in result.stderr or "HTTP 410" in result.stderr:
+            return None
+        raise RuntimeError(result.stderr.strip() or f"gh api {path} failed")
+    return json.loads(result.stdout)
+
+
+class GitHub:
+    """Looks up tickets, PRs, and comments once each; `api` is github_api unless a test passes another."""
+
+    def __init__(self, repo: str | None, api=github_api, default=None) -> None:
+        self.api, self.cache, self._repo, self.default = api, {}, repo, default
+
+    @property
+    def repo(self) -> str | None:
+        """The repository bare #N means, looked up the first time a draft has one."""
+        if self._repo is None and self.default is not None:
+            self._repo, self.default = self.default(), None
+        return self._repo
+
+    def get(self, path: str) -> dict | None:
+        if path not in self.cache:
+            self.cache[path] = self.api(path)
+        return self.cache[path]
+
+    def problem(self, kind: str, repo: str, number: int, anchor: str | None = None) -> str | None:
+        """Why the reference is wrong, or None when it is right."""
+        issue = self.get(f"repos/{repo}/issues/{number}")
+        if issue is None:
+            return f"{repo}#{number} does not exist"
+        is_pr = "pull_request" in issue
+        if kind in {"PR", "PR link"} and not is_pr:
+            return f"{repo}#{number} is an issue, not a PR"
+        if kind == "ticket link" and is_pr:
+            return f"{repo}#{number} is a PR; its link is /pull/{number}"
+        if anchor is None:
+            return None
+        found = re.fullmatch(r"(issuecomment|discussion_r|pullrequestreview)-?(\d+)", anchor)
+        if found is None:
+            raise LookupError(f"link anchor #{anchor} is not a comment")
+        style, ident = found.groups()
+        path = {"issuecomment": f"repos/{repo}/issues/comments/{ident}",
+                "discussion_r": f"repos/{repo}/pulls/comments/{ident}",
+                "pullrequestreview": f"repos/{repo}/pulls/{number}/reviews/{ident}"}[style]
+        comment = self.get(path)
+        if comment is None:
+            return f"comment {anchor} does not exist"
+        owner = comment.get("issue_url") or comment.get("pull_request_url") or ""
+        if style != "pullrequestreview" and not owner.endswith(f"/{number}"):
+            return f"comment {anchor} belongs to #{owner.rsplit('/', 1)[-1]}, not #{number}"
+        return None
 
 
 class Source:
@@ -65,14 +126,57 @@ def enclosing_definition(lines: list[str], start: int) -> str | None:
     return None
 
 
-def check(draft: str, source: Source, tolerance: int) -> tuple[list[str], list[str], int]:
-    """Findings (wrong), notes (could not be checked), and how many references were checked."""
+def bare_references(line: str, spans: list[re.Match[str]]) -> list[re.Match[str]]:
+    """`path:line` references written outside backticks and outside links."""
+    covered = [(m.start(), m.end()) for m in [*spans, *URL.finditer(line)]]
+    return [m for m in REF.finditer(line)
+            if not any(start <= m.start() < end for start, end in covered)
+            and (m.start() == 0 or not re.match(r"[\w./\-]", line[m.start() - 1]))]
+
+
+def check_github(number: int, line: str, github: GitHub | None, counts: dict[str, int],
+                 findings: list[str], notes: list[str]) -> int:
+    """Check the line's ticket numbers, PR numbers, and GitHub links; return how many were checked."""
+    references = []
+    for match in LINK.finditer(line):
+        repo, place, ticket, anchor = match.groups()
+        kind = "comment link" if anchor else ("PR link" if place == "pull" else "ticket link")
+        references.append((kind, repo, int(ticket), anchor, match.group(0)))
+    masked = URL.sub(lambda m: " " * len(m.group(0)), line)
+    for match in TICKET.finditer(masked):
+        repo, pr, ticket = match.groups()
+        references.append(("PR" if pr else "ticket", repo, int(ticket), None, match.group(0)))
+    checked = 0
+    for kind, repo, ticket, anchor, text in references:
+        repo = repo or (github.repo if github else None)
+        if github is None or repo is None:
+            reason = "GitHub checks are off (--offline)" if github is None else "cannot tell the repository"
+            notes.append(f"line {number} {kind} {text}: not checked ({reason})")
+            continue
+        try:
+            problem = github.problem(kind, repo, ticket, anchor)
+        except (LookupError, RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            notes.append(f"line {number} {kind} {text}: not checked ({' '.join(str(error).split())[:120]})")
+            continue
+        checked += 1
+        counts[kind] = counts.get(kind, 0) + 1
+        if problem:
+            findings.append(f"line {number} {kind} {text}: {problem}")
+    return checked
+
+
+def check(draft: str, source: Source, tolerance: int, github: GitHub | None = None,
+          counts: dict[str, int] | None = None) -> tuple[list[str], list[str], int]:
+    """Findings (wrong), notes (could not be checked), and how many references were checked; counts, when
+    given, collects the checked references by kind. Without github, ticket and link references are not read."""
     findings, notes, checked = [], [], 0
+    counts = {} if counts is None else counts
     for number, line in enumerate(draft.split("\n"), 1):
         spans = list(SPAN.finditer(line))
         names = names_by_reference(line, spans)
-        for index, span in enumerate(spans):
-            match = REF.fullmatch(span.group(1))
+        located = [(index, REF.fullmatch(span.group(1))) for index, span in enumerate(spans)]
+        located += [(None, match) for match in bare_references(line, spans)]
+        for index, match in located:
             if not match:
                 continue
             name, first, last = match.groups()
@@ -81,6 +185,7 @@ def check(draft: str, source: Source, tolerance: int) -> tuple[list[str], list[s
                 notes.append(f"line {number} `{name}:{first}`: no such file, or several files share the name; not checked")
                 continue
             checked += 1
+            counts["file:line"] = counts.get("file:line", 0) + 1
             lines = source.read(path).decode("utf-8", "replace").splitlines()
             start, end = int(first), int(last or first)
             if not 1 <= start <= end <= len(lines):
@@ -99,22 +204,38 @@ def check(draft: str, source: Source, tolerance: int) -> tuple[list[str], list[s
                              "(add --root for files outside git)")
                 continue
             checked += 1
+            counts["sha256"] = counts.get("sha256", 0) + 1
             digest = hashlib.sha256(source.read(path)).hexdigest()
             prefix, suffix = match.group(1).lower(), (match.group(2) or "").lower()
             if not digest.startswith(prefix) or not digest.endswith(suffix):
                 findings.append(f"line {number} `{path}` has sha256 {digest[:8]}…{digest[-4:]}, the draft says {match.group(0)}")
+        checked += check_github(number, line, github, counts, findings, notes)
     return findings, notes, checked
 
 
+def default_repository() -> str | None:
+    try:
+        from dkitchen import config
+        return config.load().repository()
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
 def check_refs(args) -> int:
+    github = None if getattr(args, "offline", False) else GitHub(getattr(args, "repo", None), default=default_repository)
+    counts: dict[str, int] = {}
     try:
         findings, notes, checked = check(Path(args.draft).read_text(encoding="utf-8"), Source(args.ref, args.root),
-                                         args.tolerance)
+                                         args.tolerance, github, counts)
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"ding: {error}", file=sys.stderr)
         return 2
-    for line in [*notes, *findings]:
-        print(line, file=sys.stderr)
-    print(f"checked {checked} references: {len(findings)} wrong, {len(notes)} not checked", file=sys.stderr)
-    print(json.dumps({"checked": checked, "findings": len(findings), "unchecked": len(notes)}))
+    for line in findings:
+        print(f"wrong: {line}", file=sys.stderr)
+    for line in notes:
+        print(f"not checked: {line}", file=sys.stderr)
+    kinds = ", ".join(f"{counts[kind]} {kind}" for kind in KINDS if counts.get(kind)) or "none"
+    print(f"checked {checked} references ({kinds}): {len(findings)} wrong, {len(notes)} not checked", file=sys.stderr)
+    print(json.dumps({"checked": checked, "findings": len(findings), "unchecked": len(notes),
+                      "by_kind": counts, "wrong": findings, "not_checked": notes}, ensure_ascii=False))
     return int(bool(findings))

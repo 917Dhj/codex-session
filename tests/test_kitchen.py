@@ -407,8 +407,51 @@ def test_check_refs_command_reports_and_exits_nonzero_on_findings(tree, capsys):
     draft.write_text("`pkg/work.py:6` holds `Ledger`\n")
     assert ding.main(["check-refs", str(draft), "--root", str(tree)]) == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"checked": 1, "findings": 1, "unchecked": 0}
-    assert "checked 1 references: 1 wrong, 0 not checked" in captured.err
+    report = json.loads(captured.out)
+    assert {key: report[key] for key in ("checked", "findings", "unchecked", "by_kind")} == {
+        "checked": 1, "findings": 1, "unchecked": 0, "by_kind": {"file:line": 1}}
+    assert report["wrong"][0].startswith("line 1 `pkg/work.py:6`")
+    assert "checked 1 references (1 file:line): 1 wrong, 0 not checked" in captured.err
+
+
+GITHUB = {
+    "repos/o/r/issues/433": {"number": 433},
+    "repos/o/r/issues/543": {"number": 543, "pull_request": {}},
+    "repos/o/r/issues/comments/111": {"issue_url": "https://api.github.com/repos/o/r/issues/433"},
+    "repos/o/r/issues/comments/222": {"issue_url": "https://api.github.com/repos/o/r/issues/535"},
+}
+
+
+def fake_github(path):
+    if path == "repos/o/r/issues/9":
+        raise RuntimeError("HTTP 502")
+    return GITHUB.get(path)
+
+
+def test_tickets_prs_and_comment_links_are_checked_against_github(tree):
+    github = refs.GitHub("o/r", fake_github)
+    counts = {}
+    draft = ("见 #433 和 PR#543；#544 不存在，PR #433 不是 PR\n"
+             "https://github.com/o/r/issues/433#issuecomment-111 https://github.com/o/r/issues/433#issuecomment-222\n"
+             "https://github.com/o/r/pull/543 https://github.com/o/r/issues/543 #9")
+    findings, notes, checked = refs.check(draft, refs.Source("HEAD", tree), 0, github, counts)
+    assert findings == [
+        "line 1 ticket #544: o/r#544 does not exist",
+        "line 1 PR PR #433: o/r#433 is an issue, not a PR",
+        "line 2 comment link https://github.com/o/r/issues/433#issuecomment-222: comment issuecomment-222 "
+        "belongs to #535, not #433",
+        "line 3 ticket link https://github.com/o/r/issues/543: o/r#543 is a PR; its link is /pull/543",
+    ]
+    assert notes == ["line 3 ticket #9: not checked (HTTP 502)"]
+    assert counts == {"ticket": 2, "PR": 2, "comment link": 2, "PR link": 1, "ticket link": 1}
+    assert checked == 8
+
+
+def test_bare_line_references_are_checked_and_offline_lists_tickets(tree):
+    findings, notes, checked = refs.check("pkg/work.py:99 改了；见 #433", refs.Source("HEAD", tree), 0)
+    assert findings == ["line 1 `pkg/work.py:99`: beyond the end of the file (10 lines)"]
+    assert notes == ["line 1 ticket #433: not checked (GitHub checks are off (--offline))"]
+    assert checked == 1
 
 
 def test_log_issue_must_be_positive(capsys):
