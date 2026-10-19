@@ -30,6 +30,9 @@ Every key is optional. The defaults match the English templates in kitchen/:
 
     [sessions]
     name = "【#{issue}】{name}"           # `ding new --issue N --name NAME`; also {repo}
+
+    [relay]
+    superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a default relay
 """
 from __future__ import annotations
 
@@ -93,6 +96,11 @@ class Sessions:
         return self.name.format(issue=issue, name=name, repo=repo)
 
 
+@dataclass(frozen=True)
+class Relay:
+    superseding: str = "New decision; it replaces earlier relays not yet carried out."
+
+
 SESSION_FIELDS = ("issue", "name", "repo")
 
 
@@ -126,6 +134,7 @@ class Config:
     labels: Labels = Labels()
     log: Log = Log()
     sessions: Sessions = Sessions()
+    relay: Relay = Relay()
 
     def repository(self) -> str:
         """The configured repository, or the one gh sees from the repository root."""
@@ -180,7 +189,7 @@ def load(cwd: Path | None = None) -> Config:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
-    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions}
+    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

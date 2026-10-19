@@ -3281,3 +3281,100 @@ def test_rename_refuses_ambiguous_targets(issue_data, monkeypatch, capsys, targe
     assert captured.out == ""
     assert THREAD_ID in captured.err and OTHER_ID in captured.err
     assert calls == ["thread/list"]
+
+
+def steer_server(monkeypatch, *, reads, steer_error=None, queued=()):
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "thread/read":
+            return {"thread": thread(status=reads.pop(0) if len(reads) > 1 else reads[0])}
+        if method == "thread/turns/list":
+            if params.get("itemsView") == "notLoaded":
+                return {"data": [{"id": "turn-1", "status": "inProgress", "items": []}]}
+            return {"data": []}
+        if method == "turn/steer":
+            assert params == {"threadId": THREAD_ID, "expectedTurnId": "turn-1", "clientUserMessageId": MESSAGE_ID,
+                              "input": [{"type": "text", "text": "message"}]}
+            if steer_error:
+                raise ding.AppServerError(steer_error)
+            return {"turnId": "turn-1"}
+        if method == "turn/interrupt":
+            assert params == {"threadId": THREAD_ID, "turnId": "turn-1"}
+            return {}
+        if method == "thread/queue/add":
+            return {"queuedSubmission": {"id": "own-q", "clientUserMessageId": MESSAGE_ID, "input": params["input"]}}
+        if method == "thread/queue/start":
+            return {"turn": started_turn()}
+        if method == "thread/queue/list":
+            return {"data": list(queued), "nextCursor": None}
+        if method == "thread/queue/delete":
+            return {"deleted": True}
+        pytest.fail(method)
+
+    monkeypatch.setattr(ding, "app_server", lambda path, **kwargs: server_calls(call))
+    monkeypatch.setattr(ding.time, "sleep", lambda seconds: None)
+    return calls
+
+
+def test_steer_inserts_into_the_active_turn_without_queueing(monkeypatch):
+    calls = steer_server(monkeypatch, reads=["active"])
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, steer=True)
+    assert result["outcome"] == "steered"
+    assert result["turn_id"] == "turn-1"
+    assert [method for method, _ in calls] == ["thread/read", "thread/turns/list", "turn/steer"]
+
+
+def test_steer_that_misses_the_turn_falls_back_to_the_queue(monkeypatch):
+    calls = steer_server(monkeypatch, reads=["active", "active"], steer_error="no active turn to steer")
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, steer=True)
+    assert result["outcome"] == "queued_behind_active"
+    assert result["queued_submission_id"] == "own-q"
+    assert "no active turn" in result["steer_error"]
+    assert [method for method, _ in calls][-1] == "thread/queue/add"
+
+
+def test_interrupt_waits_for_idle_then_starts_a_new_turn(monkeypatch):
+    calls = steer_server(monkeypatch, reads=["active", "active", "idle"])
+    result = ding.deliver_message(THREAD_ID, "message", "/test.sock", MESSAGE_ID, timeout=0.05, interrupt=True)
+    assert result["interrupted_turn_id"] == "turn-1"
+    assert result["outcome"] == "started"
+    methods = [method for method, _ in calls]
+    assert methods.index("turn/interrupt") < methods.index("thread/queue/add")
+    assert "turn/steer" not in methods
+
+
+def test_send_supersede_deletes_only_own_queued_messages_and_logs_them(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    record = tmp_path / "state/ding/sent.jsonl"
+    record.parent.mkdir(parents=True)
+    old = [
+        {"event": "send_result", "thread_id": THREAD_ID, "sender": "orchestrator", "queued_submission_id": "q-old",
+         "client_message_id": "c-old"},
+        {"event": "send_result", "thread_id": THREAD_ID, "sender": "verifier", "queued_submission_id": "q-other",
+         "client_message_id": "c-other"},
+        {"event": "send_result", "thread_id": OTHER_ID, "sender": "orchestrator", "queued_submission_id": "q-else",
+         "client_message_id": "c-else"},
+    ]
+    record.write_text("".join(json.dumps(event) + "\n" for event in old))
+    queued = [{"id": q, "clientUserMessageId": c, "input": []}
+              for q, c in (("q-old", "c-old"), ("q-other", "c-other"), ("q-user", "c-user"))]
+    calls = steer_server(monkeypatch, reads=["active"], queued=queued)
+    monkeypatch.setattr(ding, "deliver_message", lambda *args, **kwargs: {"outcome": "steered", "error": None,
+                                                                         "kwargs": kwargs})
+    assert ding.main(["send", THREAD_ID, "--socket", "/test.sock", "--from", "orchestrator", "--steer",
+                      "--supersede", "--message", "new"]) == 0
+    assert [params["queuedSubmissionId"] for method, params in calls if method == "thread/queue/delete"] == ["q-old"]
+    *_, intent, superseded, result = records(record)
+    assert intent["steer"] and intent["supersede"]
+    assert superseded["event"] == "superseded"
+    assert superseded["removed"] == [{"queued_submission_id": "q-old", "client_message_id": "c-old", "deleted": True}]
+    assert result["kwargs"] == {"steer": True}
+    assert "removed 1 earlier queued message" in capsys.readouterr().err
+
+
+def test_supersede_requires_a_sender(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(["send", THREAD_ID, "--supersede", "--message", "new"])
+    assert "--supersede needs --from" in capsys.readouterr().err

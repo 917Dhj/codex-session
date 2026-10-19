@@ -137,13 +137,29 @@ def test_relay_comments_only_after_confirmed_delivery(tmp_path, monkeypatch, cap
     args = SimpleNamespace(ticket=42, message="Go ahead with stage 2.", message_file=None, comment=None,
                            no_comment=False, to=None, socket=None)
     assert orchestrate.relay(args, loaded) == sent
-    assert sends == [["send", "o/r#42", "--from", "Orchestrator", "--message", "Orchestrator: Go ahead with stage 2."]]
+    assert sends == [["send", "o/r#42", "--from", "Orchestrator", "--message",
+                      "Orchestrator: New decision; it replaces earlier relays not yet carried out.\n"
+                      "Go ahead with stage 2.", "--steer", "--supersede"]]
     assert len(calls) == comments
     if comments:
         assert calls[0][:5] == ("gh", "issue", "comment", "42", "--repo")
         assert calls[0][-1] == "Orchestrator: Go ahead with stage 2."
     else:
         assert "No comment was left" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("queue, interrupt, tail", [
+    (True, False, []), (False, True, ["--steer", "--supersede", "--interrupt"]),
+])
+def test_relay_queue_keeps_plain_message_and_interrupt_passes_through(tmp_path, monkeypatch, queue, interrupt, tail):
+    loaded = settings(tmp_path, CHINESE + '\n[relay]\nsuperseding = "新决策，取代此前尚未执行的转达"\n')
+    sends = []
+    monkeypatch.setattr(orchestrate.ding, "main", lambda argv: sends.append(argv) or 0)
+    args = SimpleNamespace(ticket=42, message="总编排：放行第 2 阶段。", message_file=None, comment=None,
+                           no_comment=True, to=None, socket=None, queue=queue, interrupt=interrupt)
+    assert orchestrate.relay(args, loaded) == 0
+    text = "总编排：放行第 2 阶段。" if queue else "总编排：新决策，取代此前尚未执行的转达\n放行第 2 阶段。"
+    assert sends == [["send", "o/r#42", "--from", "总编排", "--message", text, *tail]]
 
 
 def view(state="OPEN", head="abc123", draft=False, body=""):

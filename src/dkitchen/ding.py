@@ -1086,16 +1086,35 @@ def delivery_status(call, thread_id: str, *, resume: bool = False) -> dict:
     return status
 
 
+def active_turn(call, thread_id: str) -> str | None:
+    """The ID of the session's turn in progress, or None."""
+    page = call("thread/turns/list", {"threadId": thread_id, "limit": 1, "sortDirection": "desc",
+                                      "itemsView": "notLoaded"})
+    turns = page.get("data")
+    if not isinstance(turns, list) or (turns and not isinstance(turns[0], dict)):
+        raise ValueError("Malformed App Server turns page.")
+    if turns and turns[0].get("status") == "inProgress" and isinstance(turns[0].get("id"), str) and turns[0]["id"]:
+        return turns[0]["id"]
+    return None
+
+
 def deliver_message(thread_id: str, message: str, path: str, client_id: str,
-                    *, timeout: float = 60) -> dict:
+                    *, timeout: float = 60, steer: bool = False, interrupt: bool = False) -> dict:
+    """Start the message as a new turn, or queue it behind the turn in progress.
+
+    interrupt first stops the turn in progress; steer inserts the message into it instead of queueing,
+    and falls back to the queue when the turn ends before the insertion lands.
+    """
     result = {"outcome": "failed", "status": None, "error": None,
               "queued_submission_id": None, "turn_id": None, "turn_status": None}
     deadline = time.monotonic() + timeout
     mutation = None
     baseline = None
+    inputs = [{"type": "text", "text": message}]
 
     def confirm(turn):
-        result.update(outcome="started", turn_id=turn["id"], turn_status=turn["status"])
+        result.update(outcome="steered" if mutation == "steer" else "started",
+                      turn_id=turn["id"], turn_status=turn["status"])
         return result
 
     try:
@@ -1103,6 +1122,31 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
             result["status"] = delivery_status(call, thread_id)
             if result["status"]["type"] == "notLoaded":
                 result["status"] = delivery_status(call, thread_id, resume=True)
+            if interrupt and result["status"]["type"] == "active":
+                turn_id = active_turn(call, thread_id)
+                if turn_id is not None:
+                    call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+                    result["interrupted_turn_id"] = turn_id
+                    while result["status"]["type"] == "active" and time.monotonic() < deadline:
+                        time.sleep(min(1, max(0, deadline - time.monotonic())))
+                        result["status"] = delivery_status(call, thread_id)
+            if steer and result["status"]["type"] == "active":
+                turn_id = active_turn(call, thread_id)
+                if turn_id is not None:
+                    mutation = "steer"
+                    result["outcome"] = "unknown"
+                    try:
+                        steered = call("turn/steer", {"threadId": thread_id, "expectedTurnId": turn_id,
+                                                      "clientUserMessageId": client_id, "input": inputs})
+                    except AppServerError as exc:
+                        # The turn ended or changed first; nothing was inserted, so queue instead.
+                        mutation, result["outcome"], result["steer_error"] = None, "failed", str(exc)
+                        result["status"] = delivery_status(call, thread_id)
+                    else:
+                        if steered.get("turnId") != turn_id:
+                            raise ValueError("App Server steered a different turn.")
+                        result.update(outcome="steered", turn_id=turn_id, turn_status="inProgress")
+                        return result
             if result["status"]["type"] == "idle":
                 page = call("thread/turns/list", {
                     "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "full",
@@ -1114,7 +1158,6 @@ def deliver_message(thread_id: str, message: str, path: str, client_id: str,
                     baseline = page["data"][0]["id"]
             mutation = "add"
             result["outcome"] = "unknown"
-            inputs = [{"type": "text", "text": message}]
             submission = call("thread/queue/add", {
                 "threadId": thread_id, "clientUserMessageId": client_id, "input": inputs,
             }).get("queuedSubmission")
@@ -1217,6 +1260,53 @@ def new_task(args) -> int:
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
 
 
+def queued_sends(record: Path, thread_id: str, sender: str) -> dict[str, str]:
+    """Queued submission ID -> client message ID for this sender's sends to this session that were queued."""
+    found = {}
+    try:
+        lines = record.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return found
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("event") == "send_result" and event.get("thread_id") == thread_id
+                and event.get("sender") == sender and isinstance(event.get("queued_submission_id"), str)):
+            found[event["queued_submission_id"]] = event.get("client_message_id")
+    return found
+
+
+def supersede_queued(thread_id: str, path: str, sent: dict[str, str]) -> list[dict]:
+    """Delete the session's still-queued submissions among `sent`; return what was found and deleted."""
+    clients = {client: submission for submission, client in sent.items() if client}
+    removed = []
+    with app_server(path) as call:
+        cursor, seen, queued = None, set(), []
+        while True:
+            page = call("thread/queue/list", {"threadId": thread_id, **({"cursor": cursor} if cursor else {})})
+            if not isinstance(page.get("data"), list):
+                raise ValueError("Malformed App Server queue page.")
+            queued += page["data"]
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError("Malformed App Server pagination cursor.")
+            seen.add(cursor)
+        for submission in queued:
+            if not isinstance(submission, dict) or not isinstance(submission.get("id"), str):
+                raise ValueError("Malformed App Server queued submission.")
+            if submission["id"] not in sent and submission.get("clientUserMessageId") not in clients:
+                continue
+            deleted = call("thread/queue/delete", {"threadId": thread_id, "queuedSubmissionId": submission["id"]})
+            removed.append({"queued_submission_id": submission["id"],
+                            "client_message_id": submission.get("clientUserMessageId"),
+                            "deleted": deleted.get("deleted") is True})
+    return removed
+
+
 def send_task(args) -> int:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
     record = state / "ding/sent.jsonl"
@@ -1228,6 +1318,8 @@ def send_task(args) -> int:
         "target": args.thread_id if args.issue is None else f"#{args.issue}",
         "thread_id": None, "message": args.message, "outcome": "failed", "error": None,
     }
+    modes = {name: True for name in ("steer", "supersede", "interrupt") if getattr(args, name, False)}
+    event.update(modes)
     try:
         event["target"] = normalize_target(args.thread_id, args.issue)
         event["thread_id"] = resolve_target(event["target"], None, args.socket)
@@ -1242,7 +1334,24 @@ def send_task(args) -> int:
     if event["error"]:
         print(f"ding: {event['error']}", file=sys.stderr)
         return 1
-    delivery = deliver_message(event["thread_id"], args.message, path, event["client_message_id"])
+    if modes.pop("supersede", False):
+        superseded = {"event": "superseded", "client_message_id": event["client_message_id"],
+                      "sender": args.sender, "thread_id": event["thread_id"], "removed": [], "error": None}
+        try:
+            superseded["removed"] = supersede_queued(event["thread_id"], path,
+                                                     queued_sends(record, event["thread_id"], args.sender))
+        except (OSError, ValueError, RuntimeError) as exc:
+            superseded["error"] = str(exc) or type(exc).__name__
+            print(f"ding: could not remove earlier queued messages ({superseded['error']}); sending anyway",
+                  file=sys.stderr)
+        superseded["timestamp_ns"] = time.time_ns()
+        with writer(record, blocking=True):
+            append_jsonl(record, superseded)
+        deleted = [item["queued_submission_id"] for item in superseded["removed"] if item["deleted"]]
+        if deleted:
+            print(f"ding: removed {len(deleted)} earlier queued message(s) from {args.sender}: "
+                  f"{', '.join(deleted)}", file=sys.stderr)
+    delivery = deliver_message(event["thread_id"], args.message, path, event["client_message_id"], **modes)
     event.update(delivery, event="send_result", timestamp_ns=time.time_ns())
     try:
         with writer(record, blocking=True):
@@ -1254,7 +1363,7 @@ def send_task(args) -> int:
     warning = "; do not blindly resend" if event["outcome"] in {"queued", "unknown"} else ""
     detail = f"; {event['error']}" if event["error"] else ""
     print(f"ding: {event['outcome']}{warning}{detail}; record: {record}", file=sys.stderr)
-    return 0 if event["outcome"] in {"started", "queued_behind_active"} else (
+    return 0 if event["outcome"] in {"started", "steered", "queued_behind_active"} else (
         130 if event["error"] == "KeyboardInterrupt" else 1)
 
 
@@ -1424,6 +1533,13 @@ def main(argv=None) -> int:
             message.add_argument("--message", help="Message text, or '-' to read stdin")
             message.add_argument("--message-file", help="UTF-8 message file")
             sub.add_argument("--from", dest="sender", help="Prefix the message with '[from NAME]' on its own line")
+        if action == "send":
+            sub.add_argument("--steer", action="store_true",
+                             help="If the session is busy, insert the message into its current turn instead of queueing it")
+            sub.add_argument("--supersede", action="store_true",
+                             help="First delete this --from sender's earlier messages still queued for the session")
+            sub.add_argument("--interrupt", action="store_true",
+                             help="First stop the session's current turn; only when that work is known to be obsolete")
         if action in {"run", "launch"}:
             sub.add_argument("--record", required=action == "run", help="Append-only local exit/notification JSONL")
             sub.epilog = ("Task command follows --, for example: launch NAME -- python task.py" if action == "launch" else
@@ -1436,6 +1552,11 @@ def main(argv=None) -> int:
     sub.add_argument("--comment", help="Ticket comment (default: the message itself)")
     sub.add_argument("--no-comment", action="store_true", help="Send only; leave no ticket comment")
     sub.add_argument("--to", help="Executor session UUID or name, when the ticket has no Codex owner line")
+    sub.add_argument("--queue", action="store_true",
+                     help="Queue behind the executor's current turn and keep earlier queued relays "
+                          "(default: insert into the current turn and delete them)")
+    sub.add_argument("--interrupt", action="store_true",
+                     help="First stop the executor's current turn; only when that work is known to be obsolete")
     sub.add_argument("--socket", help="Existing local App Server Unix socket path")
     sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD")
     sub.add_argument("pr", type=int, help="PR number")
@@ -1524,6 +1645,8 @@ def main(argv=None) -> int:
         if args.action in {"send", "run"}:
             args.message = message_text(args.message, args.message_file, args.sender)
         if args.action == "send":
+            if args.supersede and args.sender is None:
+                parser.error("--supersede needs --from, to tell whose queued messages to delete")
             return send_task(args)
         args.thread_id = resolve_target(args.thread_id, args.issue, args.socket)
         if args.action == "run":

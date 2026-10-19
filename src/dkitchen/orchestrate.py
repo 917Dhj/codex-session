@@ -2,7 +2,8 @@
 
 - merge: merge a reviewed PR at the reviewed HEAD and print the merge commit; refuses drafts, moved HEADs,
   and tickets whose executor's latest status block is not waiting on the orchestrator.
-- relay: send a message to a ticket's executor with `ding send`, then leave the matching ticket comment.
+- relay: send a message to a ticket's executor with `ding send`, then leave the matching ticket comment. By default
+  the message goes into the executor's current turn and replaces the orchestrator's relays still queued for it.
 - log: post one entry to the orchestrator log, stamped with the current UTC time.
 Every comment is signed with the orchestrator's station name, so `ding watch` can tell who wrote it.
 """
@@ -130,7 +131,16 @@ def relay(args, config: Config) -> int:
     repo = config.repository()
     message = ding.message_text(args.message, args.message_file, None)
     target = args.to or f"{repo}#{args.ticket}"
-    send = ["send", target, "--from", config.stations.orchestrator, "--message", signed(message, config)]
+    queue = getattr(args, "queue", False)
+    text = signed(message, config)
+    if not queue:
+        signature = config.stations.signature(config.stations.orchestrator)
+        text = f"{signature}{config.relay.superseding}\n{text[len(signature.rstrip()):].lstrip()}"
+    send = ["send", target, "--from", config.stations.orchestrator, "--message", text]
+    if not queue:
+        send += ["--steer", "--supersede"]
+    if getattr(args, "interrupt", False):
+        send += ["--interrupt"]
     if args.socket:
         send += ["--socket", args.socket]
     if ding.main(send):
