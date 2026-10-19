@@ -276,6 +276,7 @@ Then end your turn. The wake-up will come.
 Options:
 
 - `--message TEXT`, `--message-file PATH`, or `--message -` set your own wake-up text. `--from NAME` works as in `send`.
+- `--progress PATH` names the task's `progress.json` (schema `progress-v1`: `current` stage with `done`/`total`, `rate_per_hour`, `eta`, `updated`). `ding board` then adds a PROGRESS column, such as `answer 120/500 34/h ETA 10-20 05:10`, and marks a running task whose file has not been updated for 10 minutes `STALE 14m`. `ding` only reads the file; the task writes it.
 - `--record PATH` writes the job's record somewhere you choose.
 - `--socket PATH` picks the App Server.
 

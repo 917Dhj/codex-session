@@ -545,7 +545,7 @@ def run_registry() -> Path:
 
 
 @contextmanager
-def registered_run(thread_id: str, record: Path) -> Iterator[str]:
+def registered_run(thread_id: str, record: Path, progress: Path | None = None) -> Iterator[str]:
     registry = run_registry()
     registry.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     registry.parent.chmod(0o700)
@@ -566,6 +566,7 @@ def registered_run(thread_id: str, record: Path) -> Iterator[str]:
                 "event": "run_start", "run_id": run_id, "thread_id": thread_id,
                 "record": str(record.resolve()), "pid": os.getpid(),
                 "started_ns": time.time_ns(), "cwd": str(Path.cwd()),
+                **({"progress": str(progress.resolve())} if progress is not None else {}),
             })
         yield run_id
 
@@ -589,7 +590,9 @@ def latest_runs() -> dict[str, dict]:
                     or str(UUID(run["thread_id"])) != run["thread_id"]
                     or not Path(run["record"]).is_absolute() or not Path(run["cwd"]).is_absolute()
                     or type(run.get("pid")) is not int or run["pid"] <= 0
-                    or type(run.get("started_ns")) is not int or run["started_ns"] <= 0):
+                    or type(run.get("started_ns")) is not int or run["started_ns"] <= 0
+                    or "progress" in run and (not isinstance(run["progress"], str)
+                                              or not Path(run["progress"]).is_absolute())):
                 raise ValueError("invalid run_start")
         except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
             print(f"ding: invalid run registry row {number} ({registry}): {exc}", file=sys.stderr)
@@ -653,6 +656,60 @@ def run_state(run: dict) -> str:
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"ding: run evidence unavailable ({run['record']}): {exc}", file=sys.stderr)
         return "unknown"
+
+
+STALE_PROGRESS = 600
+
+
+def short_time(value: object) -> str:
+    """An ISO time as MM-DD HH:MM in its own zone, or the text unchanged."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%m-%d %H:%M")
+    except ValueError:
+        return str(value)
+
+
+def progress_summary(path: str, now: float | None = None) -> str:
+    """One board cell from a progress-v1 file: stage done/total, rate, ETA, and a mark when it went quiet."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema") != "progress-v1":
+            return "progress: unknown format"
+    except FileNotFoundError:
+        return "progress: no file yet"
+    except (OSError, ValueError, UnicodeError):
+        return "progress: unreadable"
+    current = data.get("current") if isinstance(data.get("current"), dict) else None
+    parts = []
+    if current:
+        total = current.get("total")
+        parts.append(f"{current.get('name') or data.get('stage') or '?'} {current.get('done', '?')}/"
+                     f"{'?' if total is None else total}")
+        if current.get("failed"):
+            parts.append(f"failed {current['failed']}")
+    elif data.get("stage"):
+        parts.append(str(data["stage"]))
+    rate = data.get("rate_per_hour")
+    if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+        parts.append(f"{rate:.0f}/h" if rate >= 10 else f"{rate:.1f}/h")
+    eta = data.get("eta")
+    if isinstance(eta, dict) and (eta.get("beijing") or eta.get("utc")):
+        parts.append(f"ETA {short_time(eta.get('beijing') or eta.get('utc'))}")
+    state = data.get("state")
+    if state != "running":
+        parts.append(str(state))
+    else:
+        updated = data.get("updated", {}).get("utc") if isinstance(data.get("updated"), dict) else None
+        try:
+            age = (time.time() if now is None else now) - datetime.fromisoformat(
+                str(updated).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            age = None
+        if age is None:
+            parts.append("STALE? no update time")
+        elif age > STALE_PROGRESS:
+            parts.append(f"STALE {int(age // 60)}m")
+    return " ".join(parts) or "progress: empty"
 
 
 def executor_comment_heads(mapping: dict[str, set[int]], fields: tuple[str, ...]) -> dict[str, str]:
@@ -1052,11 +1109,15 @@ def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str
                 if all_threads or any(Path(run["cwd"]).resolve().is_relative_to(root) for root in roots)]
     mapping = issue_map()
     heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}, status) if status else {}
-    print("NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN")
+    shown = any("progress" in run for run in runs.values())
+    print("NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN" + ("\tPROGRESS" if shown else ""))
     for name, cwd, status, thread_id, head in rows:
         issue = ",".join(f"#{number}" for number in sorted(mapping.get(thread_id, set())))
         state = run_state(runs[thread_id]) if thread_id in runs else ""
-        print("\t".join(display_cell(cell) for cell in [name, cwd, status, issue, heads.get(thread_id, head), state]))
+        cells = [name, cwd, status, issue, heads.get(thread_id, head), state]
+        if shown:
+            cells.append(progress_summary(runs[thread_id]["progress"]) if "progress" in runs.get(thread_id, {}) else "")
+        print("\t".join(display_cell(cell) for cell in cells))
 
 
 def socket_path(explicit: str | None) -> str:
@@ -1434,7 +1495,8 @@ def task_exit_code(command: list[str], *, env: dict | None = None) -> tuple[int,
 
 def run_task(args, command: list[str]) -> int:
     record = Path(args.record)
-    with writer(record), registered_run(args.thread_id, record) as run_id:
+    progress = Path(args.progress) if getattr(args, "progress", None) else None
+    with writer(record), registered_run(args.thread_id, record, progress) as run_id:
         child_env = os.environ.copy()
         child_env["DING_RUN_ID"] = run_id
         code, error = task_exit_code(command, env=child_env)
@@ -1482,6 +1544,8 @@ def launch_task(args, command: list[str]) -> int:
                            f"Task {args.name} exited; inspect {record}", args.message_file, args.sender)
     inner = [os.path.abspath(sys.executable), str(Path(__file__).resolve()), "run", thread_id,
              "--record", str(record)]
+    if getattr(args, "progress", None):
+        inner += ["--progress", str(Path(args.progress).resolve())]
     launch_records.mkdir(parents=True, exist_ok=True, mode=0o700)
     launch_records.chmod(0o700)
     message_path = launch_records / f"{launch_id}.message.txt"
@@ -1595,6 +1659,7 @@ def main(argv=None) -> int:
                              help="First stop the session's current turn; only when that work is known to be obsolete")
         if action in {"run", "launch"}:
             sub.add_argument("--record", required=action == "run", help="Append-only local exit/notification JSONL")
+            sub.add_argument("--progress", help="The task's progress.json (progress-v1), shown by `ding board`")
             sub.epilog = ("Task command follows --, for example: launch NAME -- python task.py" if action == "launch" else
                           "Task command follows --, for example: run UUID --message TEXT --record exit.jsonl -- python task.py")
     sub = commands.add_parser("relay", help="Send a message to a ticket's executor, then leave it on the ticket")
