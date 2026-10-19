@@ -233,6 +233,12 @@ What happens depends on what the receiver is doing:
 
 Neither `started` nor `queued_behind_active` means the work is done. Look for the receiver's reply on the ticket.
 
+When a new decision replaces what the receiver is busy with, three options change how a busy receiver gets it:
+
+- `--steer` inserts the message into the receiver's current turn (App Server `turn/steer`), so it is read at the model's next step instead of after the turn ends. The result is `steered` (exit 0). Long shell commands are polled every few seconds, so the message usually lands within seconds even mid-command; the receiver may then abandon that command. If the turn ends just before the insertion, the message is queued as usual.
+- `--supersede` (needs `--from`) first deletes this sender's earlier messages to the same session that are still waiting in its queue, found through the `queued_submission_id`s in the send log. Each deletion is logged as a `superseded` event. Messages from other senders and the user's own queue are left alone.
+- `--interrupt` first stops the current turn, waits for the session to become idle, then starts the message as a new turn. Use it only when the current work is known to be obsolete.
+
 A queued message only runs after a normal turn end. If the receiver is waiting for user input, it runs once that turn completes; if the turn is interrupted or paused for budget, the message stays in the queue.
 
 **Before resending,** check the send log and the receiver's history. Each `send` gets a new message ID, so a blind resend can make the receiver do the work twice. `ding` itself never retries a delivery.
@@ -314,7 +320,7 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 
 | Command | Who runs it | What it does |
 | --- | --- | --- |
-| `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
+| `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. The message opens with the `[relay] superseding` line and is sent with `--steer --supersede`: it enters the executor's current turn and deletes the orchestrator's relays still queued for it. `--queue` queues it plainly instead; `--interrupt` also stops the current turn first. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
 | `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator to merge (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
 | `ding watch` | Orchestrator, in the background | Waits for GitHub activity the orchestrator must handle, prints it as one batch, and exits. See [While the user is away](../kitchen/modules/unattended.md). |
@@ -357,6 +363,9 @@ pending = "Waiting for the user"
 
 [sessions]
 name = "【#{issue}】{name}"           # session name for `ding new --issue N --name NAME`
+
+[relay]
+superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a `ding relay` message
 ```
 
 `[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.

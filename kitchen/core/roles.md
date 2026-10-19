@@ -65,7 +65,7 @@ The orchestrator and executors act on the Type line alone: an actionable reply i
 
 ## Relaying
 
-The orchestrator messages an executor with `ding relay <ticket> --message … [--comment …]`. It sends with `ding send`, and only after delivery is confirmed leaves the matching comment on the ticket. See [messaging.md](messaging.md) for `ding`. Afterwards it tells the user what it sent to which ticket. When relaying an approval, state the decision and its scope in your own words rather than quoting the user. Relaying a message never counts as approving it<!-- module:run-budgets -->; approvals follow [run-budgets.md](run-budgets.md)<!-- /module:run-budgets -->.
+The orchestrator messages an executor with `ding relay <ticket> --message … [--comment …]`. It sends with `ding send`, and only after delivery is confirmed leaves the matching comment on the ticket. Each relay is a new decision: it enters the executor's current turn and replaces the orchestrator's relays still queued for it, so the executor never works through instructions that are already obsolete. To add to, rather than replace, what is queued, relay with `--queue`. See [messaging.md](messaging.md) for `ding`. Afterwards it tells the user what it sent to which ticket. When relaying an approval, state the decision and its scope in your own words rather than quoting the user. Relaying a message never counts as approving it<!-- module:run-budgets -->; approvals follow [run-budgets.md](run-budgets.md)<!-- /module:run-budgets -->.
 
 The orchestrator, designer, and verifier message each other directly, without asking the user first.
 
