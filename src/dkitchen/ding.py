@@ -1637,12 +1637,17 @@ def main(argv=None) -> int:
     sub.add_argument("--stale-hours", type=float, default=6, help="Executor silence that counts as stale (default: 6)")
     sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale checks (default: 3600)")
     sub.add_argument("--max-errors", type=int, default=10, help="Consecutive failed polls before exiting (default: 10)")
-    sub = commands.add_parser("check-refs", help="Check `file:line` and sha256 references in a draft comment")
+    sub = commands.add_parser("check-refs", help="Check `file:line`, sha256, ticket, PR, and comment references "
+                                                 "in a draft comment")
     sub.add_argument("draft", help="Draft comment file")
     where = sub.add_mutually_exclusive_group()
     where.add_argument("--ref", default="origin/main", help="Git revision the references point into (default: origin/main)")
     where.add_argument("--root", type=Path, help="Directory to read files from instead, such as a worktree or output folder")
     sub.add_argument("--tolerance", type=int, default=0, help="Lines around a reference that may hold its name (default: 0)")
+    sub.add_argument("--repo", help="Repository that bare #N numbers refer to (default: repo in .dkitchen.toml, "
+                                    "then the one gh sees)")
+    sub.add_argument("--offline", action="store_true", help="Do not ask GitHub; list ticket and link references as "
+                                                            "not checked")
     argv = list(sys.argv[1:] if argv is None else argv)
     command = []
     if argv and argv[0] in {"run", "launch"} and "--" in argv:
