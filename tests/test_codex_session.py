@@ -397,6 +397,7 @@ def test_new_issue_formats_name_and_asks_for_owner_line(tmp_path, monkeypatch, c
 
     for function in ("gh_json", "gh_records", "github_repository"):
         monkeypatch.setattr(ding, function, lambda *a: pytest.fail("must not read GitHub"))
+    monkeypatch.setattr(ding, "ticket_owners", lambda repo, number: [])
     monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
     assert ding.main(["new", "--cwd", str(cwd), "--issue", "57", "--name", "Ablation {seed}",
                       "--message", "Brief", "--socket", "/test.sock"]) == 0
@@ -3378,3 +3379,64 @@ def test_supersede_requires_a_sender(capsys):
     with pytest.raises(SystemExit):
         ding.main(["send", THREAD_ID, "--supersede", "--message", "new"])
     assert "--supersede needs --from" in capsys.readouterr().err
+
+
+def owned_ticket_server(monkeypatch, owners, live):
+    requests = []
+
+    def call(method, params):
+        requests.append((method, params))
+        if method == "thread/list":
+            return {"data": [thread(thread_id=owner, name="【#57】old") for owner in live], "nextCursor": None}
+        return {"thread/start": {"thread": {"id": THREAD_ID}}, "thread/name/set": {},
+                "turn/start": {"turn": {"id": "turn-1", "status": "inProgress"}}}[method]
+
+    monkeypatch.setattr(ding, "ticket_owners", lambda repo, number: list(owners))
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(call))
+    return requests
+
+
+@pytest.mark.parametrize("live, replace, code", [([OTHER_ID], False, 1), ([], False, 0), ([OTHER_ID], True, 0)])
+def test_new_issue_refuses_a_second_live_executor_unless_replacing(tmp_path, monkeypatch, capsys, live, replace, code):
+    cwd = ticket_repo(tmp_path, None)
+    requests = owned_ticket_server(monkeypatch, [OTHER_ID], live)
+    argv = ["new", "--cwd", str(cwd), "--issue", "57", "--name", "Run", "--message", "Brief", "--socket", "/s"]
+    assert ding.main(argv + (["--replace"] if replace else [])) == code
+    started = any(method == "thread/start" for method, _ in requests)
+    assert started == (code == 0)
+    if code:
+        assert "--parent 57" in capsys.readouterr().err
+
+
+def test_new_parent_opens_a_sub_ticket_and_owns_it(tmp_path, monkeypatch, capsys):
+    cwd = ticket_repo(tmp_path, None)
+    (cwd / ".dkitchen.toml").write_text('repo = "example/project"\n[sessions]\nparent = "母票：#{parent}"\n',
+                                         encoding="utf-8")
+    gh = []
+
+    def gh_json(arguments):
+        gh.append(arguments)
+        return {"number": 90, "id": 9000} if arguments[1] == "repos/example/project/issues" else {}
+
+    monkeypatch.setattr(ding, "gh_json", gh_json)
+    requests = owned_ticket_server(monkeypatch, [], [])
+    assert ding.main(["new", "--cwd", str(cwd), "--parent", "57", "--title", "27B v9", "--name", "27B",
+                      "--message", "Brief", "--socket", "/s"]) == 0
+    assert gh[0][-4:] == ["-f", "title=27B v9", "-f", "body=母票：#57\n"]
+    assert gh[1] == ["api", "repos/example/project/issues/57/sub_issues", "-X", "POST", "-F", "sub_issue_id=9000"]
+    assert requests[1] == ("thread/name/set", {"threadId": THREAD_ID, "name": "【#90】27B"})
+    assert "You own ticket example/project#90." in requests[2][1]["input"][0]["text"]
+
+
+def test_new_parent_attach_failure_starts_no_session(tmp_path, monkeypatch, capsys):
+    cwd = ticket_repo(tmp_path, None)
+
+    def gh_json(arguments):
+        if "sub_issues" in arguments[1]:
+            raise ValueError("gh failed: 404")
+        return {"number": 90, "id": 9000}
+
+    monkeypatch.setattr(ding, "gh_json", gh_json)
+    monkeypatch.setattr(ding, "app_server", lambda path: pytest.fail("no session before the ticket is attached"))
+    assert ding.main(["new", "--cwd", str(cwd), "--parent", "57", "--name", "27B", "--message", "Brief"]) == 1
+    assert "rerun with --issue 90" in capsys.readouterr().err

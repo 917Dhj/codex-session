@@ -75,8 +75,9 @@ def role(body: str, config: Config) -> str:
 
 
 def fields(body: str, config: Config) -> dict[str, str]:
-    """The status block's fields, with half- or full-width colons."""
-    pairs = (re.split(r"[:：]", line, maxsplit=1) for line in body.splitlines()[:len(config.status.fields)])
+    """The status block's fields, with half- or full-width colons; an unlisted Pending merge field may follow."""
+    count = len(config.status.fields) + (config.status.pending_merge not in config.status.fields)
+    pairs = (re.split(r"[:：]", line, maxsplit=1) for line in body.splitlines()[:count])
     return {pair[0].strip(): pair[1].strip() for pair in pairs if len(pair) == 2}
 
 

@@ -15,9 +15,10 @@ Status: in progress | waiting on design | waiting on user | blocked | done
 Waiting on: <who, for what; or none>
 Key numbers: <the numbers the reader needs, on one line>
 Next: <what happens next, and who does it>
+Pending merge: <optional: PR#N, … that passed review and need nothing more from you>
 ```
 
-Each field takes one line. Digests, process IDs, and paths go inside `<details>`.
+Each field takes one line. List a PR under *Pending merge* once it needs nothing more from you; the orchestrator may then merge it while you work on something else. Drop the line when there is none. Digests, process IDs, and paths go inside `<details>`.
 
 A designer reply marked `Type: proposal, awaiting user` waits for the user: act on it only after the user decides.
 

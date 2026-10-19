@@ -19,6 +19,7 @@ Every key is optional. The defaults match the English templates in kitchen/:
     blocked = "blocked"
     done = "done"
     none = "none"                        # a Waiting on value naming nobody
+    pending_merge = "Pending merge"      # optional field listing PRs ready to merge, e.g. "PR#12, PR#14"
 
     [labels]
     prefix = "status:"
@@ -30,6 +31,7 @@ Every key is optional. The defaults match the English templates in kitchen/:
 
     [sessions]
     name = "【#{issue}】{name}"           # `ding new --issue N --name NAME`; also {repo}
+    parent = "Parent: #{parent}"         # first line of a sub-ticket opened by `ding new --parent N`
 
     [relay]
     superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a default relay
@@ -74,6 +76,7 @@ class Status:
     blocked: str = "blocked"
     done: str = "done"
     none: str = "none"
+    pending_merge: str = "Pending merge"
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,7 @@ class Log:
 @dataclass(frozen=True)
 class Sessions:
     name: str = "【#{issue}】{name}"
+    parent: str = "Parent: #{parent}"
 
     def session_name(self, *, issue: int, name: str, repo: str) -> str:
         return self.name.format(issue=issue, name=name, repo=repo)
@@ -164,6 +168,13 @@ def section(cls, values: object, name: str):
             value = tuple(item.strip() for item in value)
         elif key == "name" and cls is Sessions:
             value = session_template(value)
+        elif key == "parent" and cls is Sessions:
+            if not isinstance(value, str) or "{parent}" not in value:
+                raise ValueError(f"{FILE}: [sessions] parent must be a string holding {{parent}}")
+            try:
+                value.format(parent=1)
+            except (ValueError, KeyError, IndexError) as exc:
+                raise ValueError(f"{FILE}: [sessions] parent is not a valid template: {exc}") from exc
         elif key == "issue":
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{FILE}: [{name}] issue must be a positive issue number")

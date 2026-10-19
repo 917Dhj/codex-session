@@ -74,6 +74,14 @@ You own ticket 917Dhj/my-repo#57. Before anything else, post a comment on it wit
 
 Until that comment is posted, `'#57'` does not resolve to the new session; pass its UUID instead.
 
+A ticket has one executor. `--issue N` reads the ticket's `Codex owner:` lines first and refuses when any of those sessions is not archived. Give each run its own sub-ticket instead, or pass `--replace` when the ticket really changes hands (the new owner line then wins).
+
+`--parent N` opens that sub-ticket for you: a new ticket titled `--title` (default: `--name`), whose body is the `[sessions] parent` line (default `Parent: #N`), attached to `#N` as a GitHub sub-issue. The new session then owns the sub-ticket exactly as with `--issue`. This is the one form of `new` that writes to GitHub. If the ticket opens but cannot be attached, no session starts, and the error names the new ticket.
+
+```bash
+ding new --cwd /work/worktree-57 --parent 57 --title '27B v9 run' --name '27B v9' --message-file brief.md
+```
+
 After the App Server accepts the first turn, `new` prints only the session UUID to stdout and exits with code 0. It does not wait for the reply. Use that UUID to continue or inspect the session:
 
 ```bash
@@ -321,12 +329,12 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 | Command | Who runs it | What it does |
 | --- | --- | --- |
 | `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. The message opens with the `[relay] superseding` line and is sent with `--steer --supersede`: it enters the executor's current turn and deletes the orchestrator's relays still queued for it. `--queue` queues it plainly instead; `--interrupt` also stops the current turn first. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
-| `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator to merge (see below). Then it confirms the merge and prints the merge commit. |
+| `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator or lists PR #57 as pending merge (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
 | `ding watch` | Orchestrator, in the background | Waits for GitHub activity the orchestrator must handle, prints it as one batch, and exits. See [While the user is away](../kitchen/modules/unattended.md). |
 | `ding check-refs draft.md` | Verifier | Checks every `` `file:line` `` in a draft comment (a name written right next to it must appear on that line) and every `sha256`, against `origin/main` or `--root DIR`. Exits 1 when something is wrong. |
 
-**Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
+**Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator, or its optional `[status] pending_merge` field (default *Pending merge*, for example `Pending merge: PR#57, PR#58`) lists this PR. The executor lists a PR there once it needs nothing more on it, so the merge does not wait for the executor to come back from its next task. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
 `ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. Run `ding watch --help` for the timing options.
 
@@ -352,6 +360,7 @@ waiting_on_design = "waiting on design"
 blocked = "blocked"
 done = "done"
 none = "none"                        # a "Waiting on" value that names nobody
+pending_merge = "Pending merge"      # optional field: PRs the executor is ready to have merged
 
 [labels]
 prefix = "status:"
@@ -363,6 +372,7 @@ pending = "Waiting for the user"
 
 [sessions]
 name = "【#{issue}】{name}"           # session name for `ding new --issue N --name NAME`
+parent = "Parent: #{parent}"         # first line of a sub-ticket from `ding new --parent N`
 
 [relay]
 superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a `ding relay` message
