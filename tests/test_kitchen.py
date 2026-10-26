@@ -246,6 +246,22 @@ def test_merge_finds_the_one_ticket_with_executor_comments(tmp_path, monkeypatch
         f"repos/o/r/issues/{number}/comments?per_page=100" for number in tickets]
 
 
+CLAUDE = "Claude session: ToM agent person experience record implementation"
+
+
+@pytest.mark.parametrize("bodies, code", [
+    ((f"状态：进行中\n在等：总编排审合PR7\n关键数字：1\n下一步：合入后冒烟\n{CLAUDE}",), 0),
+    ((WAITING, f"状态：进行中\n在等：无\n关键数字：1\n下一步：还在改PR7\n{CLAUDE}"), 1),
+    ((f"状态：完成\n在等：无\n关键数字：1\n下一步：交给执行者\n{CLAUDE}", WAITING), 0),
+])
+def test_merge_reads_claude_and_codex_executors_by_the_latest_comment(tmp_path, monkeypatch, capsys, bodies, code):
+    loaded = settings(tmp_path, CHINESE)
+    responses = [view(), thread_comments("总设计：答复", *bodies)] + ([(0, ""), view("MERGED")] if code == 0 else [])
+    monkeypatch.setattr(orchestrate, "call", fake_call(responses, []))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", ticket=1020, no_ticket=False), loaded) == code
+    assert f"#1020 latest executor status (https://c/{len(bodies)}):" in capsys.readouterr().out
+
+
 def test_merge_refuses_a_ticket_without_executor_comments(tmp_path, monkeypatch, capsys):
     loaded = settings(tmp_path, CHINESE)
     monkeypatch.setattr(orchestrate, "call", fake_call([view(), thread_comments("总设计：答复")], []))
@@ -468,4 +484,6 @@ def test_a_quoted_session_signature_signs_nothing(tmp_path, text):
                 "| request body | ok: it starts with the status block and contains `Codex session:` |\n")
     assert watch.role(verifier, loaded) == stations.verifier
     assert watch.role("I checked it; the body has `Codex session:` in it.", loaded) == stations.user
+    assert watch.role("Quoting `Claude session:` signs nothing.", loaded) == stations.user
+    assert watch.role("Status: done\nWaiting on: none\n\nClaude session: impl", loaded) == stations.executor
     assert watch.role(executor("Status: done\nWaiting on: none\nKey numbers: 1\nNext: merge"), loaded) == stations.executor
