@@ -15,7 +15,7 @@ When a session is replaced, edit only this table. Everywhere else, write the sta
 - **Orchestrator** (Claude Code, the strongest model available): reports progress, starting from `ding board`. Tells the user facts and schedules.
 - **Designer** (Claude Code, the strongest model available): writes tickets.<!-- module:model-text --> Owns model-visible text ([model-text.md](model-text.md)).<!-- /module:model-text -->
 - **Verifier** (Claude Code, a cheaper model): checks facts and makes no decisions. Reads code and data and runs scripts that call no model. Runs no models and edits no repo files.
-- **Executor** (Codex): one sub-ticket and one session per run, in its own worktree (`ding new --parent <ticket>`). Carries out the sub-ticket. The parent ticket holds only the design, rulings, and summary; execution and run requests go on the sub-ticket.<!-- module:model-text --> Stops and hands back to the designer when it needs new or changed model-visible text; copies text given in the ticket verbatim.<!-- /module:model-text -->
+- **Executor** (Codex): one sub-ticket and one session per run, in its own worktree (`ding new --parent <ticket>`). Carries out the sub-ticket. A ticket may instead name a Claude Code session as its executor; it follows the same executor rules and signs its comments as [issue-tracker.md](issue-tracker.md) says. The parent ticket holds only the design, rulings, and summary; execution and run requests go on the sub-ticket.<!-- module:model-text --> Stops and hands back to the designer when it needs new or changed model-visible text; copies text given in the ticket verbatim.<!-- /module:model-text -->
 
 ## Who owns what
 
@@ -75,7 +75,7 @@ Other sessions are messaged only when the user explicitly asks. Otherwise, hand 
 
 All stations post from one GitHub account, so comments are told apart by how they are written<!-- module:unattended -->, which is also how the issue watcher tells who wrote what<!-- /module:unattended -->:
 
-- Executor comments carry a `Codex session:` line.
+- Executor comments carry a `Codex session:` line, or a `Claude session:` line when a Claude Code session is the executor.
 - The designer, verifier, and orchestrator start the first line with their station name: `Designer:`, `## Verifier:`, `Orchestrator:`.
 - Everything else is the user's. The user's comments never start with a station name.
 

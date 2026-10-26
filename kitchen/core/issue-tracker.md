@@ -8,6 +8,8 @@ When you take over a ticket, post a comment with the line `Codex owner: <CODEX_T
 
 Every comment you post carries `Codex session: <CODEX_THREAD_ID>`, with your current session's ID.
 
+A Claude Code session working as the executor signs with `Claude session: <its session name>` instead and posts no `Codex owner:` line, since `ding` cannot message a Claude Code session. Everything else here applies to it unchanged: it opens every comment with the status block, and the orchestrator merges its PRs only while that block waits on the orchestrator or lists the PR under *Pending merge*. When Claude Code and Codex sessions take turns on one ticket, the latest executor comment of either kind is the one that counts.
+
 Open every comment with the status block, and put the details after it inside `<details>`:
 
 ```text

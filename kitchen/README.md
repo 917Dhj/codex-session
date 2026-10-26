@@ -30,7 +30,7 @@ The rules and the `ding` commands share one vocabulary. The defaults are below. 
 | Word | Default | Read by |
 | --- | --- | --- |
 | Station names | Orchestrator, Designer, Verifier, Executor | Everyone |
-| Signatures | A comment's first line starts with `Orchestrator:`, `Designer:`, or `Verifier:` (Markdown heading marks allowed). Executor comments carry a `Codex session:` line. Anything else is the user's. | `ding watch`, `ding relay`, `ding log` |
+| Signatures | A comment's first line starts with `Orchestrator:`, `Designer:`, or `Verifier:` (Markdown heading marks allowed). Executor comments carry a `Codex session:` line (`Claude session:` for a Claude Code executor). Anything else is the user's. | `ding watch`, `ding relay`, `ding log` |
 | Owner line | `Codex owner: <session id>` | `ding` targets |
 | Status fields | `Status`, `Waiting on`, `Key numbers`, `Next` | `ding board --status`, `ding watch` |
 | Status values | `in progress`, `waiting on design`, `waiting on user`, `blocked`, `done` | `ding watch` |

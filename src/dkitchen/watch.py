@@ -63,7 +63,8 @@ def issue_number(url: str) -> int:
 
 def role(body: str, config: Config) -> str:
     """The station named at the start of the first line; otherwise the executor by a line starting with its
-    session signature; else the user. A session signature quoted inside a line signs nothing."""
+    session signature (`Codex session:`, or `Claude session:` for an executor run in Claude Code); else the user.
+    A session signature quoted inside a line signs nothing."""
     stations = config.stations
     first = next((line for line in body.splitlines() if line.strip()), "")
     first = re.sub(r"^[\s#*>]+", "", first)
@@ -71,7 +72,7 @@ def role(body: str, config: Config) -> str:
                    if first.startswith(name)), None)
     if signed:
         return signed
-    return stations.executor if re.search(r"(?m)^[ \t]*Codex session:", body) else stations.user
+    return stations.executor if re.search(r"(?m)^[ \t]*(?:Codex|Claude) session:", body) else stations.user
 
 
 def fields(body: str, config: Config) -> dict[str, str]:
