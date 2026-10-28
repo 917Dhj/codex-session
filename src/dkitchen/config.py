@@ -35,6 +35,11 @@ Every key is optional. The defaults match the English templates in kitchen/:
 
     [relay]
     superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a default relay
+
+    [rule]                               # `ding rule`: the designer's reply opens with the designer's signature,
+    type_label = "Type"                  # then a line `<type_label><separator><one of types>`
+    types = ["actionable", "proposal, awaiting user", "record"]
+    notify = "#{ticket} answered, see the ticket {url}"   # message `--notify` sends; also {first_line}
 """
 from __future__ import annotations
 
@@ -105,6 +110,13 @@ class Relay:
     superseding: str = "New decision; it replaces earlier relays not yet carried out."
 
 
+@dataclass(frozen=True)
+class Rule:
+    type_label: str = "Type"
+    types: tuple[str, ...] = ("actionable", "proposal, awaiting user", "record")
+    notify: str = "#{ticket} answered, see the ticket {url}"
+
+
 SESSION_FIELDS = ("issue", "name", "repo")
 
 
@@ -139,6 +151,7 @@ class Config:
     log: Log = Log()
     sessions: Sessions = Sessions()
     relay: Relay = Relay()
+    rule: Rule = Rule()
 
     def repository(self) -> str:
         """The configured repository, or the one gh sees from the repository root."""
@@ -162,10 +175,18 @@ def section(cls, values: object, name: str):
     result = cls()
     for key, value in values.items():
         default = getattr(result, key)
-        if key == "fields":
+        if key in {"fields", "types"}:
             if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() for item in value):
-                raise ValueError(f"{FILE}: [{name}] fields must be a nonempty list of field names")
+                raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty list of "
+                                 f"{'field names' if key == 'fields' else 'words'}")
             value = tuple(item.strip() for item in value)
+        elif key == "notify":
+            if not isinstance(value, str) or "{url}" not in value:
+                raise ValueError(f"{FILE}: [rule] notify must be a string holding {{url}}")
+            try:
+                value.format(ticket=1, url="u", first_line="l")
+            except (ValueError, KeyError, IndexError) as exc:
+                raise ValueError(f"{FILE}: [rule] notify is not a valid template: {exc}") from exc
         elif key == "name" and cls is Sessions:
             value = session_template(value)
         elif key == "parent" and cls is Sessions:
@@ -200,7 +221,8 @@ def load(cwd: Path | None = None) -> Config:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
-    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay}
+    sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay,
+                "rule": Rule}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

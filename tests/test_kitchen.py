@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dkitchen import config, ding, orchestrate, refs, watch
+from dkitchen import config, ding, orchestrate, refs, rule, watch
 
 
 CHINESE = """
@@ -487,3 +487,235 @@ def test_a_quoted_session_signature_signs_nothing(tmp_path, text):
     assert watch.role("Quoting `Claude session:` signs nothing.", loaded) == stations.user
     assert watch.role("Status: done\nWaiting on: none\n\nClaude session: impl", loaded) == stations.executor
     assert watch.role(executor("Status: done\nWaiting on: none\nKey numbers: 1\nNext: merge"), loaded) == stations.executor
+
+
+RULING = CHINESE + """
+[rule]
+type_label = "类型"
+types = ["可执行", "方案，等用户", "记录"]
+notify = "#{ticket} 已答复，见票 {url}"
+"""
+REPLY = "总设计：结论\n类型：可执行\n\n正文 见 `pkg/work.py:9` holds `Ledger`\n"
+URL = "https://github.com/o/r/issues/42#issuecomment-900"
+
+
+def comment_pages(*bodies):
+    return 0, json.dumps([[{"id": 100 + index, "body": body, "created_at": f"2026-10-28T0{index}:00:00Z",
+                            "html_url": f"https://github.com/o/r/issues/42#issuecomment-{100 + index}"}
+                           for index, body in enumerate(bodies)]])
+
+
+@pytest.fixture
+def ruling(tree, tmp_path, monkeypatch):
+    """`ding rule` run offline in a Chinese-vocabulary repo whose gh and ding send are doubles."""
+    (tmp_path / config.FILE).write_text(RULING, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    state = SimpleNamespace(calls=[], sends=[], send_code=0, draft=tmp_path / "draft.md")
+    state.draft.write_text(REPLY, encoding="utf-8")
+
+    def run(responses, *options, text=None):
+        if text is not None:
+            state.draft.write_text(text, encoding="utf-8")
+        monkeypatch.setattr(rule, "call", fake_call(list(responses), state.calls))
+        return real_main(["rule", "42", str(state.draft), "--root", str(tree), "--offline", *options])
+
+    real_main = ding.main
+
+    def main(argv):
+        if argv[0] != "send":
+            return real_main(argv)
+        state.sends.append(argv)
+        print("started")
+        return state.send_code
+
+    monkeypatch.setattr(ding, "main", main)
+
+    state.run = run
+    return state
+
+
+def test_rule_posts_and_prints_only_the_url(ruling, capsys):
+    assert ruling.run([comment_pages("用户：请裁定", "核查：通过"), (0, URL + "\n")], "--reply-to", "101") == 0
+    captured = capsys.readouterr()
+    assert captured.out == URL + "\n"
+    assert "latest comment" not in captured.err
+    assert ruling.calls[0][:4] == ("gh", "api", "--paginate", "--slurp")
+    assert ruling.calls[1] == ("gh", "issue", "comment", "42", "--repo", "o/r", "--body-file", str(ruling.draft))
+    assert ruling.sends == []
+
+
+def test_rule_without_reply_to_shows_the_latest_comment(ruling, capsys):
+    assert ruling.run([comment_pages("用户：请裁定", "核查：通过\n第二行"), (0, URL)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == URL + "\n"
+    assert "latest comment on #42: 2026-10-28T01:00:00Z '核查：通过'" in captured.err
+
+
+@pytest.mark.parametrize("text, message", [
+    ("核查：结论\n类型：可执行\n", "line 1 must start with '总设计：'"),
+    ("总设计：结论\n", "line 2 must start with '类型：'"),
+    ("总设计：结论\n正文\n类型：可执行\n", "line 2 must start with '类型：'"),
+    ("总设计：结论\n类型：大概可以\n", "must be one of: 可执行, 方案，等用户, 记录"),
+])
+def test_rule_stops_when_the_first_two_lines_are_wrong(ruling, capsys, text, message):
+    assert ruling.run([], text=text) == 1
+    assert message in capsys.readouterr().err
+    assert ruling.calls == [] and ruling.sends == []
+
+
+def test_rule_accepts_each_type(ruling, capsys):
+    for kind in ("方案，等用户", "记录"):
+        assert ruling.run([comment_pages("用户：问"), (0, URL)], text=f"总设计：结论\n类型：{kind}\n") == 0
+
+
+def test_rule_stops_on_a_wrong_reference_and_posts_nothing(ruling, capsys):
+    assert ruling.run([], text="总设计：结论\n类型：可执行\n`pkg/work.py:6` holds `Ledger`\n") == 1
+    captured = capsys.readouterr()
+    assert "wrong: line 3 `pkg/work.py:6`" in captured.err and "Nothing posted" in captured.err
+    assert captured.out == "" and ruling.calls == [] and ruling.sends == []
+
+
+def test_rule_stops_when_a_comment_came_after_the_one_answered(ruling, capsys):
+    pages = comment_pages("用户：请裁定", "用户：补充一点", "核查：新数字")
+    link = "https://github.com/o/r/issues/42#issuecomment-100"
+    assert ruling.run([pages], "--reply-to", link, "--notify", "#42") == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and len(ruling.calls) == 1 and ruling.sends == []
+    assert "newer: https://github.com/o/r/issues/42#issuecomment-101 '用户：补充一点'" in captured.err
+    assert "newer: https://github.com/o/r/issues/42#issuecomment-102 '核查：新数字'" in captured.err
+    assert "--force" in captured.err
+
+
+def test_rule_force_posts_despite_newer_comments(ruling, capsys):
+    assert ruling.run([comment_pages("用户：请裁定", "用户：补充一点"), (0, URL)], "--reply-to", "100", "--force") == 0
+    captured = capsys.readouterr()
+    assert captured.out == URL + "\n" and "posting anyway" in captured.err
+
+
+@pytest.mark.parametrize("reply_to, message", [
+    ("999", "comment 999 is not among"),
+    ("https://github.com/o/r/issues/43#issuecomment-100", "is not on o/r#42"),
+    ("https://github.com/o/r/issues/42", "not an issue comment link"),
+])
+def test_rule_refuses_a_reply_target_that_is_not_on_the_ticket(ruling, capsys, reply_to, message):
+    assert ruling.run([comment_pages("用户：请裁定")], "--reply-to", reply_to) == 1
+    assert message in capsys.readouterr().err and len(ruling.calls) <= 1
+
+
+def test_rule_reports_a_failed_notification_but_keeps_the_comment(ruling, capsys):
+    ruling.send_code = 1
+    assert ruling.run([comment_pages("用户：请裁定"), (0, URL)], "--reply-to", "100", "--notify", "#42") == 1
+    captured = capsys.readouterr()
+    assert captured.out == URL + "\n"
+    assert "the comment stays" in captured.err and "failed" in captured.err
+    assert ruling.sends == [["send", "#42", "--from", "总设计", "--message", f"#42 已答复，见票 {URL}\n总设计：结论"]]
+    assert [call[:3] for call in ruling.calls] == [("gh", "api", "--paginate"), ("gh", "issue", "comment")]
+
+
+def test_rule_notifies_a_codex_session_and_keeps_stdout_clean(ruling, capsys):
+    assert ruling.run([comment_pages("用户：请裁定"), (0, URL)], "--notify", "00000000-0000-4000-8000-000000000001") == 0
+    captured = capsys.readouterr()
+    assert captured.out == URL + "\n" and "started" in captured.err
+    assert ruling.sends[0][:2] == ["send", "00000000-0000-4000-8000-000000000001"]
+
+
+def test_rule_refuses_a_claude_session_before_posting(ruling, capsys):
+    assert ruling.run([], "--notify", "uds:/tmp/cc-socks/1.sock") == 1
+    assert "cannot message a Claude Code session" in capsys.readouterr().err
+    assert ruling.calls == [] and ruling.sends == []
+
+
+def test_rule_reports_a_failed_post_and_a_non_url_answer(ruling, capsys):
+    assert ruling.run([comment_pages("用户：问"), (1, "")]) == 1
+    assert "comment failed: boom" in capsys.readouterr().err
+    assert ruling.run([comment_pages("用户：问"), (0, "created\n")], "--notify", "#42") == 1
+    assert "did not print a comment link" in capsys.readouterr().err and ruling.sends == []
+
+
+BODY = "票面\n第二行\n"
+
+
+def test_edit_body_writes_only_over_the_baseline_and_verifies(ruling, tmp_path, capsys):
+    base = tmp_path / "base.md"
+    base.write_text(BODY, encoding="utf-8")
+    new = "新票面 `pkg/work.py:9` holds `Ledger`\n"
+    responses = [(0, BODY.replace("\n", "\r\n") + "\n"), (0, "https://github.com/o/r/issues/42\n"), (0, new)]
+    assert ruling.run(responses, "--edit-body", "--base", str(base), text=new) == 0
+    assert capsys.readouterr().out == "https://github.com/o/r/issues/42\n"
+    assert ruling.calls[0] == ("gh", "api", "repos/o/r/issues/42", "--jq", ".body")
+    assert ruling.calls[1] == ("gh", "issue", "edit", "42", "--repo", "o/r", "--body-file", str(ruling.draft))
+
+
+def test_edit_body_stops_when_the_body_changed(ruling, tmp_path, capsys):
+    base = tmp_path / "base.md"
+    base.write_text(BODY, encoding="utf-8")
+    assert ruling.run([(0, "票面\n别人改了\n")], "--edit-body", "--base", str(base), text="新票面\n") == 1
+    captured = capsys.readouterr()
+    assert "+别人改了" in captured.err and "Nothing edited" in captured.err and len(ruling.calls) == 1
+
+
+def test_edit_body_reports_a_body_that_reads_back_differently(ruling, tmp_path, capsys):
+    base = tmp_path / "base.md"
+    base.write_text(BODY, encoding="utf-8")
+    responses = [(0, BODY), (0, "https://github.com/o/r/issues/42\n"), (0, "新票面 被改了\n")]
+    assert ruling.run(responses, "--edit-body", "--base", str(base), text="新票面\n") == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "read back differs" in captured.err
+
+
+@pytest.mark.parametrize("options, error", [
+    (["--edit-body"], "--edit-body and --base go together"),
+    (["--base", "x"], "--edit-body and --base go together"),
+    (["--edit-body", "--base", "x", "--reply-to", "1"], "belong to comments"),
+    (["--force"], "--force goes with --reply-to"),
+])
+def test_rule_option_combinations(capsys, options, error):
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["rule", "42", "draft.md", *options])
+    assert exc.value.code == 2 and error in capsys.readouterr().err
+
+
+def test_rule_help_explains_the_steps(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(["rule", "--help"])
+    out = capsys.readouterr().out
+    for word in ("--reply-to", "--notify", "--edit-body", "--base", "--force", "check-refs", "SendMessage"):
+        assert word in out
+
+
+def test_check_refs_reports_each_draft_and_fails_when_any_is_wrong(tree, capsys):
+    good, bad = tree / "good.md", tree / "bad.md"
+    good.write_text("`pkg/work.py:9` holds `Ledger`\n")
+    bad.write_text("`pkg/work.py:6` holds `Ledger`\n")
+    assert ding.main(["check-refs", str(good), "--root", str(tree)]) == 0
+    assert "draft" not in json.loads(capsys.readouterr().out)
+    assert ding.main(["check-refs", str(good), str(bad), str(good), "--root", str(tree)]) == 1
+    captured = capsys.readouterr()
+    reports = [json.loads(line) for line in captured.out.splitlines()]
+    assert [(r["draft"], r["findings"]) for r in reports] == [(str(good), 0), (str(bad), 1), (str(good), 0)]
+    assert f"wrong: {bad}: line 1 `pkg/work.py:6`" in captured.err
+    assert f"{good}: checked 1 references (1 file:line): 0 wrong" in captured.err
+
+
+def test_check_refs_keeps_going_past_an_unreadable_draft(tree, capsys):
+    good = tree / "good.md"
+    good.write_text("`pkg/work.py:9` holds `Ledger`\n")
+    assert ding.main(["check-refs", str(tree / "missing.md"), str(good), "--root", str(tree)]) == 2
+    captured = capsys.readouterr()
+    assert "missing.md" in captured.err and json.loads(captured.out)["draft"] == str(good)
+
+
+@pytest.mark.parametrize("text, error", [
+    ("[rule]\ntypes = []", "types must be a nonempty list"),
+    ("[rule]\nnotify = 'no link'", "holding {url}"),
+    ("[rule]\nnotify = '{url} {oops}'", "not a valid template"),
+])
+def test_rule_config_is_checked(tmp_path, text, error):
+    with pytest.raises(ValueError, match=error):
+        settings(tmp_path, text)
+
+
+def test_rule_defaults_are_english(tmp_path):
+    loaded = settings(tmp_path)
+    assert loaded.rule.type_label == "Type" and "actionable" in loaded.rule.types
+    assert rule.format_problem("Designer: x\nType: record\n", loaded) is None
