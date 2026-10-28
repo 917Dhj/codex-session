@@ -2641,6 +2641,8 @@ def test_board_shows_notification_failure_from_matching_record(tmp_path, monkeyp
 
 @pytest.fixture
 def fake_tmux(monkeypatch):
+    from dkitchen import config
+    monkeypatch.setattr(config, "repository_root", lambda cwd=None: cwd or Path.cwd())
     calls = []
     monkeypatch.setattr(ding.shutil, "which", lambda name: "/fake/bin/tmux" if name == "tmux" else None)
     monkeypatch.setattr(ding.subprocess, "run", lambda argv, **kwargs:
@@ -3504,3 +3506,145 @@ def test_codex_starting_the_queued_message_first_is_a_clean_start(monkeypatch):
     assert result["outcome"] == "started" and result["error"] is None
     assert "queued submission not found" in result["recovered_error"]
     assert calls.count("thread/queue/start") == 1
+
+
+@pytest.fixture
+def preflight_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_THREAD_ID", THREAD_ID)
+    monkeypatch.setattr(ding.shutil, "which", lambda name: "/fake/bin/tmux")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    cwd = tmp_path / "nested cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    run = subprocess.run
+    calls = []
+
+    def dispatch(argv, **kwargs):
+        if argv[0] == "/fake/bin/tmux":
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(ding.subprocess, "run", dispatch)
+    return calls
+
+
+def preflight_config(tmp_path, script, timeout=300):
+    argv = [ding.sys.executable, "-c", script]
+    (tmp_path / ".dkitchen.toml").write_text(
+        f"[launch]\npreflight = {json.dumps(argv)}\npreflight_timeout = {timeout}\n")
+    return argv
+
+
+def preflight_event(record):
+    return json.loads(record.read_text().splitlines()[0])
+
+
+def test_preflight_receipt_environment_and_output(tmp_path, monkeypatch, preflight_launch, capfd):
+    import hashlib
+    monkeypatch.setenv("CALLER_VALUE", "inherited")
+    script = ("import json, os, sys; from pathlib import Path; "
+              "print('hook stdout', flush=True); print('hook stderr', file=sys.stderr, flush=True); "
+              "Path(os.environ['DING_PREFLIGHT_RECEIPT']).write_text(json.dumps("
+              "{'env': dict(os.environ), 'cwd': str(Path.cwd())}))")
+    argv = preflight_config(tmp_path, script)
+    command = ["task", "", "two words", "$(touch sentinel)", "中文"]
+    record = tmp_path / "custom/exit.jsonl"
+    assert ding.main(["launch", "job", "--record", str(record), "--", *command]) == 0
+    assert len(preflight_launch) == 1
+    event = preflight_event(record)
+    receipt = Path(event["receipt_path"])
+    data = json.loads(receipt.read_text())
+    assert data["cwd"] == str(Path.cwd())
+    assert data["env"]["CALLER_VALUE"] == "inherited"
+    assert data["env"]["DING_LAUNCH_NAME"] == "job"
+    assert json.loads(data["env"]["DING_LAUNCH_COMMAND"]) == command
+    assert data["env"]["DING_LAUNCH_CWD"] == str(Path.cwd())
+    assert data["env"]["DING_PREFLIGHT_RECEIPT"] == str(receipt)
+    assert "DING_PREFLIGHT_RECEIPT" not in ding.os.environ
+    assert receipt.parent == record.parent
+    assert event["argv"] == argv and event["exit_code"] == 0
+    assert event["duration_seconds"] >= 0
+    assert event["receipt_sha256"] == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    out = capfd.readouterr()
+    assert "hook stdout" in out.out and "hook stderr" in out.err
+    assert str(receipt) in out.out and event["receipt_sha256"] in out.out
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("script,timeout,code,timed_out", [
+    ("raise SystemExit(7)", 300, 7, False),
+    ("import time; time.sleep(30)", 0.05, 124, True),
+    ("pass", 300, 0, False),
+])
+def test_preflight_pass_refusal_and_timeout(tmp_path, preflight_launch, capsys, script, timeout, code, timed_out):
+    preflight_config(tmp_path, script, timeout)
+    assert ding.main(["launch", "job", "--", "task"]) == (1 if code else 0)
+    assert len(preflight_launch) == (0 if code else 1)
+    record = next((ding.run_registry().parent / "launch-records").glob("*.jsonl"))
+    event = preflight_event(record)
+    assert event["exit_code"] == code and event["timed_out"] is timed_out
+    assert event["receipt_sha256"] is None
+    assert not Path(event["receipt_path"]).exists()
+    if code:
+        err = capsys.readouterr().err
+        assert f"preflight refused (exit {code}); receipt: {event['receipt_path']}" in err
+
+
+def test_preflight_missing_executable_is_recorded(tmp_path, preflight_launch, capsys):
+    (tmp_path / ".dkitchen.toml").write_text('[launch]\npreflight = ["/no-such-preflight-executable"]')
+    assert ding.main(["launch", "job", "--", "task"]) == 1
+    assert not preflight_launch
+    record = next((ding.run_registry().parent / "launch-records").glob("*.jsonl"))
+    assert preflight_event(record)["exit_code"] == 127
+    assert "preflight refused (exit 127)" in capsys.readouterr().err
+
+
+def test_skip_preflight_records_reason_without_running_hook(tmp_path, preflight_launch):
+    preflight_config(tmp_path, "raise SystemExit(7)")
+    record = tmp_path / "exit.jsonl"
+    assert ding.main(["launch", "job", "--record", str(record),
+                      "--skip-preflight", "approved exception", "--", "task"]) == 0
+    assert len(preflight_launch) == 1
+    event = preflight_event(record)
+    assert event["skip_reason"] == "approved exception"
+    assert event["exit_code"] is None and event["duration_seconds"] == 0
+    assert not Path(event["receipt_path"]).exists()
+
+
+@pytest.mark.parametrize("arguments", [["--skip-preflight"], ["--skip-preflight", ""],
+                                      ["--skip-preflight", "   "]])
+def test_skip_preflight_requires_reason(tmp_path, preflight_launch, arguments):
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["launch", "job", *arguments, "--", "task"])
+    assert exc.value.code == 2
+    assert not preflight_launch
+    assert not ding.run_registry().exists()
+
+
+def test_preflight_record_failure_prevents_tmux(tmp_path, monkeypatch, preflight_launch):
+    preflight_config(tmp_path, "pass")
+    def fail(*args):
+        raise OSError("record unavailable")
+    monkeypatch.setattr(ding, "append_jsonl", fail)
+    assert ding.main(["launch", "job", "--", "task"]) == 1
+    assert not preflight_launch
+
+
+def test_launch_without_config_keeps_existing_behavior(tmp_path, preflight_launch):
+    assert ding.main(["launch", "job", "--", "task"]) == 0
+    assert len(preflight_launch) == 1
+    assert not list((ding.run_registry().parent / "launch-records").glob("*.jsonl"))
+    assert not list((ding.run_registry().parent / "launch-records").glob("*.preflight.json"))
+
+
+def test_refused_preflight_preserves_and_hashes_opaque_receipt(tmp_path, preflight_launch):
+    import hashlib
+    preflight_config(tmp_path, "import os; from pathlib import Path; "
+                     "Path(os.environ['DING_PREFLIGHT_RECEIPT']).write_bytes(b'not JSON'); raise SystemExit(8)")
+    assert ding.main(["launch", "job", "--", "task"]) == 1
+    assert not preflight_launch
+    record = next((ding.run_registry().parent / "launch-records").glob("*.jsonl"))
+    event = preflight_event(record)
+    assert Path(event["receipt_path"]).read_bytes() == b"not JSON"
+    assert event["receipt_sha256"] == hashlib.sha256(b"not JSON").hexdigest()

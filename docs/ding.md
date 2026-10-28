@@ -296,6 +296,47 @@ Things to know:
 - **If `launch` times out,** creation is unconfirmed. Check `tmux ls` and the record before trying again.
 - `launch` needs `CODEX_THREAD_ID`, which Codex sets in its shells. From anywhere else, use `run`.
 
+### Optional repository preflight
+
+Configure a command in the repository root's `.dkitchen.toml` to check a launch before its tmux session is created:
+
+```toml
+[launch]
+preflight = ["python", "/abs/path/check.py"]
+preflight_timeout = 300  # seconds; default 300
+```
+
+`preflight` is an argv list, executed without a shell in the launch working directory. Its stdout and stderr pass through. It inherits the caller's environment plus:
+
+| Variable | Value |
+| --- | --- |
+| `DING_LAUNCH_NAME` | The launch name |
+| `DING_LAUNCH_COMMAND` | The task argv encoded as JSON |
+| `DING_LAUNCH_CWD` | The absolute launch working directory |
+| `DING_PREFLIGHT_RECEIPT` | An absolute `<launch-id>.preflight.json` path beside the launch record |
+
+The hook may write a receipt at that path. `ding` treats its bytes as opaque and prints its path and SHA-256 when it exists. For example, `check.py` can use:
+
+```python
+import os
+from pathlib import Path
+
+# Exit nonzero when a repository check fails.
+Path(os.environ["DING_PREFLIGHT_RECEIPT"]).write_text('{"ok": true}\n')
+```
+
+Exit 0 permits the launch. A nonzero exit or timeout refuses it without creating a tmux session, and reports `preflight refused (exit N); receipt: <path>`. Timeouts are recorded with exit code 124 and `timed_out: true`; a missing executable is recorded with exit code 127.
+
+The launch JSONL contains a `preflight` event with the hook's `argv`, `exit_code`, `duration_seconds`, `receipt_path`, `receipt_sha256` (null if absent), and `launch_id`. This event remains available even when the hook refuses the launch. `ding board` continues to read the job's exit and notification events from the same record.
+
+To bypass the check, supply a nonempty reason:
+
+```bash
+ding launch train --skip-preflight "Approved maintenance exception" -- python train.py
+```
+
+The `preflight` event records `skip_reason` and a null exit code. Without a configured hook or an override, launch behavior is unchanged.
+
 ## Wrap a command yourself: `run`
 
 `run` is what `launch` uses inside tmux. Use it directly when you want to manage the terminal yourself, or to wake a session other than your own:
@@ -399,7 +440,7 @@ Everything lives under `${XDG_STATE_HOME:-~/.local/state}/ding/`, readable only 
 | --- | --- |
 | `sent.jsonl` | Every `send`: what was sent, to whom, and the result |
 | `runs.jsonl` | One `run_start` line per wrapped job, used by `board` to find jobs |
-| `launch-records/<id>.jsonl` | Default record for each `launch`: `task_exit` and `notification` events |
+| `launch-records/<id>.jsonl` | Default record for each `launch`: optional `preflight`, then `task_exit` and `notification` events |
 | `launch-records/<id>.message.txt` | The wake-up message for that launch |
 | `watch/OWNER-REPO.json` | Where `ding watch` left off |
 | `run-locks/<run id>.lock` | Held while a wrapper is alive; this is how `board` tells `running` from `lost` |

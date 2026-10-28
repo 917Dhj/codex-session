@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+import hashlib
 from importlib import metadata
 import json
 import math
@@ -626,6 +627,8 @@ def run_state(run: dict) -> str:
                     print(f"ding: ignoring incomplete run record tail ({run['record']})", file=sys.stderr)
                     break
                 raise
+            if isinstance(event, dict) and event.get("event") == "preflight":
+                continue
             if (not isinstance(event, dict) or not isinstance(event.get("run_id"), str)
                     or not event["run_id"] or not isinstance(event.get("event"), str)):
                 raise ValueError("invalid record event")
@@ -1530,6 +1533,52 @@ def run_task(args, command: list[str]) -> int:
         return code
 
 
+def launch_preflight(args, command: list[str], record: Path, launch_id: str, settings) -> bool:
+    if not settings.preflight and args.skip_preflight is None:
+        return True
+    receipt = record.parent / f"{launch_id}.preflight.json"
+    event = {
+        "event": "preflight", "launch_id": launch_id, "name": args.name,
+        "argv": list(settings.preflight), "exit_code": None, "duration_seconds": 0,
+        "receipt_path": str(receipt), "receipt_sha256": None,
+        "skip_reason": args.skip_preflight, "timed_out": False, "error": None,
+    }
+    with writer(record):
+        if args.skip_preflight is None:
+            environment = dict(os.environ, DING_LAUNCH_NAME=args.name,
+                               DING_LAUNCH_COMMAND=json.dumps(command), DING_LAUNCH_CWD=str(Path.cwd()),
+                               DING_PREFLIGHT_RECEIPT=str(receipt))
+            started = time.monotonic()
+            try:
+                result = subprocess.run(settings.preflight, cwd=Path.cwd(), env=environment,
+                                        timeout=settings.preflight_timeout)
+                event["exit_code"] = result.returncode
+            except subprocess.TimeoutExpired:
+                event.update(exit_code=124, timed_out=True)
+            except OSError as exc:
+                event.update(exit_code=127 if isinstance(exc, FileNotFoundError) else 126, error=str(exc))
+            event["duration_seconds"] = time.monotonic() - started
+            try:
+                with receipt.open("rb") as handle:
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: handle.read(65536), b""):
+                        digest.update(block)
+                event["receipt_sha256"] = digest.hexdigest()
+            except FileNotFoundError:
+                pass
+        event["timestamp_ns"] = time.time_ns()
+        append_jsonl(record, event)
+    if event["exit_code"] not in {None, 0}:
+        detail = "; timeout" if event["timed_out"] else ""
+        if event["error"]:
+            detail += f"; {event['error']}"
+        print(f"ding: preflight refused (exit {event['exit_code']}); receipt: {receipt}{detail}", file=sys.stderr)
+        return False
+    if event["receipt_sha256"]:
+        print(f"ding: preflight receipt: {receipt}; sha256: {event['receipt_sha256']}")
+    return True
+
+
 def launch_task(args, command: list[str]) -> int:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.name):
         raise ValueError("launch name must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit")
@@ -1540,6 +1589,8 @@ def launch_task(args, command: list[str]) -> int:
     tmux = shutil.which("tmux")
     if tmux is None:
         raise ValueError("tmux executable not found in the caller's PATH")
+    from dkitchen import config
+    settings = config.load().launch
     launch_id = str(uuid4())
     launch_records = (run_registry().parent / "launch-records").resolve()
     record = (Path(args.record) if args.record else launch_records / f"{launch_id}.jsonl").resolve()
@@ -1551,6 +1602,8 @@ def launch_task(args, command: list[str]) -> int:
         inner += ["--progress", str(Path(args.progress).resolve())]
     launch_records.mkdir(parents=True, exist_ok=True, mode=0o700)
     launch_records.chmod(0o700)
+    if not launch_preflight(args, command, record, launch_id, settings):
+        return 1
     message_path = launch_records / f"{launch_id}.message.txt"
     with os.fdopen(os.open(message_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
                    "w", encoding="utf-8", newline="") as handle:
@@ -1638,6 +1691,7 @@ def main(argv=None) -> int:
                             ("launch", "Run a command in a new tmux session and wake this Codex session when it exits")):
         sub = commands.add_parser(action, help=summary)
         if action == "launch":
+            sub.add_argument("--skip-preflight", metavar="REASON", help="Skip the repository preflight and record why")
             sub.add_argument("name", help="Name of the dedicated ding-NAME tmux session and its first window")
         else:
             target = sub.add_mutually_exclusive_group(required=True)
@@ -1776,6 +1830,8 @@ def main(argv=None) -> int:
             parser.error("--edit-body and --base go together")
         if args.force and not args.reply_to:
             parser.error("--force goes with --reply-to")
+    if args.action == "launch" and args.skip_preflight is not None and not args.skip_preflight.strip():
+        parser.error("--skip-preflight requires a nonempty reason")
     if args.action in {"run", "launch"} and not command:
         parser.error(f"{args.action} requires a task command after --")
     try:
