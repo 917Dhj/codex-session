@@ -385,7 +385,7 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 
 `ding board` does not expose session update times. Watch therefore saves when it first observes all the idle conditions, and waits from the later of that observation and the executor comment's update. This observation survives restarts. A new executor comment or a failed idle condition resets the period. Setting `[watch] idle_minutes = 0` disables this wake; the stale check remains enabled.
 
-Board and watch first parse ticket numbers from the configured `[sessions] name` template. Sessions whose names do not match use GitHub owner/candidate attribution. Failed attribution, GitHub calls, and timeouts, including a re-collect after `--settle`, use the same bounded retry loop. Only `--max-errors` consecutive failed polls stop it with exit 2; its reporting cursor is not advanced. A failed re-collect prints no partial batch and retries from the same cursor.
+Watch calls `ding board --no-issue-lookup`: only session names matching the configured `[sessions] name` template are attributed to tickets. Other session names remain unattributed, and watch never requests the whole-repository ownership scan. Plain `ding board` retains GitHub owner/candidate attribution for unmatched names. Nonzero board exits, failed GitHub calls, and timeouts, including a re-collect after `--settle`, use the same bounded retry loop. Only `--max-errors` consecutive failed polls stop it with exit 2; its reporting cursor is not advanced. A failed re-collect prints no partial batch and retries from the same cursor.
 
 Run `ding watch --help` for the timing options.
 

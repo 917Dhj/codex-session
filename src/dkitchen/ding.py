@@ -1061,7 +1061,8 @@ def nonnegative_number(value: str) -> float:
     return number
 
 
-def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str, ...] | None = None) -> None:
+def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str, ...] | None = None,
+               no_issue_lookup: bool = False) -> None:
     roots = [] if all_threads else repository_roots()
     runs = latest_runs()
     try:
@@ -1123,7 +1124,7 @@ def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str
             unmatched.append(thread_id)
         else:
             mapping[thread_id] = {number}
-    if unmatched:
+    if unmatched and not no_issue_lookup:
         fallback = issue_map()
         mapping.update({thread_id: fallback.get(thread_id, set()) for thread_id in unmatched})
     heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}, status) if status else {}
@@ -1689,6 +1690,8 @@ def main(argv=None) -> int:
     board = commands.add_parser("board", help="List sessions, run states, and local unwrapped tasks")
     board.add_argument("--all", action="store_true", help="Include all non-archived sessions")
     board.add_argument("--status", action="store_true", help="Show the latest executor comment status block")
+    board.add_argument("--no-issue-lookup", action="store_true",
+                       help="Attribute tickets only from [sessions] name; skip GitHub ownership lookup")
     board.add_argument("--status-fields", type=status_fields,
                        help="Comma-separated field names that open a status block (default: $DING_STATUS_FIELDS, "
                             f"then [status] fields in .dkitchen.toml, then '{STATUS_FIELDS}')")
@@ -1891,7 +1894,8 @@ def main(argv=None) -> int:
                     fields = config.load().status.fields
             findings = unwrapped_tasks(min_age=args.min_age, min_cpu=args.min_cpu)
             try:
-                show_board(args.socket, all_threads=args.all, status=fields if args.status else None)
+                show_board(args.socket, all_threads=args.all, status=fields if args.status else None,
+                           no_issue_lookup=args.no_issue_lookup)
             finally:
                 show_unwrapped(findings)
             return 0

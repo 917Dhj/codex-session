@@ -155,10 +155,10 @@ def board_running(output: str, sessions: Sessions = Sessions(), repo: str = "") 
 
 def board_output(checkout: Path) -> str:
     # The ISSUE column is filled only for sessions of the repository in the current directory.
-    result = subprocess.run([sys.executable, "-m", "dkitchen.ding", "board"], capture_output=True, text=True,
+    result = subprocess.run([sys.executable, "-m", "dkitchen.ding", "board", "--no-issue-lookup"],
+                            capture_output=True, text=True,
                             timeout=120, cwd=checkout)
-    # Board keeps rendering after an attribution failure; watch must retry.
-    if result.returncode or "ding: issue lookup failed:" in result.stderr:
+    if result.returncode:
         raise RuntimeError(f"ding board failed: {result.stderr.strip()[:200]}")
     return result.stdout
 

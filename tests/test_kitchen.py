@@ -98,7 +98,7 @@ def test_board_status_falls_back_to_the_config_fields(tmp_path, monkeypatch, cap
     monkeypatch.delenv("DING_STATUS_FIELDS", raising=False)
     monkeypatch.setattr(ding, "unwrapped_tasks", lambda **kwargs: [])
     seen = {}
-    monkeypatch.setattr(ding, "show_board", lambda path, all_threads, status: seen.setdefault("fields", status))
+    monkeypatch.setattr(ding, "show_board", lambda path, all_threads, status, no_issue_lookup: seen.setdefault("fields", status))
     assert ding.main(["board", "--status"]) == 0
     assert seen["fields"] == ("状态", "在等", "关键数字", "下一步")
     monkeypatch.setenv("DING_STATUS_FIELDS", "A,B")
@@ -873,7 +873,7 @@ def idle_ticket(tmp_path, monkeypatch):
             "html_url": "https://github.com/o/r/issues/26#issuecomment-2601"}
     issue = {"number": 26, "comments": 1, "labels": [], "updated_at": last["updated_at"]}
     state = SimpleNamespace(config=loaded, clock=Clock, last=last, issues=[issue], comments=[last],
-                            board="NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\na\t/r\tidle\t#26\thead\t\n", panes="")
+                            board="NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n【#26】worker\t/r\tidle\t#26\thead\t\n", panes="")
     calls = []
 
     def gh(path):
@@ -885,6 +885,7 @@ def idle_ticket(tmp_path, monkeypatch):
         raise AssertionError(path)
 
     monkeypatch.setattr(watch, "gh", gh)
+    state.board_reader = watch.board_output
     monkeypatch.setattr(watch, "board_output", lambda checkout: state.board)
     monkeypatch.setattr(watch, "tmux_panes", lambda: state.panes)
     state.calls = calls
@@ -917,7 +918,7 @@ def test_idle_wake_requires_every_condition_and_resets_observation(idle_ticket, 
     ticket.clock.moment += timedelta(hours=1)
     skip = set()
     if condition in {"active", "unknown"}:
-        ticket.board += f"b\t/r\t{condition}\t#26\thead\t\n"
+        ticket.board += f"【#26】other\t/r\t{condition}\t#26\thead\t\n"
     elif condition == "run":
         ticket.board = ticket.board.replace("head\t\n", "head\trunning\n")
     elif condition == "tmux":
@@ -943,7 +944,7 @@ def test_idle_threshold_must_be_exceeded(idle_ticket, minutes):
 
 def test_idle_accepts_not_loaded_sessions_and_ignores_shell_or_dead_tmux(idle_ticket):
     ticket = idle_ticket
-    ticket.board += "b\t/r\tnotLoaded\t#26\thead\t\n"
+    ticket.board += "【#26】other\t/r\tnotLoaded\t#26\thead\t\n"
     ticket.panes = "ding-issue26-shell|0|bash\nding-issue26-done|1|python\n"
     _, observed = check_idle(ticket)
     ticket.clock.moment += timedelta(hours=1)
@@ -1137,12 +1138,18 @@ def test_idle_and_stale_use_template_names_with_an_empty_issue_column(idle_ticke
     assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set()) == []
 
 
-def test_watch_refuses_board_attribution_failure_even_with_exit_zero(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=0, stdout="NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\nworker\t/r\tidle\t\thead\t\n",
-        stderr="ding: issue lookup failed: gh api timed out\n"))
-    with pytest.raises(RuntimeError, match="issue lookup failed"):
-        watch.board_output(tmp_path)
+@pytest.mark.parametrize("code", [0, 1])
+def test_watch_board_skips_lookup_and_checks_exit_code(tmp_path, monkeypatch, code):
+    output = "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\nworker\t/r\tidle\t\thead\t\n"
+    def board(argv, **kwargs):
+        assert argv[-2:] == ["board", "--no-issue-lookup"]
+        return SimpleNamespace(returncode=code, stdout=output, stderr="board failed" if code else "")
+    monkeypatch.setattr(watch.subprocess, "run", board)
+    if code:
+        with pytest.raises(RuntimeError, match="board failed"):
+            watch.board_output(tmp_path)
+    else:
+        assert watch.board_output(tmp_path) == output
 
 
 def test_idle_schedule_is_independent_of_hourly_stale_check(idle_ticket, monkeypatch, capsys):
@@ -1185,7 +1192,7 @@ def test_session_template_ticket_parsing(template, name, repo, expected):
 
 
 @pytest.mark.parametrize("phase", ["stale", "idle"])
-def test_board_attribution_error_is_a_failed_poll_in_both_checks(idle_ticket, monkeypatch, capsys, phase):
+def test_board_error_is_a_failed_poll_in_both_checks(idle_ticket, monkeypatch, capsys, phase):
     ticket = idle_ticket
     ticket.clock.moment += timedelta(hours=6)
     monkeypatch.setattr(config, "load", lambda: ticket.config)
@@ -1194,7 +1201,7 @@ def test_board_attribution_error_is_a_failed_poll_in_both_checks(idle_ticket, mo
         monkeypatch.setattr(watch, "stale", lambda *args: [])
     monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
     def board_failure(*args):
-        raise RuntimeError("ding board failed: ding: issue lookup failed: timeout")
+        raise RuntimeError("ding board failed: App Server unavailable")
     monkeypatch.setattr(watch, "board_output", board_failure)
     path = ticket.config.root / "watch.json"
     assert ding.main(["watch", "--state", str(path), "--interval", "0", "--max-errors", "2"]) == 2
@@ -1225,3 +1232,53 @@ def test_idle_cadence_is_capped_independently_of_poll_interval(idle_ticket, monk
     assert ding.main(["watch", "--state", str(ticket.config.root / "watch.json"),
                       "--interval", "7200", "--stale-every", "3600"]) == 0
     assert checks == [0, every, 2 * every]
+
+
+@pytest.mark.parametrize("unmatched_status", ["idle", "active"])
+def test_watch_mixed_session_names_skip_failing_repository_scan(idle_ticket, monkeypatch, capsys, unmatched_status):
+    import contextlib
+    import io
+    import subprocess
+    ticket = idle_ticket
+    root = ticket.config.root
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "board_output", ticket.board_reader)
+    monkeypatch.setattr(ding, "repository_roots", lambda: [root])
+    monkeypatch.setattr(ding, "latest_runs", lambda: {})
+    monkeypatch.setattr(ding, "unwrapped_tasks", lambda **kwargs: [])
+    threads = [{"id": str(index), "name": name, "cwd": str(root), "status": {"type": "idle"}}
+               for index, name in enumerate(["【#26】worker", "检查 gml_10 系统盘"])]
+    threads[1]["status"]["type"] = unmatched_status
+    @contextlib.contextmanager
+    def server(path):
+        yield lambda *args: {}
+    monkeypatch.setattr(ding, "app_server", server)
+    monkeypatch.setattr(ding, "socket_path", lambda path: "/mock.sock")
+    monkeypatch.setattr(ding, "board_threads", lambda *args: threads)
+    monkeypatch.setattr(ding, "read_reply", lambda *args: "")
+    lookups = []
+    def failing_scan():
+        lookups.append(None)
+        raise subprocess.TimeoutExpired(["gh", "api", "repository-wide scan"], 60)
+    monkeypatch.setattr(ding, "issue_map", failing_scan)
+    def board(argv, **kwargs):
+        assert argv[:4] == [watch.sys.executable, "-m", "dkitchen.ding", "board"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = ding.main(argv[3:])
+        if code == 0:
+            rows = [line.split("\t") for line in stdout.getvalue().splitlines()[1:]]
+            assert [row[3] for row in rows] == ["#26", ""]
+        return SimpleNamespace(returncode=code, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+    monkeypatch.setattr(watch.subprocess, "run", board)
+    path = root / "watch.json"
+    path.write_text(json.dumps({"since": "2026-10-28T10:00:00Z", "seen": [], "stale": [],
+                               "idle_observed": {"26": {"comment_id": 2601, "since": "2026-10-28T11:00:00Z"}}}))
+    assert ding.main(["watch", "--state", str(path), "--max-errors", "1"]) == 0
+    assert lookups == []
+    output = capsys.readouterr()
+    assert "#26 executor idle" in output.out
+    assert "poll failed" not in output.err
+    assert json.loads(path.read_text())["idle_reported"] == [2601]
