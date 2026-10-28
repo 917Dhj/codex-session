@@ -221,21 +221,36 @@ def default_repository() -> str | None:
         return None
 
 
-def check_refs(args) -> int:
-    github = None if getattr(args, "offline", False) else GitHub(getattr(args, "repo", None), default=default_repository)
+def report(path: str, args, source: Source, github: GitHub | None, many: bool, emit_json: bool = True) -> int:
+    """Check one draft and report it on stderr (and as a JSON line on stdout); 1 when something is wrong, 2 when
+    the draft cannot be read. With several drafts every line names its file."""
+    label = f"{path}: " if many else ""
     counts: dict[str, int] = {}
     try:
-        findings, notes, checked = check(Path(args.draft).read_text(encoding="utf-8"), Source(args.ref, args.root),
-                                         args.tolerance, github, counts)
+        findings, notes, checked = check(Path(path).read_text(encoding="utf-8"), source, args.tolerance, github, counts)
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"ding: {error}", file=sys.stderr)
         return 2
     for line in findings:
-        print(f"wrong: {line}", file=sys.stderr)
+        print(f"wrong: {label}{line}", file=sys.stderr)
     for line in notes:
-        print(f"not checked: {line}", file=sys.stderr)
+        print(f"not checked: {label}{line}", file=sys.stderr)
     kinds = ", ".join(f"{counts[kind]} {kind}" for kind in KINDS if counts.get(kind)) or "none"
-    print(f"checked {checked} references ({kinds}): {len(findings)} wrong, {len(notes)} not checked", file=sys.stderr)
-    print(json.dumps({"checked": checked, "findings": len(findings), "unchecked": len(notes),
-                      "by_kind": counts, "wrong": findings, "not_checked": notes}, ensure_ascii=False))
+    print(f"{label}checked {checked} references ({kinds}): {len(findings)} wrong, {len(notes)} not checked", file=sys.stderr)
+    if emit_json:
+        print(json.dumps({**({"draft": path} if many else {}), "checked": checked, "findings": len(findings),
+                          "unchecked": len(notes), "by_kind": counts, "wrong": findings, "not_checked": notes},
+                         ensure_ascii=False))
     return int(bool(findings))
+
+
+def check_refs(args, emit_json: bool = True) -> int:
+    """Report each draft in turn; 0 when none has a wrong reference, 1 when one does, 2 when one cannot be read."""
+    drafts = [args.draft] if isinstance(args.draft, (str, Path)) else list(args.draft)
+    github = None if getattr(args, "offline", False) else GitHub(getattr(args, "repo", None), default=default_repository)
+    try:
+        source = Source(args.ref, args.root)
+    except OSError as error:
+        print(f"ding: {error}", file=sys.stderr)
+        return 2
+    return max(report(path, args, source, github, len(drafts) > 1, emit_json) for path in drafts)

@@ -1705,9 +1705,45 @@ def main(argv=None) -> int:
     sub.add_argument("--stale-hours", type=float, default=6, help="Executor silence that counts as stale (default: 6)")
     sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale checks (default: 3600)")
     sub.add_argument("--max-errors", type=int, default=10, help="Consecutive failed polls before exiting (default: 10)")
+    sub = commands.add_parser(
+        "rule", help="Post the designer's ruling on a ticket after checking it, and tell a session",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Post a designer ruling as a ticket comment (or, with --edit-body, as the ticket's new body).\n"
+                    "Before anything is sent it checks that:\n"
+                    "  - the draft's line 1 starts with the designer's signature and line 2 with the type label\n"
+                    "    and one of the allowed types ([stations] and [rule] in .dkitchen.toml; comments only);\n"
+                    "  - `ding check-refs` finds no wrong reference in it;\n"
+                    "  - with --reply-to, no comment came after the one answered (--force posts anyway); without\n"
+                    "    it, the time and first line of the latest comment are shown as a hint;\n"
+                    "  - with --edit-body, the ticket body still equals the --base file.\n"
+                    "Then it posts with gh. stdout is only the URL gh returns; everything else goes to stderr.\n"
+                    "With --notify it then sends the [rule] notify message (default: '#N answered, see the ticket "
+                    "URL')\nplus the draft's first line. A failed notification is reported, and the comment stays.",
+        epilog="examples:\n"
+               "  ding rule 42 reply.md --reply-to https://github.com/o/r/issues/42#issuecomment-123 --notify '#42'\n"
+               "  gh api repos/o/r/issues/42 --jq .body > base.md   # take the baseline, edit a copy, then:\n"
+               "  ding rule 42 new-body.md --edit-body --base base.md\n"
+               "--notify reaches Codex sessions (via `ding send`: UUID, name, '#N', ticket URL). ding cannot "
+               "message\nClaude Code sessions; tell them with SendMessage after the URL is printed.")
+    sub.add_argument("ticket", type=int, help="Ticket number")
+    sub.add_argument("draft", help="Draft file (UTF-8): the comment, or with --edit-body the new ticket body")
+    sub.add_argument("--reply-to", help="Comment answered, as its link or id; stops when later comments exist")
+    sub.add_argument("--force", action="store_true", help="With --reply-to: post although later comments exist")
+    sub.add_argument("--notify", help="Codex session to tell, as for `ding send` (UUID, name, '#N', ticket URL)")
+    sub.add_argument("--edit-body", action="store_true", help="Replace the ticket body, not add a comment; needs --base")
+    sub.add_argument("--base", help="With --edit-body: file holding the body you started from; stops if the ticket's "
+                                    "body differs from it")
+    where = sub.add_mutually_exclusive_group()
+    where.add_argument("--ref", default="origin/main", help="check-refs: Git revision the references point into "
+                                                            "(default: origin/main)")
+    where.add_argument("--root", type=Path, help="check-refs: directory to read files from instead")
+    sub.add_argument("--tolerance", type=int, default=0, help="check-refs: lines around a reference that may hold its name")
+    sub.add_argument("--repo", help="Repository (default: repo in .dkitchen.toml, then the one gh sees)")
+    sub.add_argument("--offline", action="store_true", help="check-refs: do not ask GitHub")
     sub = commands.add_parser("check-refs", help="Check `file:line`, sha256, ticket, PR, and comment references "
                                                  "in a draft comment")
-    sub.add_argument("draft", help="Draft comment file")
+    sub.add_argument("draft", nargs="+", help="Draft comment file; several files are checked one by one and "
+                                              "the exit status is nonzero when any has a wrong reference")
     where = sub.add_mutually_exclusive_group()
     where.add_argument("--ref", default="origin/main", help="Git revision the references point into (default: origin/main)")
     where.add_argument("--root", type=Path, help="Directory to read files from instead, such as a worktree or output folder")
@@ -1731,6 +1767,15 @@ def main(argv=None) -> int:
         parser.error("--parent must be a positive issue number")
     if args.action == "merge" and args.ticket is not None and args.ticket <= 0:
         parser.error("--ticket must be a positive issue number")
+    if args.action == "rule":
+        if args.ticket <= 0:
+            parser.error("ticket must be a positive issue number")
+        if args.edit_body and (args.reply_to or args.force):
+            parser.error("--edit-body edits the ticket body; --reply-to and --force belong to comments")
+        if args.edit_body != (args.base is not None):
+            parser.error("--edit-body and --base go together")
+        if args.force and not args.reply_to:
+            parser.error("--force goes with --reply-to")
     if args.action in {"run", "launch"} and not command:
         parser.error(f"{args.action} requires a task command after --")
     try:
@@ -1751,6 +1796,9 @@ def main(argv=None) -> int:
                                                   settings.sessions.parent.format(parent=args.parent))
                 args.name = settings.sessions.session_name(issue=args.issue, name=args.name, repo=args.repo)
             return new_task(args)
+        if args.action == "rule":
+            from dkitchen import config, rule
+            return rule.rule(args, config.load())
         if args.action == "check-refs":
             from dkitchen import refs
             return refs.check_refs(args)

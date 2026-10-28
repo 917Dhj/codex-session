@@ -61,6 +61,8 @@ Designer: <one-sentence conclusion>
 Type: actionable        (or: Type: proposal, awaiting user)
 ```
 
+`ding rule <ticket> <draft.md> [--reply-to <comment>] [--notify <session>]` posts such a reply: it checks the two lines and the references, stops if a comment came after the one answered, and prints the comment's URL (see `ding rule --help`).
+
 The orchestrator and executors act on the Type line alone: an actionable reply is carried out, and a proposal is left untouched until the user decides. With a proposal, the designer also labels the ticket `status:awaiting-user`.
 
 ## Relaying
