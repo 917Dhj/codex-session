@@ -1764,7 +1764,7 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Post a designer ruling as a ticket comment (or, with --edit-body, as the ticket's new body).\n"
                     "Before anything is sent it checks that:\n"
-                    "  - the draft's line 1 starts with the designer's signature and line 2 with the type label\n"
+                    "  - the draft's line 1 starts with a configured designer signature and line 2 with the type label\n"
                     "    and one of the allowed types ([stations] and [rule] in .dkitchen.toml; comments only);\n"
                     "  - `ding check-refs` finds no wrong reference in it;\n"
                     "  - with --reply-to, no comment came after the one answered (--force posts anyway); without\n"

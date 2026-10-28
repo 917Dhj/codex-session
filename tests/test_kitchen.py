@@ -745,3 +745,76 @@ def test_launch_config_preserves_argv_and_defaults(tmp_path):
 def test_bad_launch_config_is_refused(tmp_path, text, error):
     with pytest.raises(ValueError, match=error):
         settings(tmp_path, "[launch]\n" + text)
+
+
+@pytest.mark.parametrize("text", [None, CHINESE])
+def test_default_designer_signature_is_shared_and_requires_separator(tmp_path, text):
+    loaded = settings(tmp_path, text)
+    stations = loaded.stations
+    signature = stations.signature(stations.designer)
+    assert loaded.designer_signatures == (signature,)
+    assert rule.format_problem(f"{signature}decision\nType{stations.separator}record\n", loaded) is None
+    assert watch.role(f"## {signature}decision", loaded) == stations.designer
+    for prefix in (stations.designer, stations.designer + " (other): "):
+        assert rule.format_problem(f"{prefix}\nType{stations.separator}record\n", loaded) is not None
+        assert watch.role(prefix, loaded) == stations.user
+    assert watch.role(stations.verifier + " report", loaded) == stations.verifier
+    assert watch.role(stations.orchestrator + " update", loaded) == stations.orchestrator
+
+
+@pytest.mark.parametrize("prefix", ["总设计：", "总设计（训练）："])
+def test_rule_and_watch_share_configured_designer_signatures(tmp_path, prefix):
+    loaded = settings(tmp_path, RULING + 'signatures = ["总设计：", "总设计（训练）："]\n')
+    assert rule.format_problem(f"{prefix}结论\n类型：可执行\n", loaded) is None
+    assert watch.role(f"{prefix}结论", loaded) == loaded.stations.designer
+    problem = rule.format_problem("其他设计：结论\n类型：可执行\n", loaded)
+    assert "'总设计：'" in problem and "'总设计（训练）：'" in problem
+    assert watch.role("其他设计：结论", loaded) == loaded.stations.user
+
+
+@pytest.mark.parametrize("value", ['[]', '[1]', '["Designer: ", false]', '[""]', '["   "]', '"Designer: "'])
+def test_invalid_rule_signatures_are_rejected_on_load(tmp_path, value):
+    with pytest.raises(ValueError, match=r"\[rule\] signatures must be a nonempty list"):
+        settings(tmp_path, f"[rule]\nsignatures = {value}")
+
+
+def test_explicit_signatures_replace_default_and_preserve_spaces(tmp_path):
+    loaded = settings(tmp_path, '[rule]\nsignatures = ["Training designer: "]')
+    assert loaded.rule.signatures == ("Training designer: ",)
+    assert rule.format_problem("Training designer: decision\nType: record", loaded) is None
+    assert watch.role("Training designer: decision", loaded) == loaded.stations.designer
+    for prefix in ("Training designer:", "Designer: decision"):
+        assert rule.format_problem(f"{prefix}\nType: record", loaded) is not None
+        assert watch.role(prefix, loaded) == loaded.stations.user
+
+
+@pytest.mark.parametrize("prefix", ["总设计：", "总设计（训练）："])
+def test_rule_command_accepts_each_configured_signature(ruling, tmp_path, prefix):
+    (tmp_path / config.FILE).write_text(RULING + 'signatures = ["总设计：", "总设计（训练）："]\n')
+    assert ruling.run([comment_pages("用户：问"), (0, URL)], text=f"{prefix}结论\n类型：可执行\n") == 0
+    assert len(ruling.calls) == 2
+
+
+def test_rule_command_refuses_unlisted_signature_before_posting(ruling, tmp_path, capsys):
+    (tmp_path / config.FILE).write_text(RULING + 'signatures = ["总设计：", "总设计（训练）："]\n')
+    assert ruling.run([], text="总设计（其他）：结论\n类型：可执行\n") == 1
+    error = capsys.readouterr().err
+    assert "'总设计：'" in error and "'总设计（训练）：'" in error
+    assert ruling.calls == [] and ruling.sends == []
+
+
+@pytest.mark.parametrize("signature", ["  Design: ", "# Design: "])
+def test_configured_signature_is_matched_before_watch_markdown_normalization(tmp_path, signature):
+    loaded = settings(tmp_path, f"[rule]\nsignatures = {json.dumps([signature])}")
+    body = f"{signature}decision\nType: record"
+    assert rule.format_problem(body, loaded) is None
+    assert watch.role(body, loaded) == loaded.stations.designer
+
+
+def test_watch_does_not_report_a_configured_designer_as_user(tmp_path, monkeypatch):
+    loaded = settings(tmp_path, RULING + 'signatures = ["总设计：", "总设计（训练）："]\n')
+    comments = [comment(24, "总设计（训练）：结论"), comment(25, "总设计（其他）：提问")]
+    monkeypatch.setattr(watch, "gh", lambda path: comments if "/issues/comments" in path and "page=1" in path else [])
+    found = watch.collect(loaded, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z", set(), set())
+    assert len(found) == 1
+    assert "#25 用户 comment" in found[0][1] and found[0][2] is True
