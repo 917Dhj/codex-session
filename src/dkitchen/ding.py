@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import string
 import subprocess
 from pathlib import Path
 import socket
@@ -1110,7 +1111,21 @@ def show_board(path: str | None, *, all_threads: bool = False, status: tuple[str
         rows = [[thread_id, run["cwd"], "unavailable", thread_id, ""]
                 for thread_id, run in runs.items()
                 if all_threads or any(Path(run["cwd"]).resolve().is_relative_to(root) for root in roots)]
-    mapping = issue_map()
+    from dkitchen import config
+    settings = config.load()
+    repo = settings.repository() if any(field == "repo" for _, field, _, _ in
+                                        string.Formatter().parse(settings.sessions.name)) else ""
+    mapping, unmatched = {}, []
+    for name, cwd, _, thread_id, _ in rows:
+        in_repo = not all_threads or Path(cwd).resolve().is_relative_to(settings.root.resolve())
+        number = settings.sessions.issue_number(name, repo) if in_repo else None
+        if number is None:
+            unmatched.append(thread_id)
+        else:
+            mapping[thread_id] = {number}
+    if unmatched:
+        fallback = issue_map()
+        mapping.update({thread_id: fallback.get(thread_id, set()) for thread_id in unmatched})
     heads = executor_comment_heads({row[3]: mapping.get(row[3], set()) for row in rows}, status) if status else {}
     shown = any("progress" in run for run in runs.values())
     print("NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN" + ("\tPROGRESS" if shown else ""))
@@ -1757,7 +1772,7 @@ def main(argv=None) -> int:
     sub.add_argument("--interval", type=float, default=90, help="Seconds between polls (default: 90)")
     sub.add_argument("--settle", type=float, default=300, help="After the first trigger, seconds to wait to batch more (default: 300)")
     sub.add_argument("--stale-hours", type=float, default=6, help="Executor silence that counts as stale (default: 6)")
-    sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale and idle checks (default: 3600)")
+    sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale checks (default: 3600)")
     sub.add_argument("--max-errors", type=int, default=10, help="Consecutive failed polls before exiting (default: 10)")
     sub = commands.add_parser(
         "rule", help="Post the designer's ruling on a ticket after checking it, and tell a session",

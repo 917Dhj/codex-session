@@ -1124,3 +1124,104 @@ def test_stale_keeps_its_existing_silence_rule_and_comment_deduplication(idle_ti
     assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, {2601}, set()) == []
     ticket.panes = "ding-issue26-job|0|python\n"
     assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set()) == []
+
+
+def test_idle_and_stale_use_template_names_with_an_empty_issue_column(idle_ticket):
+    ticket = idle_ticket
+    ticket.board = "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n【#26】worker\t/r\tidle\t\thead\t\n"
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    assert check_idle(ticket, observed)[0][0][2] == 2601
+    ticket.clock.moment += timedelta(hours=5)
+    ticket.board = ticket.board.replace("head\t\n", "head\trunning\n")
+    assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set()) == []
+
+
+def test_watch_refuses_board_attribution_failure_even_with_exit_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout="NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\nworker\t/r\tidle\t\thead\t\n",
+        stderr="ding: issue lookup failed: gh api timed out\n"))
+    with pytest.raises(RuntimeError, match="issue lookup failed"):
+        watch.board_output(tmp_path)
+
+
+def test_idle_schedule_is_independent_of_hourly_stale_check(idle_ticket, monkeypatch, capsys):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, watch=config.Watch(idle_minutes=15))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    start = ticket.clock.moment
+    monkeypatch.setattr(watch.time, "monotonic", lambda: (ticket.clock.moment - start).total_seconds())
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: setattr(
+        ticket.clock, "moment", ticket.clock.moment + timedelta(seconds=seconds)))
+    stale_checks = []
+    monkeypatch.setattr(watch, "stale", lambda *args: stale_checks.append(ticket.clock.moment) or [])
+    result = ding.main(["watch", "--state", str(ticket.config.root / "watch.json"),
+                        "--interval", "7200", "--stale-every", "3600", "--settle", "0"])
+    assert result == 0
+    assert ticket.clock.moment - start == timedelta(minutes=20)
+    assert stale_checks == [start]
+    assert "#26 executor idle" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("template, name, repo, expected", [
+    ("【#{issue}】{name}", "【#868】worker", "", 868),
+    ("【#{issue}】{name}", "【#868】two\nlines", "", 868),
+    ("【#{issue}】{name}", "【#0】worker", "", None),
+    ("【#{issue}】{name}", "【# 】worker", "", None),
+    ("【#{issue}】{name}", "Legacy worker", "", None),
+    ("{repo}#{issue:04d} {name}", "o/r#0868 Plot", "o/r", 868),
+    ("{repo}#{issue:04d} {name}", "other/repo#0868 Plot", "o/r", None),
+    ("{{x}} {issue:^6d} :: {name}", "{x}   26   :: Plot", "", 26),
+    ("{name} #{issue}", "Worker #868", "", 868),
+    ("#{issue} {name} #{issue}", "#26 Worker #26", "", 26),
+    ("#{issue}", "#26", "", 26),
+    ("{name}", "Worker #868", "", None),
+    ("{issue}{name}", "868worker", "", None),
+])
+def test_session_template_ticket_parsing(template, name, repo, expected):
+    assert config.Sessions(name=template).issue_number(name, repo) == expected
+
+
+@pytest.mark.parametrize("phase", ["stale", "idle"])
+def test_board_attribution_error_is_a_failed_poll_in_both_checks(idle_ticket, monkeypatch, capsys, phase):
+    ticket = idle_ticket
+    ticket.clock.moment += timedelta(hours=6)
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    if phase == "idle":
+        monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    def board_failure(*args):
+        raise RuntimeError("ding board failed: ding: issue lookup failed: timeout")
+    monkeypatch.setattr(watch, "board_output", board_failure)
+    path = ticket.config.root / "watch.json"
+    assert ding.main(["watch", "--state", str(path), "--interval", "0", "--max-errors", "2"]) == 2
+    assert not path.exists()
+    output = capsys.readouterr()
+    assert "poll failed 1/2" in output.err and "poll failed 2/2" in output.err
+    assert "#26 executor" not in output.out
+
+
+@pytest.mark.parametrize("minutes, every", [(3, 60), (45, 900), (120, 900)])
+def test_idle_cadence_is_capped_independently_of_poll_interval(idle_ticket, monkeypatch, minutes, every):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, watch=config.Watch(idle_minutes=minutes))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    start = ticket.clock.moment
+    monkeypatch.setattr(watch.time, "monotonic", lambda: (ticket.clock.moment - start).total_seconds())
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: setattr(
+        ticket.clock, "moment", ticket.clock.moment + timedelta(seconds=seconds)))
+    checks = []
+    def idle(*args):
+        checks.append((ticket.clock.moment - start).total_seconds())
+        found = [(watch.now(), "idle wake", 2601)] if len(checks) == 3 else []
+        return found, {}
+    monkeypatch.setattr(watch, "idle", idle)
+    assert ding.main(["watch", "--state", str(ticket.config.root / "watch.json"),
+                      "--interval", "7200", "--stale-every", "3600"]) == 0
+    assert checks == [0, every, 2 * every]

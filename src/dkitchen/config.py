@@ -109,6 +109,31 @@ class Sessions:
     def session_name(self, *, issue: int, name: str, repo: str) -> str:
         return self.name.format(issue=issue, name=name, repo=repo)
 
+    def issue_number(self, name: str, repo: str = "") -> int | None:
+        """The ticket encoded by the template, or None when it cannot be recovered reliably."""
+        pattern, captured, previous = "", set(), None
+        for literal, field, spec, _ in string.Formatter().parse(self.name):
+            pattern += re.escape(literal)
+            if field is None:
+                continue
+            if not literal and {previous, field} == {"issue", "name"}:
+                return None
+            if field == "repo":
+                pattern += re.escape(format(repo, spec))
+            elif field in captured:
+                pattern += f"(?P={field})"
+            else:
+                pattern += f"(?P<{field}>{' *[0-9]+ *' if field == 'issue' else '.*?'})"
+                captured.add(field)
+            previous = field
+        match = re.fullmatch(pattern, name, flags=re.DOTALL)
+        if match is None or "issue" not in captured:
+            return None
+        number = int(match["issue"])
+        if number <= 0 or self.session_name(issue=number, name=match.groupdict().get("name", ""), repo=repo) != name:
+            return None
+        return number
+
 
 @dataclass(frozen=True)
 class Relay:

@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 
-from dkitchen.config import Config
+from dkitchen.config import Config, Sessions
 
 SHELLS = {"bash", "sh", "zsh", "dash", "fish"}
 
@@ -135,15 +135,21 @@ def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[
     return sorted({item for item in found if item[1] not in seen})
 
 
-def board_running(output: str) -> set[int]:
-    """Tickets whose session has a running `ding run`, from `ding board`'s ISSUE and RUN columns."""
+def board_tickets(cells: list[str], sessions: Sessions, repo: str) -> set[int]:
+    name = json.loads('"' + cells[0] + '"')
+    number = sessions.issue_number(name, repo)
+    return {number} if number is not None else {int(value) for value in re.findall(r"#(\d+)", cells[3])}
+
+
+def board_running(output: str, sessions: Sessions = Sessions(), repo: str = "") -> set[int]:
+    """Tickets with a running `ding run`, using template names before the board ISSUE column."""
     running = set()
     for line in output.splitlines():
         if not line.strip():
             break  # the unwrapped-process table follows a blank line
         cells = line.split("\t")
         if len(cells) >= 6 and cells[5] == "running":
-            running.update(int(number) for number in re.findall(r"#(\d+)", cells[3]))
+            running.update(board_tickets(cells, sessions, repo))
     return running
 
 
@@ -151,13 +157,14 @@ def board_output(checkout: Path) -> str:
     # The ISSUE column is filled only for sessions of the repository in the current directory.
     result = subprocess.run([sys.executable, "-m", "dkitchen.ding", "board"], capture_output=True, text=True,
                             timeout=120, cwd=checkout)
-    if result.returncode:
+    # Board keeps rendering after an attribution failure; watch must retry.
+    if result.returncode or "ding: issue lookup failed:" in result.stderr:
         raise RuntimeError(f"ding board failed: {result.stderr.strip()[:200]}")
     return result.stdout
 
 
-def running_issues(checkout: Path) -> set[int]:
-    return board_running(board_output(checkout))
+def running_issues(checkout: Path, sessions: Sessions = Sessions(), repo: str = "") -> set[int]:
+    return board_running(board_output(checkout), sessions, repo)
 
 
 def tmux_issues(panes: str) -> set[int]:
@@ -189,7 +196,7 @@ def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set
                   if "pull_request" not in issue and issue["number"] not in skip and issue["comments"]
                   and issue["updated_at"] < cutoff
                   and not any(label["name"].startswith(config.labels.prefix) for label in issue["labels"])]
-    running = running_issues(checkout) | tmux_issues(tmux_panes()) if candidates else set()
+    running = running_issues(checkout, config.sessions, repo) | tmux_issues(tmux_panes()) if candidates else set()
     found = []
     for issue in candidates:
         if issue["number"] in running:
@@ -220,9 +227,9 @@ def idle(config: Config, repo: str, checkout: Path, observed: dict, reported: se
             break
         cells = line.split("\t")
         if len(cells) >= 6:
-            for number in re.findall(r"#(\d+)", cells[3]):
-                sessions.setdefault(int(number), []).append(cells[2])
-    running = board_running(output) | tmux_issues(tmux_panes())
+            for number in board_tickets(cells, config.sessions, repo):
+                sessions.setdefault(number, []).append(cells[2])
+    running = board_running(output, config.sessions, repo) | tmux_issues(tmux_panes())
     moment = datetime.now(timezone.utc)
     found, pending = [], {}
     for issue in issues:
@@ -280,16 +287,19 @@ def watch(args, config: Config) -> int:
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
     labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
     print(f"Watching {repo}: comments and PRs since {since}, labels since {labels_since}", file=sys.stderr)
-    errors, next_stale = 0, 0.0
+    errors, next_stale, next_idle = 0, 0.0, 0.0
+    idle_every = min(config.watch.idle_minutes * 20, 900) if config.watch.idle_minutes else float("inf")
     while True:
         polled = now()
         try:
             found = collect(config, repo, since, labels_since, seen, skip)
             quiet, idle_found, pending, stale_ids = [], [], observed, set()
-            checked = time.monotonic() >= next_stale
-            if checked:
+            checked_at = time.monotonic()
+            checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
+            if checked_stale:
                 quiet = stale(config, repo, checkout, args.stale_hours, reported, skip)
                 stale_ids = {id_ for _, _, id_ in quiet}
+            if checked_idle:
                 idle_found, pending = idle(config, repo, checkout, observed, idle_reported, skip)
                 quiet += [item for item in idle_found if item[2] not in {entry[2] for entry in quiet}]
             if any(wakes for _, _, wakes in found) or quiet:
@@ -305,10 +315,12 @@ def watch(args, config: Config) -> int:
                 print(f"{errors} polls failed in a row; the watch exits without advancing its state. "
                       "Rerun the same command once fixed.")
                 return 2
-            time.sleep(args.interval)
+            time.sleep(min(args.interval, idle_every))
             continue
-        if checked:
+        if checked_stale:
             next_stale = time.monotonic() + args.stale_every
+        if checked_idle:
+            next_idle = checked_at + idle_every
         wakes = any(wakes for _, _, wakes in found) or bool(quiet)
         changed = pending != observed
         observed = pending
@@ -330,4 +342,5 @@ def watch(args, config: Config) -> int:
             tmp.replace(path)
         if wakes:
             return 0
-        time.sleep(args.interval)
+        time.sleep(min(args.interval, max(0, next_stale - time.monotonic()),
+                       max(0, next_idle - time.monotonic())))
