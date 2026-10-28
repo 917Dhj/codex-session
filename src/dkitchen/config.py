@@ -37,6 +37,7 @@ Every key is optional. The defaults match the English templates in kitchen/:
     superseding = "New decision; it replaces earlier relays not yet carried out."   # first line of a default relay
 
     [rule]                               # `ding rule`: the designer's reply opens with the designer's signature,
+    # signatures = ["Designer: ", "Training designer: "]  # default: designer + separator
     type_label = "Type"                  # then a line `<type_label><separator><one of types>`
     types = ["actionable", "proposal, awaiting user", "record"]
     notify = "#{ticket} answered, see the ticket {url}"   # message `--notify` sends; also {first_line}
@@ -116,6 +117,7 @@ class Rule:
     type_label: str = "Type"
     types: tuple[str, ...] = ("actionable", "proposal, awaiting user", "record")
     notify: str = "#{ticket} answered, see the ticket {url}"
+    signatures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,10 @@ class Config:
     rule: Rule = Rule()
     launch: Launch = Launch()
 
+    @property
+    def designer_signatures(self) -> tuple[str, ...]:
+        return self.rule.signatures or (self.stations.signature(self.stations.designer),)
+
     def repository(self) -> str:
         """The configured repository, or the one gh sees from the repository root."""
         if self.repo:
@@ -183,11 +189,11 @@ def section(cls, values: object, name: str):
     result = cls()
     for key, value in values.items():
         default = getattr(result, key)
-        if key in {"fields", "types"}:
+        if key in {"fields", "types", "signatures"}:
             if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() for item in value):
-                raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty list of "
-                                 f"{'field names' if key == 'fields' else 'words'}")
-            value = tuple(item.strip() for item in value)
+                kind = {"fields": "field names", "types": "words", "signatures": "signatures"}[key]
+                raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty list of {kind}")
+            value = tuple(value) if key == "signatures" else tuple(item.strip() for item in value)
         elif key == "preflight":
             if (not isinstance(value, list) or not value
                     or not all(isinstance(item, str) and "\0" not in item for item in value)

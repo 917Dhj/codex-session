@@ -35,9 +35,9 @@ def format_problem(draft: str, config: Config) -> str | None:
     """Why the draft's first two lines are wrong, or None when they are right."""
     stations, rule = config.stations, config.rule
     lines = draft.split("\n")
-    signature = stations.signature(stations.designer)
-    if not lines[0].startswith(signature):
-        return f"line 1 must start with {signature!r}, not {lines[0][:40]!r}"
+    if not lines[0].startswith(config.designer_signatures):
+        signatures = " or ".join(repr(signature) for signature in config.designer_signatures)
+        return f"line 1 must start with {signatures}, not {lines[0][:40]!r}"
     label = f"{rule.type_label}{stations.separator}"
     if len(lines) < 2 or not lines[1].startswith(label):
         return f"line 2 must start with {label!r}, not {(lines[1] if len(lines) > 1 else '')[:40]!r}"

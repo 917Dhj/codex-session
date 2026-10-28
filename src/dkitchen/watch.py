@@ -66,9 +66,11 @@ def role(body: str, config: Config) -> str:
     session signature (`Codex session:`, or `Claude session:` for an executor run in Claude Code); else the user.
     A session signature quoted inside a line signs nothing."""
     stations = config.stations
-    first = next((line for line in body.splitlines() if line.strip()), "")
-    first = re.sub(r"^[\s#*>]+", "", first)
-    signed = next((name for name in (stations.designer, stations.verifier, stations.orchestrator)
+    first_line = next((line for line in body.splitlines() if line.strip()), "")
+    first = re.sub(r"^[\s#*>]+", "", first_line)
+    if first_line.startswith(config.designer_signatures) or first.startswith(config.designer_signatures):
+        return stations.designer
+    signed = next((name for name in (stations.verifier, stations.orchestrator)
                    if first.startswith(name)), None)
     if signed:
         return signed
