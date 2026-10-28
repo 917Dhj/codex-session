@@ -41,6 +41,9 @@ Every key is optional. The defaults match the English templates in kitchen/:
     type_label = "Type"                  # then a line `<type_label><separator><one of types>`
     types = ["actionable", "proposal, awaiting user", "record"]
     notify = "#{ticket} answered, see the ticket {url}"   # message `--notify` sends; also {first_line}
+
+    [watch]
+    idle_minutes = 45                    # 0 disables idle-executor wakes
 """
 from __future__ import annotations
 
@@ -106,6 +109,31 @@ class Sessions:
     def session_name(self, *, issue: int, name: str, repo: str) -> str:
         return self.name.format(issue=issue, name=name, repo=repo)
 
+    def issue_number(self, name: str, repo: str = "") -> int | None:
+        """The ticket encoded by the template, or None when it cannot be recovered reliably."""
+        pattern, captured, previous = "", set(), None
+        for literal, field, spec, _ in string.Formatter().parse(self.name):
+            pattern += re.escape(literal)
+            if field is None:
+                continue
+            if not literal and {previous, field} == {"issue", "name"}:
+                return None
+            if field == "repo":
+                pattern += re.escape(format(repo, spec))
+            elif field in captured:
+                pattern += f"(?P={field})"
+            else:
+                pattern += f"(?P<{field}>{' *[0-9]+ *' if field == 'issue' else '.*?'})"
+                captured.add(field)
+            previous = field
+        match = re.fullmatch(pattern, name, flags=re.DOTALL)
+        if match is None or "issue" not in captured:
+            return None
+        number = int(match["issue"])
+        if number <= 0 or self.session_name(issue=number, name=match.groupdict().get("name", ""), repo=repo) != name:
+            return None
+        return number
+
 
 @dataclass(frozen=True)
 class Relay:
@@ -124,6 +152,11 @@ class Rule:
 class Launch:
     preflight: tuple[str, ...] = ()
     preflight_timeout: float = 300
+
+
+@dataclass(frozen=True)
+class Watch:
+    idle_minutes: float = 45
 
 
 SESSION_FIELDS = ("issue", "name", "repo")
@@ -162,6 +195,7 @@ class Config:
     relay: Relay = Relay()
     rule: Rule = Rule()
     launch: Launch = Launch()
+    watch: Watch = Watch()
 
     @property
     def designer_signatures(self) -> tuple[str, ...]:
@@ -204,6 +238,10 @@ def section(cls, values: object, name: str):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{FILE}: [launch] preflight_timeout must be a positive finite number of seconds")
+        elif key == "idle_minutes":
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{FILE}: [watch] idle_minutes must be a nonnegative finite number of minutes")
         elif key == "notify":
             if not isinstance(value, str) or "{url}" not in value:
                 raise ValueError(f"{FILE}: [rule] notify must be a string holding {{url}}")
@@ -246,7 +284,7 @@ def load(cwd: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
     sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay,
-                "rule": Rule, "launch": Launch}
+                "rule": Rule, "launch": Launch, "watch": Watch}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

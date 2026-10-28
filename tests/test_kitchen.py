@@ -98,7 +98,7 @@ def test_board_status_falls_back_to_the_config_fields(tmp_path, monkeypatch, cap
     monkeypatch.delenv("DING_STATUS_FIELDS", raising=False)
     monkeypatch.setattr(ding, "unwrapped_tasks", lambda **kwargs: [])
     seen = {}
-    monkeypatch.setattr(ding, "show_board", lambda path, all_threads, status: seen.setdefault("fields", status))
+    monkeypatch.setattr(ding, "show_board", lambda path, all_threads, status, no_issue_lookup: seen.setdefault("fields", status))
     assert ding.main(["board", "--status"]) == 0
     assert seen["fields"] == ("状态", "在等", "关键数字", "下一步")
     monkeypatch.setenv("DING_STATUS_FIELDS", "A,B")
@@ -818,3 +818,467 @@ def test_watch_does_not_report_a_configured_designer_as_user(tmp_path, monkeypat
     found = watch.collect(loaded, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z", set(), set())
     assert len(found) == 1
     assert "#25 用户 comment" in found[0][1] and found[0][2] is True
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_watch_post_settle_timeout_is_retried_without_losing_batch(tmp_path, monkeypatch, capsys, recover):
+    import subprocess
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    monkeypatch.setattr(config, "load", lambda: loaded)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    pulls = []
+    original_since = "2026-10-14T08:00:00Z"
+    state = tmp_path / "watch.json"
+    state.write_text(json.dumps({"since": original_since, "seen": [], "stale": []}))
+    original = state.read_bytes()
+
+    def gh(path):
+        assert state.read_bytes() == original
+        if "/issues/comments?" in path:
+            return [comment(26, "User question")]
+        if "/pulls?" in path:
+            pulls.append(path)
+            if len(pulls) % 2 == 0 and (not recover or len(pulls) == 2):
+                raise subprocess.TimeoutExpired(["gh", "api", path], 60)
+        return []
+
+    monkeypatch.setattr(watch, "gh", gh)
+    result = ding.main(["watch", "--state", str(state), "--interval", "0", "--settle", "0", "--max-errors", "2"])
+    assert result == (0 if recover else 2)
+    captured = capsys.readouterr()
+    assert "poll failed 1/2" in captured.err
+    assert len(pulls) == 4
+    if recover:
+        assert captured.out.count("#26 User comment") == 1
+        assert json.loads(state.read_text())["since"] != original_since
+    else:
+        assert state.read_bytes() == original
+        assert "#26 User comment" not in captured.out
+
+
+@pytest.fixture
+def idle_ticket(tmp_path, monkeypatch):
+    class Clock(datetime):
+        moment = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.moment
+
+    monkeypatch.setattr(watch, "datetime", Clock)
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    last = {"id": 2601, "body": executor("Status: in progress\nWaiting on: none\nKey numbers: 1\nNext: check"),
+            "created_at": "2026-10-28T10:00:00Z", "updated_at": "2026-10-28T10:00:00Z",
+            "html_url": "https://github.com/o/r/issues/26#issuecomment-2601"}
+    issue = {"number": 26, "comments": 1, "labels": [], "updated_at": last["updated_at"]}
+    state = SimpleNamespace(config=loaded, clock=Clock, last=last, issues=[issue], comments=[last],
+                            board="NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n【#26】worker\t/r\tidle\t#26\thead\t\n", panes="")
+    calls = []
+
+    def gh(path):
+        calls.append(path)
+        if "/issues/26/comments?" in path:
+            return state.comments
+        if "/issues?state=open&per_page=100" in path:
+            return state.issues
+        raise AssertionError(path)
+
+    monkeypatch.setattr(watch, "gh", gh)
+    state.board_reader = watch.board_output
+    monkeypatch.setattr(watch, "board_output", lambda checkout: state.board)
+    monkeypatch.setattr(watch, "tmux_panes", lambda: state.panes)
+    state.calls = calls
+    return state
+
+
+def check_idle(ticket, observed=None, reported=None, skip=None):
+    return watch.idle(ticket.config, "o/r", ticket.config.root,
+                      observed or {}, reported or set(), skip or set())
+
+
+def test_idle_executor_wakes_after_threshold_and_reports_comment_summary(idle_ticket):
+    ticket = idle_ticket
+    found, observed = check_idle(ticket)
+    assert found == []
+    assert observed == {"26": {"comment_id": 2601, "since": "2026-10-28T12:00:00Z"}}
+    ticket.clock.moment += timedelta(minutes=46)
+    found, observed = check_idle(ticket, observed)
+    assert len(found) == 1 and found[0][2] == 2601
+    assert "#26 executor idle for 46 minutes while still in progress" in found[0][1]
+    assert "no running ding run or tmux job" in found[0][1]
+    assert "Status: in progress; Waiting on: none" in found[0][1]
+    assert ticket.last["html_url"] in found[0][1]
+
+
+@pytest.mark.parametrize("condition", ["active", "unknown", "run", "tmux", "no_session", "done", "label", "skip"])
+def test_idle_wake_requires_every_condition_and_resets_observation(idle_ticket, condition):
+    ticket = idle_ticket
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    skip = set()
+    if condition in {"active", "unknown"}:
+        ticket.board += f"【#26】other\t/r\t{condition}\t#26\thead\t\n"
+    elif condition == "run":
+        ticket.board = ticket.board.replace("head\t\n", "head\trunning\n")
+    elif condition == "tmux":
+        ticket.panes = "ding-issue26-job|0|python\n"
+    elif condition == "no_session":
+        ticket.board = ticket.board.replace("#26", "#27")
+    elif condition == "done":
+        ticket.last["body"] = ticket.last["body"].replace("in progress", "done")
+    elif condition == "label":
+        ticket.issues[0]["labels"] = [{"name": "status:awaiting-user"}]
+    elif condition == "skip":
+        skip = {26}
+    found, pending = check_idle(ticket, observed, skip=skip)
+    assert found == [] and pending == {}
+
+
+@pytest.mark.parametrize("minutes", [44, 45])
+def test_idle_threshold_must_be_exceeded(idle_ticket, minutes):
+    _, observed = check_idle(idle_ticket)
+    idle_ticket.clock.moment += timedelta(minutes=minutes)
+    assert check_idle(idle_ticket, observed)[0] == []
+
+
+def test_idle_accepts_not_loaded_sessions_and_ignores_shell_or_dead_tmux(idle_ticket):
+    ticket = idle_ticket
+    ticket.board += "【#26】other\t/r\tnotLoaded\t#26\thead\t\n"
+    ticket.panes = "ding-issue26-shell|0|bash\nding-issue26-done|1|python\n"
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    assert len(check_idle(ticket, observed)[0]) == 1
+
+
+def test_idle_reports_once_per_comment_and_new_comment_starts_a_new_period(idle_ticket):
+    ticket = idle_ticket
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    found, observed = check_idle(ticket, observed)
+    assert len(found) == 1
+    reported = {found[0][2]}
+    assert check_idle(ticket, observed, reported)[0] == []
+    ticket.last.update(id=2602, created_at="2026-10-28T13:00:00Z", updated_at="2026-10-28T13:00:00Z")
+    found, observed = check_idle(ticket, observed, reported)
+    assert found == [] and observed["26"]["comment_id"] == 2602
+    ticket.clock.moment += timedelta(minutes=46)
+    assert check_idle(ticket, observed, reported)[0][0][2] == 2602
+
+
+def test_idle_uses_latest_executor_comment_even_after_a_user_reply(idle_ticket):
+    ticket = idle_ticket
+    ticket.comments.append({"id": 2602, "body": "User followup"})
+    ticket.issues[0]["comments"] = 2
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    assert check_idle(ticket, observed)[0][0][2] == 2601
+
+
+def test_idle_never_ages_before_the_latest_executor_comment_update(idle_ticket):
+    ticket = idle_ticket
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    ticket.last["updated_at"] = "2026-10-28T12:50:00Z"
+    assert check_idle(ticket, observed)[0] == []
+
+
+def test_idle_disabled_does_not_query_github_board_or_tmux(tmp_path, monkeypatch):
+    loaded = settings(tmp_path, '[watch]\nidle_minutes = 0')
+    def unexpected(*args):
+        pytest.fail("disabled idle check must not query")
+    for name in ("gh", "board_output", "tmux_panes"):
+        monkeypatch.setattr(watch, name, unexpected)
+    assert watch.idle(loaded, "o/r", tmp_path, {}, set(), set()) == ([], {})
+
+
+@pytest.mark.parametrize("value", ['-1', '"45"', 'true', 'nan', 'inf'])
+def test_bad_watch_idle_minutes_is_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match=r"\[watch\] idle_minutes must be a nonnegative finite number"):
+        settings(tmp_path, f"[watch]\nidle_minutes = {value}")
+
+
+def test_watch_config_defaults_and_unknown_keys(tmp_path):
+    assert settings(tmp_path).watch.idle_minutes == 45
+    assert settings(tmp_path, '[watch]\nidle_minutes = 0.5').watch.idle_minutes == 0.5
+    with pytest.raises(ValueError, match=r"unknown keys in \[watch\]: idle_minute"):
+        settings(tmp_path, '[watch]\nidle_minute = 1')
+
+
+def test_idle_observation_survives_restart_without_advancing_since(idle_ticket, monkeypatch, capsys):
+    ticket = idle_ticket
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    calls = []
+
+    def collect(*args):
+        calls.append(None)
+        if len(calls) > 1:
+            raise RuntimeError("offline")
+        return []
+
+    monkeypatch.setattr(watch, "collect", collect)
+    path = ticket.config.root / "watch.json"
+    arguments = ["watch", "--state", str(path), "--since", "2026-10-28T10:00:00Z",
+                 "--interval", "0", "--settle", "0", "--stale-every", "0", "--max-errors", "1"]
+    assert ding.main(arguments) == 2
+    state = json.loads(path.read_text())
+    assert state["since"] == "2026-10-28T10:00:00Z"
+    assert state["idle_observed"]["26"]["since"] == "2026-10-28T12:00:00Z"
+    assert state["labels_since"] == "2026-10-28T10:00:00Z"
+    def resumed_collect(config, repo, since, labels_since, seen, skip):
+        assert since == labels_since == "2026-10-28T10:00:00Z"
+        return []
+    monkeypatch.setattr(watch, "collect", resumed_collect)
+    ticket.clock.moment += timedelta(hours=1)
+    assert ding.main(arguments) == 0
+    state = json.loads(path.read_text())
+    assert state["idle_reported"] == [2601]
+    assert "labels_since" not in state
+    assert state["stale"] == []
+    assert capsys.readouterr().out.count("#26 executor idle") == 1
+    assert check_idle(ticket, state["idle_observed"], set(state["idle_reported"]))[0] == []
+
+
+@pytest.mark.parametrize("stage", ["collect", "stale", "idle"])
+@pytest.mark.parametrize("recover", [True, False])
+def test_watch_bounds_errors_in_every_poll_phase(tmp_path, monkeypatch, capsys, stage, recover):
+    import subprocess
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    monkeypatch.setattr(config, "load", lambda: loaded)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    item = ("2026-10-28T12:00:00Z", "#26 recovered", True)
+    monkeypatch.setattr(watch, "collect", lambda *args: [item] if stage == "collect" else [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    attempts = []
+
+    def fail_then_recover(*args):
+        attempts.append(None)
+        if len(attempts) == 1 or not recover:
+            if stage == "stale":
+                raise RuntimeError("gh api failed")
+            raise subprocess.TimeoutExpired(["gh", "api"], 60)
+        if stage == "collect":
+            return [item]
+        return [(item[0], item[1], 2601)] if stage == "stale" else ([(item[0], item[1], 2601)], {})
+
+    monkeypatch.setattr(watch, stage, fail_then_recover)
+    path = tmp_path / "watch.json"
+    result = ding.main(["watch", "--state", str(path), "--interval", "0", "--settle", "0", "--max-errors", "2"])
+    assert result == (0 if recover else 2)
+    captured = capsys.readouterr()
+    assert "poll failed 1/2" in captured.err
+    if recover:
+        assert captured.out.count("#26 recovered") == 1
+        assert path.exists()
+    else:
+        assert len(attempts) == 2
+        assert "poll failed 2/2" in captured.err
+        assert not path.exists()
+
+
+def test_idle_paginates_back_to_the_latest_executor_comment(idle_ticket, monkeypatch):
+    ticket = idle_ticket
+    ticket.issues[0]["comments"] = 101
+    gh = watch.gh
+    pages = []
+    def comments(path):
+        if "/issues/26/comments?" in path:
+            pages.append(path)
+            return [{"body": "User followup"}] if path.endswith("page=2") else [ticket.last]
+        return gh(path)
+    monkeypatch.setattr(watch, "gh", comments)
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    assert check_idle(ticket, observed)[0][0][2] == 2601
+    assert len(pages) == 4
+
+
+def test_idle_wake_skips_log_issue(idle_ticket, monkeypatch, capsys):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, log=config.Log(issue=26))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    calls = []
+    def collect(*args):
+        calls.append(None)
+        if len(calls) > 1:
+            return [("2026-10-28T12:00:00Z", "other event", True)]
+        return []
+    monkeypatch.setattr(watch, "collect", collect)
+    path = ticket.config.root / "watch.json"
+    assert ding.main(["watch", "--state", str(path), "--interval", "0", "--settle", "0"]) == 0
+    assert json.loads(path.read_text())["idle_observed"] == {}
+    assert "#26 executor idle" not in capsys.readouterr().out
+
+
+def test_stale_keeps_its_existing_silence_rule_and_comment_deduplication(idle_ticket):
+    ticket = idle_ticket
+    ticket.clock.moment += timedelta(hours=6)
+    found = watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set())
+    assert len(found) == 1 and found[0][2] == 2601
+    assert "executor silent for over 6 hours" in found[0][1]
+    assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, {2601}, set()) == []
+    ticket.panes = "ding-issue26-job|0|python\n"
+    assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set()) == []
+
+
+def test_idle_and_stale_use_template_names_with_an_empty_issue_column(idle_ticket):
+    ticket = idle_ticket
+    ticket.board = "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n【#26】worker\t/r\tidle\t\thead\t\n"
+    _, observed = check_idle(ticket)
+    ticket.clock.moment += timedelta(hours=1)
+    assert check_idle(ticket, observed)[0][0][2] == 2601
+    ticket.clock.moment += timedelta(hours=5)
+    ticket.board = ticket.board.replace("head\t\n", "head\trunning\n")
+    assert watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set()) == []
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_watch_board_skips_lookup_and_checks_exit_code(tmp_path, monkeypatch, code):
+    output = "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\nworker\t/r\tidle\t\thead\t\n"
+    def board(argv, **kwargs):
+        assert argv[-2:] == ["board", "--no-issue-lookup"]
+        return SimpleNamespace(returncode=code, stdout=output, stderr="board failed" if code else "")
+    monkeypatch.setattr(watch.subprocess, "run", board)
+    if code:
+        with pytest.raises(RuntimeError, match="board failed"):
+            watch.board_output(tmp_path)
+    else:
+        assert watch.board_output(tmp_path) == output
+
+
+def test_idle_schedule_is_independent_of_hourly_stale_check(idle_ticket, monkeypatch, capsys):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, watch=config.Watch(idle_minutes=15))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    start = ticket.clock.moment
+    monkeypatch.setattr(watch.time, "monotonic", lambda: (ticket.clock.moment - start).total_seconds())
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: setattr(
+        ticket.clock, "moment", ticket.clock.moment + timedelta(seconds=seconds)))
+    stale_checks = []
+    monkeypatch.setattr(watch, "stale", lambda *args: stale_checks.append(ticket.clock.moment) or [])
+    result = ding.main(["watch", "--state", str(ticket.config.root / "watch.json"),
+                        "--interval", "7200", "--stale-every", "3600", "--settle", "0"])
+    assert result == 0
+    assert ticket.clock.moment - start == timedelta(minutes=20)
+    assert stale_checks == [start]
+    assert "#26 executor idle" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("template, name, repo, expected", [
+    ("【#{issue}】{name}", "【#868】worker", "", 868),
+    ("【#{issue}】{name}", "【#868】two\nlines", "", 868),
+    ("【#{issue}】{name}", "【#0】worker", "", None),
+    ("【#{issue}】{name}", "【# 】worker", "", None),
+    ("【#{issue}】{name}", "Legacy worker", "", None),
+    ("{repo}#{issue:04d} {name}", "o/r#0868 Plot", "o/r", 868),
+    ("{repo}#{issue:04d} {name}", "other/repo#0868 Plot", "o/r", None),
+    ("{{x}} {issue:^6d} :: {name}", "{x}   26   :: Plot", "", 26),
+    ("{name} #{issue}", "Worker #868", "", 868),
+    ("#{issue} {name} #{issue}", "#26 Worker #26", "", 26),
+    ("#{issue}", "#26", "", 26),
+    ("{name}", "Worker #868", "", None),
+    ("{issue}{name}", "868worker", "", None),
+])
+def test_session_template_ticket_parsing(template, name, repo, expected):
+    assert config.Sessions(name=template).issue_number(name, repo) == expected
+
+
+@pytest.mark.parametrize("phase", ["stale", "idle"])
+def test_board_error_is_a_failed_poll_in_both_checks(idle_ticket, monkeypatch, capsys, phase):
+    ticket = idle_ticket
+    ticket.clock.moment += timedelta(hours=6)
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    if phase == "idle":
+        monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    def board_failure(*args):
+        raise RuntimeError("ding board failed: App Server unavailable")
+    monkeypatch.setattr(watch, "board_output", board_failure)
+    path = ticket.config.root / "watch.json"
+    assert ding.main(["watch", "--state", str(path), "--interval", "0", "--max-errors", "2"]) == 2
+    assert not path.exists()
+    output = capsys.readouterr()
+    assert "poll failed 1/2" in output.err and "poll failed 2/2" in output.err
+    assert "#26 executor" not in output.out
+
+
+@pytest.mark.parametrize("minutes, every", [(3, 60), (45, 900), (120, 900)])
+def test_idle_cadence_is_capped_independently_of_poll_interval(idle_ticket, monkeypatch, minutes, every):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, watch=config.Watch(idle_minutes=minutes))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    start = ticket.clock.moment
+    monkeypatch.setattr(watch.time, "monotonic", lambda: (ticket.clock.moment - start).total_seconds())
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: setattr(
+        ticket.clock, "moment", ticket.clock.moment + timedelta(seconds=seconds)))
+    checks = []
+    def idle(*args):
+        checks.append((ticket.clock.moment - start).total_seconds())
+        found = [(watch.now(), "idle wake", 2601)] if len(checks) == 3 else []
+        return found, {}
+    monkeypatch.setattr(watch, "idle", idle)
+    assert ding.main(["watch", "--state", str(ticket.config.root / "watch.json"),
+                      "--interval", "7200", "--stale-every", "3600"]) == 0
+    assert checks == [0, every, 2 * every]
+
+
+@pytest.mark.parametrize("unmatched_status", ["idle", "active"])
+def test_watch_mixed_session_names_skip_failing_repository_scan(idle_ticket, monkeypatch, capsys, unmatched_status):
+    import contextlib
+    import io
+    import subprocess
+    ticket = idle_ticket
+    root = ticket.config.root
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "board_output", ticket.board_reader)
+    monkeypatch.setattr(ding, "repository_roots", lambda: [root])
+    monkeypatch.setattr(ding, "latest_runs", lambda: {})
+    monkeypatch.setattr(ding, "unwrapped_tasks", lambda **kwargs: [])
+    threads = [{"id": str(index), "name": name, "cwd": str(root), "status": {"type": "idle"}}
+               for index, name in enumerate(["【#26】worker", "检查 gml_10 系统盘"])]
+    threads[1]["status"]["type"] = unmatched_status
+    @contextlib.contextmanager
+    def server(path):
+        yield lambda *args: {}
+    monkeypatch.setattr(ding, "app_server", server)
+    monkeypatch.setattr(ding, "socket_path", lambda path: "/mock.sock")
+    monkeypatch.setattr(ding, "board_threads", lambda *args: threads)
+    monkeypatch.setattr(ding, "read_reply", lambda *args: "")
+    lookups = []
+    def failing_scan():
+        lookups.append(None)
+        raise subprocess.TimeoutExpired(["gh", "api", "repository-wide scan"], 60)
+    monkeypatch.setattr(ding, "issue_map", failing_scan)
+    def board(argv, **kwargs):
+        assert argv[:4] == [watch.sys.executable, "-m", "dkitchen.ding", "board"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = ding.main(argv[3:])
+        if code == 0:
+            rows = [line.split("\t") for line in stdout.getvalue().splitlines()[1:]]
+            assert [row[3] for row in rows] == ["#26", ""]
+        return SimpleNamespace(returncode=code, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+    monkeypatch.setattr(watch.subprocess, "run", board)
+    path = root / "watch.json"
+    path.write_text(json.dumps({"since": "2026-10-28T10:00:00Z", "seen": [], "stale": [],
+                               "idle_observed": {"26": {"comment_id": 2601, "since": "2026-10-28T11:00:00Z"}}}))
+    assert ding.main(["watch", "--state", str(path), "--max-errors", "1"]) == 0
+    assert lookups == []
+    output = capsys.readouterr()
+    assert "#26 executor idle" in output.out
+    assert "poll failed" not in output.err
+    assert json.loads(path.read_text())["idle_reported"] == [2601]

@@ -2,6 +2,7 @@
 
 Wakes on:
 - executor comments whose status is not "in progress", or whose "waiting on" names a station or the user;
+- idle executors still marked "in progress", after [watch] idle_minutes with no running job;
 - comments from the user (no station signature);
 - status labels being added, and newly opened PRs;
 - stale tickets: no status label, last comment an executor "in progress" older than --stale-hours,
@@ -26,7 +27,7 @@ import subprocess
 import sys
 import time
 
-from dkitchen.config import Config
+from dkitchen.config import Config, Sessions
 
 SHELLS = {"bash", "sh", "zsh", "dash", "fish"}
 
@@ -134,25 +135,36 @@ def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[
     return sorted({item for item in found if item[1] not in seen})
 
 
-def board_running(output: str) -> set[int]:
-    """Tickets whose session has a running `ding run`, from `ding board`'s ISSUE and RUN columns."""
+def board_tickets(cells: list[str], sessions: Sessions, repo: str) -> set[int]:
+    name = json.loads('"' + cells[0] + '"')
+    number = sessions.issue_number(name, repo)
+    return {number} if number is not None else {int(value) for value in re.findall(r"#(\d+)", cells[3])}
+
+
+def board_running(output: str, sessions: Sessions = Sessions(), repo: str = "") -> set[int]:
+    """Tickets with a running `ding run`, using template names before the board ISSUE column."""
     running = set()
     for line in output.splitlines():
         if not line.strip():
             break  # the unwrapped-process table follows a blank line
         cells = line.split("\t")
         if len(cells) >= 6 and cells[5] == "running":
-            running.update(int(number) for number in re.findall(r"#(\d+)", cells[3]))
+            running.update(board_tickets(cells, sessions, repo))
     return running
 
 
-def running_issues(checkout: Path) -> set[int]:
+def board_output(checkout: Path) -> str:
     # The ISSUE column is filled only for sessions of the repository in the current directory.
-    result = subprocess.run([sys.executable, "-m", "dkitchen.ding", "board"], capture_output=True, text=True,
+    result = subprocess.run([sys.executable, "-m", "dkitchen.ding", "board", "--no-issue-lookup"],
+                            capture_output=True, text=True,
                             timeout=120, cwd=checkout)
     if result.returncode:
         raise RuntimeError(f"ding board failed: {result.stderr.strip()[:200]}")
-    return board_running(result.stdout)
+    return result.stdout
+
+
+def running_issues(checkout: Path, sessions: Sessions = Sessions(), repo: str = "") -> set[int]:
+    return board_running(board_output(checkout), sessions, repo)
 
 
 def tmux_issues(panes: str) -> set[int]:
@@ -184,7 +196,7 @@ def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set
                   if "pull_request" not in issue and issue["number"] not in skip and issue["comments"]
                   and issue["updated_at"] < cutoff
                   and not any(label["name"].startswith(config.labels.prefix) for label in issue["labels"])]
-    running = running_issues(checkout) | tmux_issues(tmux_panes()) if candidates else set()
+    running = running_issues(checkout, config.sessions, repo) | tmux_issues(tmux_panes()) if candidates else set()
     found = []
     for issue in candidates:
         if issue["number"] in running:
@@ -196,6 +208,58 @@ def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set
                                               f"running ding run or tmux job: {summary(last['body'], config)} "
                                               f"{last['html_url']}", last["id"]))
     return found
+
+
+def idle(config: Config, repo: str, checkout: Path, observed: dict, reported: set[int],
+         skip: set[int]) -> tuple[list[tuple[str, str, int]], dict]:
+    """Idle in-progress executors, and first-observation times when board has no session update time."""
+    if config.watch.idle_minutes == 0:
+        return [], {}
+    issues = [issue for issue in gh(f"repos/{repo}/issues?state=open&per_page=100")
+              if "pull_request" not in issue and issue["number"] not in skip and issue["comments"]
+              and not any(label["name"].startswith(config.labels.prefix) for label in issue["labels"])]
+    if not issues:
+        return [], {}
+    output = board_output(checkout)
+    sessions = {}
+    for line in output.splitlines()[1:]:
+        if not line.strip():
+            break
+        cells = line.split("\t")
+        if len(cells) >= 6:
+            for number in board_tickets(cells, config.sessions, repo):
+                sessions.setdefault(number, []).append(cells[2])
+    running = board_running(output, config.sessions, repo) | tmux_issues(tmux_panes())
+    moment = datetime.now(timezone.utc)
+    found, pending = [], {}
+    for issue in issues:
+        number = issue["number"]
+        if (number in running or not sessions.get(number)
+                or any(status not in {"idle", "notLoaded"} for status in sessions[number])):
+            continue
+        last = None
+        for page in range((issue["comments"] + 99) // 100, 0, -1):
+            comments = gh(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
+            last = next((comment for comment in reversed(comments)
+                         if role(comment["body"], config) == config.stations.executor), None)
+            if last:
+                break
+        if (last is None or last["id"] in reported
+                or state_and_waiting(last["body"], config)[0] != config.status.in_progress):
+            continue
+        previous = observed.get(str(number), {})
+        since = previous.get("since") if previous.get("comment_id") == last["id"] else None
+        # Board exposes no session update time; persist when all idle conditions were first observed.
+        since = since or stamp(moment)
+        pending[str(number)] = {"comment_id": last["id"], "since": since}
+        began = max(datetime.fromisoformat(since.replace("Z", "+00:00")),
+                    datetime.fromisoformat(last.get("updated_at", last["created_at"]).replace("Z", "+00:00")))
+        minutes = (moment - began).total_seconds() / 60
+        if minutes > config.watch.idle_minutes:
+            found.append((stamp(moment), f"#{number} executor idle for {minutes:.0f} minutes while still in progress, "
+                                        f"with no running ding run or tmux job: {summary(last['body'], config)} "
+                                        f"{last['html_url']}", last["id"]))
+    return found, pending
 
 
 def default_state(repo: str) -> Path:
@@ -218,19 +282,31 @@ def watch(args, config: Config) -> int:
     state = (json.loads(path.read_text()) if path.exists()
              else {"since": args.since or started, "seen": [], "stale": []})
     since, seen, reported = state["since"], set(state["seen"]), set(state.get("stale", []))
+    observed, idle_reported = state.get("idle_observed", {}), set(state.get("idle_reported", []))
     skip = set(args.skip_issue) | ({config.log.issue} if config.log.issue else set())
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
-    labels_since = max(since, started) if path.exists() else since
+    labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
     print(f"Watching {repo}: comments and PRs since {since}, labels since {labels_since}", file=sys.stderr)
-    errors, next_stale = 0, 0.0
+    errors, next_stale, next_idle = 0, 0.0, 0.0
+    idle_every = min(config.watch.idle_minutes * 20, 900) if config.watch.idle_minutes else float("inf")
     while True:
         polled = now()
         try:
             found = collect(config, repo, since, labels_since, seen, skip)
-            quiet = []
-            if time.monotonic() >= next_stale:
+            quiet, idle_found, pending, stale_ids = [], [], observed, set()
+            checked_at = time.monotonic()
+            checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
+            if checked_stale:
                 quiet = stale(config, repo, checkout, args.stale_hours, reported, skip)
-                next_stale = time.monotonic() + args.stale_every
+                stale_ids = {id_ for _, _, id_ in quiet}
+            if checked_idle:
+                idle_found, pending = idle(config, repo, checkout, observed, idle_reported, skip)
+                quiet += [item for item in idle_found if item[2] not in {entry[2] for entry in quiet}]
+            if any(wakes for _, _, wakes in found) or quiet:
+                if found:
+                    time.sleep(args.settle)
+                    polled = now()
+                    found = collect(config, repo, since, labels_since, seen, skip)
             errors = 0
         except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
             errors += 1
@@ -239,20 +315,32 @@ def watch(args, config: Config) -> int:
                 print(f"{errors} polls failed in a row; the watch exits without advancing its state. "
                       "Rerun the same command once fixed.")
                 return 2
-            time.sleep(args.interval)
+            time.sleep(min(args.interval, idle_every))
             continue
-        if any(wakes for _, _, wakes in found) or quiet:
-            if found:
-                time.sleep(args.settle)
-                polled = now()
-                found = collect(config, repo, since, labels_since, seen, skip)
+        if checked_stale:
+            next_stale = time.monotonic() + args.stale_every
+        if checked_idle:
+            next_idle = checked_at + idle_every
+        wakes = any(wakes for _, _, wakes in found) or bool(quiet)
+        changed = pending != observed
+        observed = pending
+        if wakes:
             for _, line in sorted([(time_, line) for time_, line, _ in found] + [(time_, line) for time_, line, _ in quiet]):
                 print(line)
             print(f"{len(found) + len(quiet)} items ({since} to {polled}). "
                   "After handling them, start the watch again with the same command.")
+            state.pop("labels_since", None)
+            state.update(since=polled, seen=[line for time_, line, _ in found if time_ >= polled],
+                         stale=sorted(reported | stale_ids),
+                         idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}))
+        if changed and not wakes:
+            state["labels_since"] = labels_since
+        if wakes or changed:
+            state["idle_observed"] = observed
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"since": polled, "seen": [line for time_, line, _ in found if time_ >= polled],
-                                       "stale": sorted(reported | {id_ for _, _, id_ in quiet})}, ensure_ascii=False))
+            tmp.write_text(json.dumps(state, ensure_ascii=False))
             tmp.replace(path)
+        if wakes:
             return 0
-        time.sleep(args.interval)
+        time.sleep(min(args.interval, max(0, next_stale - time.monotonic()),
+                       max(0, next_idle - time.monotonic())))

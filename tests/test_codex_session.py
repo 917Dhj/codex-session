@@ -1754,10 +1754,12 @@ def test_board_issue_failure_warns_and_still_succeeds(monkeypatch, capsys, error
         raise error
 
     monkeypatch.setattr(ding, "github_repository", fail)
-    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *a: {"data": []}))
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(
+        lambda method, params: {"data": [thread(name="Legacy worker")]} if method == "thread/list" else {"data": []}))
     assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
     output = capsys.readouterr()
-    assert output.out == "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n"
+    assert len(output.out.splitlines()) == 2
+    assert "Legacy worker" in output.out
     assert len(output.err.splitlines()) == 1
     assert output.err.startswith("ding: issue lookup failed:")
 
@@ -3648,3 +3650,46 @@ def test_refused_preflight_preserves_and_hashes_opaque_receipt(tmp_path, preflig
     event = preflight_event(record)
     assert Path(event["receipt_path"]).read_bytes() == b"not JSON"
     assert event["receipt_sha256"] == hashlib.sha256(b"not JSON").hexdigest()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_board_template_ticket_precedes_owner_fallback(tmp_path, monkeypatch, capsys, legacy):
+    from dkitchen import config
+    monkeypatch.setattr(config, "load", lambda: config.Config(root=tmp_path, repo="o/r"))
+    threads = [thread(name="【#26】worker", cwd=str(tmp_path))]
+    if legacy:
+        threads.append(thread(OTHER_ID, name="Legacy worker", cwd=str(tmp_path)))
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(
+        lambda method, params: {"data": threads} if method == "thread/list" else {"data": []}))
+    lookups = []
+    def fallback():
+        lookups.append(None)
+        assert legacy, "template names must not trigger a repository scan"
+        return {THREAD_ID: {99}, OTHER_ID: {28}}
+    monkeypatch.setattr(ding, "issue_map", fallback)
+    assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
+    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines()[1:]]
+    assert rows[0][3] == "#26"
+    if legacy:
+        assert rows[1][3] == "#28"
+    assert len(lookups) == int(legacy)
+
+
+def test_empty_board_does_not_query_issue_attribution(monkeypatch, capsys):
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(lambda *args: {"data": []}))
+    def unexpected():
+        pytest.fail("no sessions require issue attribution")
+    monkeypatch.setattr(ding, "issue_map", unexpected)
+    assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
+    assert capsys.readouterr().out == "NAME\tCWD\tSTATUS\tISSUE\tHEAD\tRUN\n"
+
+
+def test_board_all_does_not_use_another_repositories_template_name(tmp_path, monkeypatch, capsys):
+    from dkitchen import config
+    monkeypatch.setattr(config, "load", lambda: config.Config(root=tmp_path, repo="o/r"))
+    monkeypatch.setattr(ding, "issue_map", lambda: {})
+    monkeypatch.setattr(ding, "app_server", lambda path: server_calls(
+        lambda method, params: {"data": [thread(name="【#26】worker", cwd="/another/repository")]}
+        if method == "thread/list" else {"data": []}))
+    assert ding.main(["board", "--all", "--socket", "/test.sock"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split("\t")[3] == ""
