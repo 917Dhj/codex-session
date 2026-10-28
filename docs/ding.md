@@ -381,7 +381,13 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 
 **Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. Executor comments are those signed `Codex session:` or `Claude session:`; when both kinds are on the ticket, the latest comment of either counts. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator, or its optional `[status] pending_merge` field (default *Pending merge*, for example `Pending merge: PR#57, PR#58`) lists this PR. The executor lists a PR there once it needs nothing more on it, so the merge does not wait for the executor to come back from its next task. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
-`ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. Run `ding watch --help` for the timing options.
+`ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. On the `--stale-every` schedule, it also checks for executors still marked in progress whose attributed board sessions are all `idle` or `notLoaded`, with no running `ding run` or live `issue<N>` tmux job. After `[watch] idle_minutes` (default 45), it reports the ticket once per executor comment. Status-labelled tickets, `--skip-issue`, and the log ticket are excluded; a ticket without an attributed session uses only the existing stale check.
+
+`ding board` does not expose session update times. Watch therefore saves when it first observes all the idle conditions, and waits from the later of that observation and the executor comment's update. This observation survives restarts. A new executor comment or a failed idle condition resets the period. Setting `[watch] idle_minutes = 0` disables this wake; the stale check remains enabled.
+
+Failed GitHub calls and timeouts, including a re-collect after `--settle`, use the same bounded retry loop. Only `--max-errors` consecutive failed polls stop it with exit 2; its reporting cursor is not advanced. A failed re-collect prints no partial batch and retries from the same cursor.
+
+Run `ding watch --help` for the timing options.
 
 ### .dkitchen.toml
 
@@ -427,9 +433,14 @@ superseding = "New decision; it replaces earlier relays not yet carried out."   
 type_label = "Type"                  # line 2 reads `<type_label><separator><one of types>`
 types = ["actionable", "proposal, awaiting user", "record"]
 notify = "#{ticket} answered, see the ticket {url}"   # the `--notify` message; `{first_line}` is also available
+
+[watch]
+idle_minutes = 45                    # 0 disables idle-executor wakes
 ```
 
 `[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.
+
+`[watch] idle_minutes` must be a nonnegative finite number of minutes; unknown `[watch]` keys are errors.
 
 `[rule] signatures` lists the full first-line prefixes accepted as designer signatures by both `ding rule` and `ding watch`. It must be a nonempty list of nonempty strings. Prefixes are matched verbatim, including spaces. When omitted, it defaults to `[stations] designer` plus `[stations] separator`.
 

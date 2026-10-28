@@ -1757,7 +1757,7 @@ def main(argv=None) -> int:
     sub.add_argument("--interval", type=float, default=90, help="Seconds between polls (default: 90)")
     sub.add_argument("--settle", type=float, default=300, help="After the first trigger, seconds to wait to batch more (default: 300)")
     sub.add_argument("--stale-hours", type=float, default=6, help="Executor silence that counts as stale (default: 6)")
-    sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale checks (default: 3600)")
+    sub.add_argument("--stale-every", type=float, default=3600, help="Seconds between stale and idle checks (default: 3600)")
     sub.add_argument("--max-errors", type=int, default=10, help="Consecutive failed polls before exiting (default: 10)")
     sub = commands.add_parser(
         "rule", help="Post the designer's ruling on a ticket after checking it, and tell a session",
