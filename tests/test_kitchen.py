@@ -719,3 +719,29 @@ def test_rule_defaults_are_english(tmp_path):
     loaded = settings(tmp_path)
     assert loaded.rule.type_label == "Type" and "actionable" in loaded.rule.types
     assert rule.format_problem("Designer: x\nType: record\n", loaded) is None
+
+
+def test_launch_config_preserves_argv_and_defaults(tmp_path):
+    assert settings(tmp_path).launch == config.Launch()
+    loaded = settings(tmp_path, '[launch]\npreflight = ["python", "", "two words"]')
+    assert loaded.launch.preflight == ("python", "", "two words")
+    assert loaded.launch.preflight_timeout == 300
+
+
+@pytest.mark.parametrize("text, error", [
+    ('preflight = "python check.py"', "argv list"),
+    ('preflight = []', "argv list"),
+    ('preflight = [""]', "argv list"),
+    ('preflight = ["python", 1]', "argv list"),
+    ('preflight = ["python", "\\u0000"]', "argv list"),
+    ('preflight_timeout = 0', "positive finite"),
+    ('preflight_timeout = -1', "positive finite"),
+    ('preflight_timeout = true', "positive finite"),
+    ('preflight_timeout = "300"', "positive finite"),
+    ('preflight_timeout = inf', "positive finite"),
+    ('preflight_timeout = nan', "positive finite"),
+    ('prefligth = ["python"]', "unknown keys"),
+])
+def test_bad_launch_config_is_refused(tmp_path, text, error):
+    with pytest.raises(ValueError, match=error):
+        settings(tmp_path, "[launch]\n" + text)

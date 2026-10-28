@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields as dataclass_fields, replace
 from pathlib import Path
+import math
 import re
 import string
 import subprocess
@@ -117,6 +118,12 @@ class Rule:
     notify: str = "#{ticket} answered, see the ticket {url}"
 
 
+@dataclass(frozen=True)
+class Launch:
+    preflight: tuple[str, ...] = ()
+    preflight_timeout: float = 300
+
+
 SESSION_FIELDS = ("issue", "name", "repo")
 
 
@@ -152,6 +159,7 @@ class Config:
     sessions: Sessions = Sessions()
     relay: Relay = Relay()
     rule: Rule = Rule()
+    launch: Launch = Launch()
 
     def repository(self) -> str:
         """The configured repository, or the one gh sees from the repository root."""
@@ -180,6 +188,16 @@ def section(cls, values: object, name: str):
                 raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty list of "
                                  f"{'field names' if key == 'fields' else 'words'}")
             value = tuple(item.strip() for item in value)
+        elif key == "preflight":
+            if (not isinstance(value, list) or not value
+                    or not all(isinstance(item, str) and "\0" not in item for item in value)
+                    or not value[0].strip()):
+                raise ValueError(f"{FILE}: [launch] preflight must be a nonempty argv list with a nonempty executable")
+            value = tuple(value)
+        elif key == "preflight_timeout":
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{FILE}: [launch] preflight_timeout must be a positive finite number of seconds")
         elif key == "notify":
             if not isinstance(value, str) or "{url}" not in value:
                 raise ValueError(f"{FILE}: [rule] notify must be a string holding {{url}}")
@@ -222,7 +240,7 @@ def load(cwd: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
     sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay,
-                "rule": Rule}
+                "rule": Rule, "launch": Launch}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

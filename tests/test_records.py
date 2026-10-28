@@ -311,3 +311,19 @@ def test_run_malformed_notification_outcome_is_unknown_with_warning(tmp_path, ca
                                   "thread_id": thread_id, "outcome": outcome})
     assert ding.run_state(run) == "unknown"
     assert "invalid notification outcome" in capsys.readouterr().err
+
+
+def test_run_state_accepts_launch_preflight_before_task_events(tmp_path):
+    record = tmp_path / "exit.jsonl"
+    with ding.writer(record):
+        ding.append_jsonl(record, {"event": "preflight", "exit_code": 0, "receipt_path": "opaque.json"})
+    thread_id = "00000000-0000-4000-8000-000000000001"
+    with ding.registered_run(thread_id, record) as run_id:
+        run = {"run_id": run_id, "thread_id": thread_id, "record": str(record)}
+        assert ding.run_state(run) == "running"
+        ding.append_jsonl(record, {"event": "task_exit", "run_id": run_id,
+                                  "thread_id": thread_id, "exit_code": 0})
+        assert ding.run_state(run) == "exited(0)"
+        ding.append_jsonl(record, {"event": "notification", "run_id": run_id,
+                                  "thread_id": thread_id, "outcome": "started"})
+    assert ding.run_state(run) == "exited(0)"
