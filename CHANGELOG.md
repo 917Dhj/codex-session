@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.8
+
+- `ding rule --notify` sends the complete stripped first nonempty line, including through `{first_line}` templates.
+- Shortened terminal hints, watch summaries, PR titles, and diagnostic excerpts end with `…`.
+
 ## 0.5.7
 
 - `ding watch` reports idle executors still marked in progress after `[watch] idle_minutes`, default 45 minutes. Idle checks run every third of the threshold, capped at 15 minutes, independently of stale checks. First-observation times survive restarts; setting 0 disables the new wake.

@@ -1282,3 +1282,91 @@ def test_watch_mixed_session_names_skip_failing_repository_scan(idle_ticket, mon
     assert "#26 executor idle" in output.out
     assert "poll failed" not in output.err
     assert json.loads(path.read_text())["idle_reported"] == [2601]
+
+
+@pytest.mark.parametrize("template", ["#{ticket} 已答复，见票 {url}", "#{ticket} {first_line} {url}"])
+def test_rule_notify_preserves_the_complete_178_character_first_line(ruling, tmp_path, template):
+    first = "总设计：" + "结" * 174
+    assert len(first) == 178
+    configured = RULING.replace('notify = "#{ticket} 已答复，见票 {url}"', f"notify = {json.dumps(template)}")
+    (tmp_path / config.FILE).write_text(configured)
+    assert ruling.run([comment_pages("用户：问"), (0, URL)], "--notify", "#42",
+                      text=first + "  \n类型：可执行\n正文\n") == 0
+    expected = template.format(ticket=42, first_line=first, url=URL)
+    if "{first_line}" not in template:
+        expected += "\n" + first
+    assert ruling.sends == [["send", "#42", "--from", "总设计", "--message", expected]]
+
+
+def test_rule_first_line_is_complete_stripped_and_skips_empty_lines():
+    first = "结" * 178
+    assert rule.first_line("\n  \n " + first + "  \nnext") == first
+    assert rule.first_line("\n \n") == ""
+
+
+@pytest.mark.parametrize("mode", ["latest", "newer"])
+def test_rule_long_comment_hints_add_ellipsis(ruling, capsys, mode):
+    first = "结" * 178
+    if mode == "latest":
+        assert ruling.run([comment_pages(first + "\nnext"), (0, URL)]) == 0
+    else:
+        assert ruling.run([comment_pages("问", first + "\nnext")], "--reply-to", "100") == 1
+    error = capsys.readouterr().err
+    assert repr(first[:100] + "…") in error
+    assert first not in error
+
+
+@pytest.mark.parametrize("length", [0, 39, 40, 80, 100, 101, 160, 178])
+def test_display_truncation_only_marks_shortened_text(length):
+    from dkitchen import truncate
+    text = "结" * length
+    assert truncate(text, 100) == (text if length <= 100 else text[:100] + "…")
+
+
+@pytest.mark.parametrize("body", ["short", "结" * 160, "结" * 178,
+                                   "Status: " + "x" * 100 + "\nWaiting on: " + "y" * 100])
+def test_watch_summary_marks_truncation_only_when_needed(tmp_path, body):
+    full = body.replace("\n", "; ")
+    expected = full[:160] + "…" if len(full) > 160 else full
+    assert watch.summary(body, settings(tmp_path)) == expected
+
+
+@pytest.mark.parametrize("length", [79, 80, 81])
+def test_watch_pr_title_marks_truncation(tmp_path, monkeypatch, length):
+    title = "题" * length
+    pull = {"number": 29, "title": title, "created_at": "2026-10-29T00:00:00Z", "html_url": "https://github.com/o/r/pull/29"}
+    monkeypatch.setattr(watch, "gh", lambda path: [pull] if "/pulls?" in path else [])
+    result = watch.collect(settings(tmp_path), "o/r", "2026-10-28T00:00:00Z", "2026-10-28T00:00:00Z", set(), set())
+    shown = title[:80] + "…" if length > 80 else title
+    assert result == [(pull["created_at"], f"PR #29 opened: {shown} {pull['html_url']}", True)]
+
+
+def test_diagnostic_excerpt_truncations_are_marked(tmp_path, monkeypatch):
+    loaded = settings(tmp_path)
+    assert repr("x" * 40 + "…") in rule.format_problem("x" * 41, loaded)
+    assert repr("x" * 40 + "…") in rule.format_problem("Designer: decision\n" + "x" * 41, loaded)
+    monkeypatch.setattr(watch.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=1, stderr="x" * 201))
+    with pytest.raises(RuntimeError, match="x{200}…$"):
+        watch.board_output(tmp_path)
+
+
+def test_reference_display_excerpts_are_marked(tree):
+    (tree / "pkg/long.py").write_text("x" * 81 + "\n")
+    findings, _, _ = refs.check("`pkg/long.py:1` holds `Ledger`", refs.Source("HEAD", tree), 0)
+    assert findings[0].endswith(repr("x" * 80 + "…"))
+    def offline(*args):
+        raise RuntimeError("x" * 121)
+    github = SimpleNamespace(repo="o/r", problem=offline)
+    _, notes, _ = refs.check("see #42", refs.Source("HEAD", tree), 0, github)
+    assert notes == [f"line 1 ticket #42: not checked ({'x' * 120}…)"]
+
+
+def test_rule_baseline_diff_marks_omitted_lines(ruling, tmp_path, capsys):
+    base = tmp_path / "base.md"
+    base.write_text("\n".join(f"old {index}" for index in range(10)))
+    current = "\n".join(f"new {index}" for index in range(10))
+    assert ruling.run([(0, current)], "--edit-body", "--base", str(base), text="new body\n") == 1
+    error = capsys.readouterr().err
+    assert "-old 5\n…\n" in error
+    assert "-old 6" not in error

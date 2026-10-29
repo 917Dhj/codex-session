@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 
+from dkitchen import truncate
 from dkitchen.config import Config, Sessions
 
 SHELLS = {"bash", "sh", "zsh", "dash", "fish"}
@@ -105,7 +106,7 @@ def summary(body: str, config: Config) -> str:
     count, names = len(config.status.fields), config.status.fields[:2]
     lines = [line.strip() for line in body.splitlines() if line.strip()]
     picked = [line for line in lines[:count] if line.startswith(names)] or lines[:1]
-    return "; ".join(picked)[:160]
+    return truncate("; ".join(picked), 160)
 
 
 def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[str],
@@ -130,7 +131,7 @@ def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[
         if event["event"] == "labeled" and label.startswith(config.labels.prefix) and event["issue"]["number"] not in skip:
             found.append((event["created_at"], f"#{event['issue']['number']} label +{label} {event['issue']['html_url']}", True))
     for pull in newer(f"repos/{repo}/pulls?state=all&sort=created&direction=desc", "created_at", since, pages=1):
-        found.append((pull["created_at"], f"PR #{pull['number']} opened: {pull['title'][:80]} {pull['html_url']}", True))
+        found.append((pull["created_at"], f"PR #{pull['number']} opened: {truncate(pull['title'], 80)} {pull['html_url']}", True))
     # Times have one-second resolution: the boundary second is rechecked and its reported lines skipped.
     return sorted({item for item in found if item[1] not in seen})
 
@@ -159,7 +160,7 @@ def board_output(checkout: Path) -> str:
                             capture_output=True, text=True,
                             timeout=120, cwd=checkout)
     if result.returncode:
-        raise RuntimeError(f"ding board failed: {result.stderr.strip()[:200]}")
+        raise RuntimeError(f"ding board failed: {truncate(result.stderr.strip(), 200)}")
     return result.stdout
 
 

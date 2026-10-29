@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 
+from dkitchen import truncate
+
 REF = re.compile(r"([\w./\-]+\.\w+):(\d+)(?:[-–](\d+))?")
 SPAN = re.compile(r"`([^`\n]+)`")
 NEAR = 12  # characters allowed between a reference and the name it points at
@@ -156,7 +158,7 @@ def check_github(number: int, line: str, github: GitHub | None, counts: dict[str
         try:
             problem = github.problem(kind, repo, ticket, anchor)
         except (LookupError, RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
-            notes.append(f"line {number} {kind} {text}: not checked ({' '.join(str(error).split())[:120]})")
+            notes.append(f"line {number} {kind} {text}: not checked ({truncate(' '.join(str(error).split()), 120)})")
             continue
         checked += 1
         counts[kind] = counts.get(kind, 0) + 1
@@ -193,7 +195,7 @@ def check(draft: str, source: Source, tolerance: int, github: GitHub | None = No
                 continue
             window = "\n".join(lines[max(start - 1 - tolerance, 0):end + tolerance])
             findings.extend(f"line {number} `{name}:{first}`: `{word}` is not on the cited line, which reads "
-                            f"{lines[start - 1].strip()[:80]!r}"
+                            f"{truncate(lines[start - 1].strip(), 80)!r}"
                             for word in names.get(index, [])
                             if word not in window and word != enclosing_definition(lines, start))
         for match in SHA.finditer(line):
