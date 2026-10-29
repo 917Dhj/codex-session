@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.9
+
+- `ding watch --for NAME` watches only executor comments waiting on that station, with longest configured-name matching and separate default state files.
+- Station watches skip label/PR queries and stale/idle checks, including board and tmux calls.
+
 ## 0.5.8
 
 - `ding rule --notify` sends the complete stripped first nonempty line, including through `{first_line}` templates.

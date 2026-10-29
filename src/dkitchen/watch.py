@@ -13,6 +13,7 @@ Verifier comments never wake on their own, since the verifier also messages the 
 they are listed in the next batch for reference.
 The state file keeps the time already reported, so rerunning the same command loses nothing.
 One watch runs per state file; a second one exits at once.
+With --for NAME, only executor comments waiting on that station wake; other triggers are not queried.
 Station names, status words, and labels come from .dkitchen.toml.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 from dkitchen import truncate
 from dkitchen.config import Config, Sessions
@@ -101,6 +103,18 @@ def executor_wakes(body: str, waiting_user: bool, config: Config) -> bool:
     return state != status.in_progress or names(*kitchen, stations.user)
 
 
+def waiting_for(body: str, station: str, config: Config) -> bool:
+    _, waiting = state_and_waiting(body, config)
+    if waiting.startswith(config.status.none):
+        return False
+    stations = config.stations
+    names = {stations.orchestrator, stations.designer, stations.verifier, stations.executor, stations.user}
+    names.update(signature.rstrip().removesuffix(stations.separator.rstrip()).strip()
+                 for signature in config.designer_signatures)
+    choices = sorted({station} | {name for name in names if station in name}, key=len, reverse=True)
+    return any(match.group() == station for match in re.finditer("|".join(map(re.escape, choices)), waiting))
+
+
 def summary(body: str, config: Config) -> str:
     """The status block's first two lines, or the first line when there is no block."""
     count, names = len(config.status.fields), config.status.fields[:2]
@@ -110,10 +124,11 @@ def summary(body: str, config: Config) -> str:
 
 
 def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[str],
-            skip: set[int]) -> list[tuple[str, str, bool]]:
+            skip: set[int], station: str | None = None) -> list[tuple[str, str, bool]]:
     """(time, line, wakes) for every item after the given times; comment and PR times use `since`."""
     awaiting = config.labels.awaiting_user
-    waiting = {issue["number"] for issue in gh(f"repos/{repo}/issues?state=open&labels={awaiting}&per_page=100")}
+    waiting = ({issue["number"] for issue in gh(f"repos/{repo}/issues?state=open&labels={awaiting}&per_page=100")}
+               if station is None else set())
     verifier, user, executor = config.stations.verifier, config.stations.user, config.stations.executor
     found = []
     for comment in newer(f"repos/{repo}/issues/comments?since={since}&sort=updated&direction=desc", "updated_at", since):
@@ -121,17 +136,22 @@ def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[
         who = role(body, config)
         if number in skip:
             continue
-        if who in {verifier, user} or (who == executor and executor_wakes(body, number in waiting, config)):
-            kind = f"{who} comment" if comment["created_at"] >= since else f"{who} edited a comment"
-            note = f" ({verifier.lower()} reports separately; for reference)" if who == verifier else ""
-            found.append((comment["updated_at"], f"#{number} {kind}{note}: {summary(body, config)} {comment['html_url']}",
-                          who != verifier))
-    for event in newer(f"repos/{repo}/issues/events?", "created_at", labels_since):
-        label = (event.get("label") or {}).get("name", "")
-        if event["event"] == "labeled" and label.startswith(config.labels.prefix) and event["issue"]["number"] not in skip:
-            found.append((event["created_at"], f"#{event['issue']['number']} label +{label} {event['issue']['html_url']}", True))
-    for pull in newer(f"repos/{repo}/pulls?state=all&sort=created&direction=desc", "created_at", since, pages=1):
-        found.append((pull["created_at"], f"PR #{pull['number']} opened: {truncate(pull['title'], 80)} {pull['html_url']}", True))
+        if station is not None:
+            if who != executor or not waiting_for(body, station, config):
+                continue
+        elif not (who in {verifier, user} or (who == executor and executor_wakes(body, number in waiting, config))):
+            continue
+        kind = f"{who} comment" if comment["created_at"] >= since else f"{who} edited a comment"
+        note = f" ({verifier.lower()} reports separately; for reference)" if who == verifier else ""
+        found.append((comment["updated_at"], f"#{number} {kind}{note}: {summary(body, config)} {comment['html_url']}",
+                      who != verifier))
+    if station is None:
+        for event in newer(f"repos/{repo}/issues/events?", "created_at", labels_since):
+            label = (event.get("label") or {}).get("name", "")
+            if event["event"] == "labeled" and label.startswith(config.labels.prefix) and event["issue"]["number"] not in skip:
+                found.append((event["created_at"], f"#{event['issue']['number']} label +{label} {event['issue']['html_url']}", True))
+        for pull in newer(f"repos/{repo}/pulls?state=all&sort=created&direction=desc", "created_at", since, pages=1):
+            found.append((pull["created_at"], f"PR #{pull['number']} opened: {truncate(pull['title'], 80)} {pull['html_url']}", True))
     # Times have one-second resolution: the boundary second is rechecked and its reported lines skipped.
     return sorted({item for item in found if item[1] not in seen})
 
@@ -263,14 +283,17 @@ def idle(config: Config, repo: str, checkout: Path, observed: dict, reported: se
     return found, pending
 
 
-def default_state(repo: str) -> Path:
+def default_state(repo: str, station: str | None = None) -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
-    return state / "ding/watch" / f"{repo.replace('/', '-')}.json"
+    suffix = ".for-" + quote(station, safe="") if station is not None else ""
+    return state / "ding/watch" / f"{repo.replace('/', '-')}{suffix}.json"
 
 
 def watch(args, config: Config) -> int:
     repo = config.repository()
-    path = args.state or default_state(repo)
+    station = getattr(args, "station", None)
+    collect_options = {"station": station} if station is not None else {}
+    path = args.state or default_state(repo, station)
     checkout = args.checkout or config.root
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(".lock").open("w")
@@ -287,13 +310,16 @@ def watch(args, config: Config) -> int:
     skip = set(args.skip_issue) | ({config.log.issue} if config.log.issue else set())
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
     labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
-    print(f"Watching {repo}: comments and PRs since {since}, labels since {labels_since}", file=sys.stderr)
-    errors, next_stale, next_idle = 0, 0.0, 0.0
-    idle_every = min(config.watch.idle_minutes * 20, 900) if config.watch.idle_minutes else float("inf")
+    detail = (f"comments and PRs since {since}, labels since {labels_since}" if station is None
+              else f"executor comments waiting on {station!r} since {since}")
+    print(f"Watching {repo}: {detail}", file=sys.stderr)
+    errors = 0
+    next_stale = next_idle = 0.0 if station is None else float("inf")
+    idle_every = min(config.watch.idle_minutes * 20, 900) if station is None and config.watch.idle_minutes else float("inf")
     while True:
         polled = now()
         try:
-            found = collect(config, repo, since, labels_since, seen, skip)
+            found = collect(config, repo, since, labels_since, seen, skip, **collect_options)
             quiet, idle_found, pending, stale_ids = [], [], observed, set()
             checked_at = time.monotonic()
             checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
@@ -307,7 +333,7 @@ def watch(args, config: Config) -> int:
                 if found:
                     time.sleep(args.settle)
                     polled = now()
-                    found = collect(config, repo, since, labels_since, seen, skip)
+                    found = collect(config, repo, since, labels_since, seen, skip, **collect_options)
             errors = 0
         except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
             errors += 1

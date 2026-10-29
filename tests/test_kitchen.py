@@ -1370,3 +1370,184 @@ def test_rule_baseline_diff_marks_omitted_lines(ruling, tmp_path, capsys):
     error = capsys.readouterr().err
     assert "-old 5\n…\n" in error
     assert "-old 6" not in error
+
+
+@pytest.fixture
+def station_settings(tmp_path):
+    return settings(tmp_path, RULING + 'signatures = ["总设计：", "总设计（训练）："]\n')
+
+
+@pytest.mark.parametrize("station, waiting, signed, expected", [
+    ("总设计", "总设计", True, True),
+    ("总设计", "总设计（训练）", True, False),
+    ("总设计（训练）", "总设计（训练）", True, True),
+    ("总设计", "核查", True, False),
+    ("总设计", "无", True, False),
+    ("总设计", "总设计", False, False),
+    ("总设计", "总设计（训练）和总设计", True, True),
+    ("总设计", "总设计和总设计（训练）", True, True),
+])
+def test_station_collect_wakes_only_matching_executor_comments(station_settings, monkeypatch,
+                                                              station, waiting, signed, expected):
+    body = f"状态：进行中\n在等：{waiting}\n关键数字：1\n下一步：等"
+    if signed:
+        body = executor(body)
+    calls = []
+    def gh(path):
+        calls.append(path)
+        assert "/issues/comments?" in path, "station watches must not query labels, PRs or ticket lists"
+        return [comment(30, body)]
+    monkeypatch.setattr(watch, "gh", gh)
+    result = watch.collect(station_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z",
+                           set(), set(), station=station)
+    assert bool(result) is expected
+    assert len(calls) == 1
+    if expected:
+        assert result[0][2] is True and "#30 执行者 comment" in result[0][1]
+
+
+def test_station_match_uses_all_station_names_and_strips_signature_separators(station_settings):
+    from dataclasses import replace
+    loaded = replace(station_settings, stations=replace(station_settings.stations, verifier="总设计（审稿）"))
+    for longer in ("总设计（训练）", "总设计（审稿）"):
+        body = executor(f"状态：进行中\n在等：{longer}\n关键数字：1\n下一步：等")
+        assert not watch.waiting_for(body, "总设计", loaded)
+        assert watch.waiting_for(body, longer, loaded)
+    english = config.Config(root=loaded.root, rule=config.Rule(signatures=("Design+Ops: ", "Design+Ops (training): ")))
+    body = executor("Status: in progress\nWaiting on: Design+Ops (training)\nKey numbers: 1\nNext: wait")
+    assert not watch.waiting_for(body, "Design+Ops", english)
+    assert watch.waiting_for(body, "Design+Ops (training)", english)
+
+
+@pytest.mark.parametrize("state", ["进行中", "等用户", "完成"])
+def test_station_watch_matching_comment_wakes_even_on_awaiting_user_ticket(station_settings, monkeypatch, state):
+    item = comment(30, executor(f"状态：{state}\n在等：总设计\n关键数字：1\n下一步：等"))
+    item["issue"] = {"labels": [{"name": station_settings.labels.awaiting_user}]}
+    def gh(path):
+        assert "/issues/comments?" in path
+        return [item]
+    monkeypatch.setattr(watch, "gh", gh)
+    assert watch.collect(station_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z",
+                         set(), set(), station="总设计")[0][2] is True
+
+
+def test_station_watch_skips_other_triggers_and_honors_settle(station_settings, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "load", lambda: station_settings)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    calls, sleeps = [], []
+    items = [comment(30, executor("状态：进行中\n在等：总设计\n关键数字：1\n下一步：等")),
+             comment(31, "核查：报告"), comment(32, "用户问题")]
+    def gh(path):
+        calls.append(path)
+        assert "/issues/comments?" in path
+        return items
+    monkeypatch.setattr(watch, "gh", gh)
+    def forbidden(*args, **kwargs):
+        pytest.fail("station watch must not consult stale, idle, board or tmux")
+    for name in ("stale", "idle", "board_output", "tmux_panes"):
+        monkeypatch.setattr(watch, name, forbidden)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: sleeps.append(seconds))
+    assert ding.main(["watch", "--for", "总设计", "--settle", "7",
+                      "--since", "2026-10-14T08:00:00Z"]) == 0
+    assert len(calls) == 2 and sleeps == [7]
+    output = capsys.readouterr().out
+    assert output.count("#30 执行者 comment") == 1
+    assert "#31" not in output and "#32" not in output
+    assert watch.default_state("o/r", "总设计").exists()
+    assert not watch.default_state("o/r").exists()
+
+
+def test_station_watch_retains_skip_issue_and_seen_filters(station_settings, monkeypatch):
+    body = executor("状态：进行中\n在等：总设计\n关键数字：1\n下一步：等")
+    monkeypatch.setattr(watch, "gh", lambda path: [comment(30, body)])
+    args = (station_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z")
+    item = watch.collect(*args, set(), set(), station="总设计")[0]
+    assert watch.collect(*args, {item[1]}, set(), station="总设计") == []
+    assert watch.collect(*args, set(), {30}, station="总设计") == []
+
+
+def test_station_and_orchestrator_watches_run_concurrently_with_separate_default_states(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    barrier = Barrier(2)
+    def collect(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return [(watch.now(), "matching comment", True)]
+    monkeypatch.setattr(watch, "collect", collect)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    def run(station):
+        args = SimpleNamespace(state=None, checkout=None, since=None, skip_issue=[], station=station,
+                               interval=90, settle=0, stale_hours=6, stale_every=3600, max_errors=2)
+        return watch.watch(args, loaded)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(run, [None, "Designer"])) == [0, 0]
+    default, designer = watch.default_state("o/r"), watch.default_state("o/r", "Designer")
+    assert default != designer
+    assert default.exists() and designer.exists()
+    assert default.with_suffix(".lock") != designer.with_suffix(".lock")
+
+
+def test_station_default_state_name_stays_inside_watch_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    path = watch.default_state("o/r", "../../Designer/训练")
+    assert path.parent == tmp_path / "ding/watch"
+    assert path != watch.default_state("o/r")
+    assert watch.default_state("o/r", "Designer A") != watch.default_state("o/r", "Designer/A")
+
+
+def test_station_watch_explicit_state_keeps_the_existing_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "load", lambda: config.Config(root=tmp_path, repo="o/r"))
+    state = tmp_path / "shared.json"
+    with state.with_suffix(".lock").open("w") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert ding.main(["watch", "--for", "Designer", "--state", str(state)]) == 3
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("arguments", [["--for"], ["--for", ""], ["--for", "   "]])
+def test_station_watch_requires_a_nonempty_name(arguments):
+    with pytest.raises(SystemExit) as error:
+        ding.main(["watch", *arguments])
+    assert error.value.code == 2
+
+
+def test_station_watch_help_describes_its_scope(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(["watch", "--help"])
+    text = capsys.readouterr().out
+    assert "--for NAME" in text
+    assert "executor comments waiting on" in text
+    assert "labels, PRs, stale/idle checks" in text
+
+
+def test_station_watch_retries_post_settle_timeout_without_duplicate_output(station_settings, monkeypatch, tmp_path, capsys):
+    import subprocess
+    monkeypatch.setattr(config, "load", lambda: station_settings)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    calls = []
+    def gh(path):
+        assert "/issues/comments?" in path
+        calls.append(path)
+        if len(calls) == 2:
+            raise subprocess.TimeoutExpired(["gh", "api", path], 60)
+        return [comment(30, executor("状态：进行中\n在等：总设计\n关键数字：1\n下一步：等"))]
+    monkeypatch.setattr(watch, "gh", gh)
+    assert ding.main(["watch", "--for", "总设计", "--since", "2026-10-14T08:00:00Z",
+                      "--interval", "0", "--settle", "0", "--max-errors", "2"]) == 0
+    output = capsys.readouterr()
+    assert len(calls) == 4
+    assert "poll failed 1/2" in output.err
+    assert output.out.count("#30 执行者 comment") == 1
+
+
+@pytest.mark.parametrize("prefix", ["核查：", "总设计：", "总编排：", "用户："])
+def test_station_watch_ignores_non_executor_roles_even_when_waiting_on_target(station_settings, monkeypatch, prefix):
+    body = prefix + "报告\n在等：总设计\n关键数字：1\n下一步：等"
+    monkeypatch.setattr(watch, "gh", lambda path: [comment(30, body)])
+    assert watch.collect(station_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z",
+                         set(), set(), station="总设计") == []

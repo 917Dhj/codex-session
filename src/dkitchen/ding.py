@@ -1765,9 +1765,12 @@ def main(argv=None) -> int:
     sub.add_argument("--issue", type=int, help="Orchestrator log ticket (default: [log] issue in .dkitchen.toml)")
     sub = commands.add_parser("watch", help="Wait for GitHub activity the orchestrator must handle, then exit",
                                 description="Wait for GitHub activity the orchestrator must handle, print it, and exit. "
+                                            "With --for NAME, watch only executor comments waiting on that station. "
                                             "Read-only; calls no model.")
+    sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME",
+                     help="Wake only on executor comments waiting on NAME; skip labels, PRs, stale/idle checks")
     sub.add_argument("--state", type=Path, help="JSON file holding the last reported time "
-                                                  "(default: ~/.local/state/ding/watch/OWNER-REPO.json)")
+                                                  "(default: ~/.local/state/ding/watch/OWNER-REPO[.for-NAME].json)")
     sub.add_argument("--since", help="Start time for the first run (ISO, UTC; default: now)")
     sub.add_argument("--skip-issue", type=int, action="append", default=[],
                        help="Ticket to ignore; the orchestrator log ticket is always ignored")
@@ -1848,6 +1851,8 @@ def main(argv=None) -> int:
             parser.error("--edit-body and --base go together")
         if args.force and not args.reply_to:
             parser.error("--force goes with --reply-to")
+    if args.action == "watch" and args.station is not None and not args.station:
+        parser.error("--for must contain non-whitespace text")
     if args.action == "launch" and args.skip_preflight is not None and not args.skip_preflight.strip():
         parser.error("--skip-preflight requires a nonempty reason")
     if args.action in {"run", "launch"} and not command:
