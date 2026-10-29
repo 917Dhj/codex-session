@@ -18,7 +18,7 @@ import re
 import sys
 from types import SimpleNamespace
 
-from dkitchen import ding, refs
+from dkitchen import ding, refs, truncate
 from dkitchen.config import Config
 from dkitchen.orchestrate import call, fail
 
@@ -28,7 +28,7 @@ COMMENT_ID = re.compile(r"(?:#issuecomment-)?(\d+)$")
 
 
 def first_line(text: str) -> str:
-    return next((line.strip() for line in text.splitlines() if line.strip()), "")[:100]
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
 def format_problem(draft: str, config: Config) -> str | None:
@@ -37,10 +37,10 @@ def format_problem(draft: str, config: Config) -> str | None:
     lines = draft.split("\n")
     if not lines[0].startswith(config.designer_signatures):
         signatures = " or ".join(repr(signature) for signature in config.designer_signatures)
-        return f"line 1 must start with {signatures}, not {lines[0][:40]!r}"
+        return f"line 1 must start with {signatures}, not {truncate(lines[0], 40)!r}"
     label = f"{rule.type_label}{stations.separator}"
     if len(lines) < 2 or not lines[1].startswith(label):
-        return f"line 2 must start with {label!r}, not {(lines[1] if len(lines) > 1 else '')[:40]!r}"
+        return f"line 2 must start with {label!r}, not {truncate(lines[1] if len(lines) > 1 else '', 40)!r}"
     kind = lines[1][len(label):].strip()
     if kind not in rule.types:
         return f"line 2 type {kind!r} must be one of: {', '.join(rule.types)}"
@@ -74,7 +74,7 @@ def guard_reply(config: Config, repo: str, ticket: int, args) -> int | None:
     if args.reply_to is None:
         if comments:
             latest = comments[-1]
-            print(f"latest comment on #{ticket}: {latest['created_at']} {first_line(latest['body'])!r} "
+            print(f"latest comment on #{ticket}: {latest['created_at']} {truncate(first_line(latest['body']), 100)!r} "
                   f"({latest['html_url']})", file=sys.stderr)
         else:
             print(f"#{ticket} has no comments yet", file=sys.stderr)
@@ -87,7 +87,7 @@ def guard_reply(config: Config, repo: str, ticket: int, args) -> int | None:
     if not newer:
         return None
     for comment in newer:
-        print(f"newer: {comment['html_url']} {first_line(comment['body'])!r}", file=sys.stderr)
+        print(f"newer: {comment['html_url']} {truncate(first_line(comment['body']), 100)!r}", file=sys.stderr)
     if getattr(args, "force", False):
         print(f"{len(newer)} newer comment(s) after the one answered; posting anyway (--force)", file=sys.stderr)
         return None
@@ -131,8 +131,8 @@ def edit_body(config: Config, repo: str, ticket: int, args, draft: str) -> int:
     if normal(body) != normal(base):
         changes = [line for line in difflib.unified_diff(normal(base).split("\n"), normal(body).split("\n"),
                                                          "--base", "ticket now", lineterm="", n=0)
-                   if line[:1] in "+-" and line[:3] not in {"+++", "---"}][:6]
-        print("\n".join(changes), file=sys.stderr)
+                   if line[:1] in "+-" and line[:3] not in {"+++", "---"}]
+        print("\n".join(changes[:6]) + ("\n…" if len(changes) > 6 else ""), file=sys.stderr)
         return fail(f"the body of {repo}#{ticket} changed since {args.base}; merge the change into the draft and "
                     "take a new baseline. Nothing edited")
     result = call(config, "gh", "issue", "edit", str(ticket), "--repo", repo, "--body-file", args.draft)
