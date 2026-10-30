@@ -33,6 +33,10 @@ Every key is optional. The defaults match the English templates in kitchen/:
     issue = 1                            # the pinned orchestrator log ticket
     pending = "Waiting for the user"
 
+    [night]
+    heading = "Orchestrator: user decision (night orders"
+    closed = "Orchestrator: night orders closed"
+
     [sessions]
     name = "【#{issue}】{name}"           # `ding new --issue N --name NAME`; also {repo}
     parent = "Parent: #{parent}"         # first line of a sub-ticket opened by `ding new --parent N`
@@ -106,6 +110,12 @@ class Labels:
 class Log:
     issue: int | None = None
     pending: str = "Waiting for the user"
+
+
+@dataclass(frozen=True)
+class Night:
+    heading: str = "Orchestrator: user decision (night orders"
+    closed: str = "Orchestrator: night orders closed"
 
 
 @dataclass(frozen=True)
@@ -199,6 +209,7 @@ class Config:
     status: Status = Status()
     labels: Labels = Labels()
     log: Log = Log()
+    night: Night = Night()
     sessions: Sessions = Sessions()
     relay: Relay = Relay()
     rule: Rule = Rule()
@@ -279,6 +290,8 @@ def section(cls, values: object, name: str):
                 raise ValueError(f"{FILE}: [{name}] issue must be a positive issue number")
         elif not isinstance(value, str) or (not value.strip() and key != "separator"):
             raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty string")
+        if cls is Night and ("\n" in value or "\r" in value):
+            raise ValueError(f"{FILE}: [night] {key} must be a single line")
         result = replace(result, **{key: value})
     return result
 
@@ -300,7 +313,7 @@ def load(cwd: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
     sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay,
-                "rule": Rule, "launch": Launch, "watch": Watch}
+                "rule": Rule, "launch": Launch, "watch": Watch, "night": Night}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

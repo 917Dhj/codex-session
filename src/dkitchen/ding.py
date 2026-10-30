@@ -1763,6 +1763,17 @@ def main(argv=None) -> int:
     sub.add_argument("--item", action="append", required=True, help="One automatic action; repeat for more")
     sub.add_argument("--pending", action="append", default=[], help="One matter waiting for the user; repeat for more")
     sub.add_argument("--issue", type=int, help="Orchestrator log ticket (default: [log] issue in .dkitchen.toml)")
+    sub = commands.add_parser("night", help="Open, show, or close night orders on the orchestrator log ticket",
+                              description="Open, show, or close night orders on [log] issue. Reads only that ticket's "
+                                          "comments, starting with the most recent; writes only comments; calls no model. "
+                                          "Headings come from [night] in .dkitchen.toml, with English defaults.")
+    night_commands = sub.add_subparsers(dest="night_action", required=True)
+    opening = night_commands.add_parser("open", help="Post orders until a time; refuse existing open orders unless --replace")
+    opening.add_argument("--until", required=True, help="Future ISO time with timezone, e.g. 2026-10-31T08:00:00Z; orders expire then")
+    opening.add_argument("--body-file", type=Path, required=True, help="UTF-8 file containing the user's verbatim reply and numbered orders")
+    opening.add_argument("--replace", action="store_true", help="Close existing open orders before posting new ones")
+    night_commands.add_parser("show", help="Print open orders and their link, or 'no night orders open' (exit 0)")
+    night_commands.add_parser("close", help="Post a closing line for the open orders; expired orders are already closed")
     sub = commands.add_parser("watch", help="Wait for GitHub activity the orchestrator must handle, then exit",
                                 description="Wait for GitHub activity the orchestrator must handle, print it, and exit. "
                                             "With --for NAME, watch executor comments waiting on that station, design requests, and explicit handoffs. "
@@ -1886,6 +1897,9 @@ def main(argv=None) -> int:
         if args.action == "check-refs":
             from dkitchen import refs
             return refs.check_refs(args)
+        if args.action == "night":
+            from dkitchen import config, night
+            return night.night(args, config.load())
         if args.action in {"relay", "merge", "log", "watch"}:
             from dkitchen import config, orchestrate, watch
             settings = config.load()

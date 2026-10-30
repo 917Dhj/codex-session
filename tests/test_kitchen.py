@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dkitchen import config, ding, orchestrate, refs, rule, watch
+from dkitchen import config, ding, night, orchestrate, refs, rule, watch
 
 
 CHINESE = """
@@ -292,6 +292,206 @@ def test_log_needs_a_ticket(tmp_path, capsys):
     args = SimpleNamespace(item=["a"], pending=[], issue=None)
     assert orchestrate.log(args, settings(tmp_path)) == 1
     assert "[log] issue" in capsys.readouterr().err
+
+
+@pytest.fixture
+def night_log(tmp_path, monkeypatch):
+    class Clock(datetime):
+        moment = datetime(2026, 10, 30, 20, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.moment
+
+    monkeypatch.setattr(night, "datetime", Clock)
+    monkeypatch.chdir(tmp_path)
+    loaded = settings(tmp_path, CHINESE + '\n[night]\nheading = "总编排：用户裁定（夜令"\nclosed = "总编排：夜令结束"')
+    draft = tmp_path / "orders.md"
+    draft.write_text('User reply, verbatim:\n全部同意，除了 3。\n\n1. Service A may start.\n', encoding="utf-8")
+    state = SimpleNamespace(config=loaded, clock=Clock, comments=[], calls=[], draft=draft, post_codes=[])
+
+    def call(settings, *args):
+        state.calls.append(args)
+        if args[:3] == ("gh", "api", "graphql"):
+            assert f"number={loaded.log.issue}" in args and "owner=o" in args and "name=r" in args
+            payload = {"data": {"repository": {"issue": {"comments": {
+                "nodes": state.comments, "pageInfo": {"hasPreviousPage": False, "startCursor": None}}}}}}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        assert args[:4] == ("gh", "issue", "comment", "246")
+        code = state.post_codes.pop(0) if state.post_codes else 0
+        url = f"https://github.com/o/r/issues/246#issuecomment-{len(state.comments) + 1}"
+        if not code:
+            state.comments.append({"body": args[-1], "url": url})
+        return SimpleNamespace(returncode=code, stdout=url, stderr="post failed" if code else "")
+
+    monkeypatch.setattr(night, "call", call)
+    monkeypatch.setattr(orchestrate, "call", call)
+    state.open = lambda *options: ding.main(["night", "open", "--until", "2026-10-31T16:00:00+08:00",
+                                           "--body-file", str(draft), *options])
+    return state
+
+
+def test_night_open_preserves_reply_and_refuses_duplicate_without_replace(night_log, capsys):
+    ticket = night_log
+    assert ticket.open() == 0
+    assert ticket.comments[0]["body"] == (
+        "总编排：用户裁定（夜令, until 2026-10-31T08:00:00Z)\n\n" + ticket.draft.read_text(encoding="utf-8"))
+    assert capsys.readouterr().out.strip() == ticket.comments[0]["url"]
+    assert ticket.open() == 1
+    assert "already open" in capsys.readouterr().err
+    assert len(ticket.comments) == 1
+    assert ticket.open("--replace") == 0
+    assert ticket.comments[1]["body"] == "总编排：夜令结束 at 2026-10-30T20:00:00Z"
+    assert ticket.comments[2]["body"] == ticket.comments[0]["body"]
+
+
+def test_night_show_and_close_use_log_comments_only(night_log, capsys):
+    ticket = night_log
+    assert ticket.open() == 0
+    capsys.readouterr()
+    ticket.comments.append({"body": "总编排：21:00 UTC\n- #42 followed order 1", "url": "https://log"})
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == ticket.comments[0]["body"] + "\n" + ticket.comments[0]["url"] + "\n"
+    assert len(ticket.calls) == 3  # open reads and posts; show reads once
+    assert ding.main(["night", "close"]) == 0
+    assert ticket.comments[-1]["body"] == "总编排：夜令结束 at 2026-10-30T20:00:00Z"
+    capsys.readouterr()
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == "no night orders open\n"
+    assert ding.main(["night", "close"]) == 0
+    assert len(ticket.comments) == 3
+
+
+@pytest.mark.parametrize("moment", ["2026-10-31T08:00:00+00:00", "2026-10-31T09:00:00+00:00"])
+def test_night_orders_expire_without_a_closing_comment(night_log, capsys, moment):
+    ticket = night_log
+    assert ticket.open() == 0
+    ticket.clock.moment = datetime.fromisoformat(moment)
+    capsys.readouterr()
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == "no night orders open\n"
+    assert len(ticket.comments) == 1
+    ticket.clock.moment += timedelta(hours=1)
+    assert ding.main(["night", "open", "--until", "2026-11-01T08:00:00Z", "--body-file", str(ticket.draft)]) == 0
+    assert len(ticket.comments) == 2
+
+
+def test_night_without_orders_exits_zero(night_log, capsys):
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == "no night orders open\n"
+
+
+def test_night_commands_work_without_a_night_config_section(night_log, capsys):
+    settings(night_log.config.root, 'repo = "o/r"\n[log]\nissue = 246')
+    assert night_log.open() == 0
+    assert night_log.comments[0]["body"].startswith("Orchestrator: user decision (night orders, until ")
+    assert ding.main(["night", "close"]) == 0
+    assert night_log.comments[-1]["body"].startswith("Orchestrator: night orders closed at ")
+    capsys.readouterr()
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == "no night orders open\n"
+
+
+def test_expired_newer_orders_do_not_revive_older_orders(night_log, capsys):
+    assert night_log.open() == 0
+    newer = {**night_log.comments[0], "body": night_log.comments[0]["body"].replace(
+        "2026-10-31T08:00:00Z", "2026-10-30T21:00:00Z")}
+    night_log.comments.append(newer)
+    night_log.clock.moment += timedelta(hours=2)
+    capsys.readouterr()
+    assert ding.main(["night", "show"]) == 0
+    assert capsys.readouterr().out == "no night orders open\n"
+
+
+@pytest.mark.parametrize("until, error", [
+    ("tomorrow", "ISO time with timezone"),
+    ("2026-10-31", "ISO time with timezone"),
+    ("2026-10-31T08:00:00", "ISO time with timezone"),
+    ("2026-10-30T20:00:00Z", "must be in the future"),
+])
+def test_night_rejects_invalid_or_expired_window_before_any_api_call(night_log, capsys, until, error):
+    assert ding.main(["night", "open", "--until", until, "--body-file", str(night_log.draft)]) == 1
+    assert error in capsys.readouterr().err
+    assert night_log.calls == []
+
+
+@pytest.mark.parametrize("body", [None, " \n"])
+def test_night_rejects_missing_or_empty_body_before_any_api_call(night_log, body):
+    if body is None:
+        night_log.draft.unlink()
+    else:
+        night_log.draft.write_text(body)
+    assert night_log.open() == 1
+    assert night_log.calls == []
+
+
+@pytest.mark.parametrize("codes, posted", [([1], 1), ([0, 1], 2)])
+def test_night_replace_reports_post_failure_and_stops(night_log, capsys, codes, posted):
+    assert night_log.open() == 0
+    capsys.readouterr()
+    night_log.post_codes = codes
+    assert night_log.open("--replace") == 1
+    assert "post failed" in capsys.readouterr().err
+    assert len(night_log.comments) == posted
+
+
+def test_night_searches_backwards_only_until_latest_marker(night_log, monkeypatch, capsys):
+    assert night_log.open() == 0
+    orders = night_log.comments[0]
+    calls = []
+    pages = [([{"body": "routine log", "url": "https://log"}] * 100, True, "older"), ([orders], True, "oldest")]
+
+    def read(settings, *args):
+        calls.append(args)
+        nodes, previous, cursor = pages.pop(0)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"data": {"repository": {"issue": {"comments": {
+            "nodes": nodes, "pageInfo": {"hasPreviousPage": previous, "startCursor": cursor}}}}}}))
+
+    monkeypatch.setattr(night, "call", read)
+    capsys.readouterr()
+    assert ding.main(["night", "show"]) == 0
+    assert orders["url"] in capsys.readouterr().out
+    assert len(calls) == 2 and "before=older" in calls[1]
+    assert all(args[:3] == ("gh", "api", "graphql") for args in calls)
+
+
+@pytest.mark.parametrize("payload, code", [({}, 1), ({"errors": ["denied"]}, 0), ({"data": {"repository": None}}, 0)])
+def test_night_read_errors_are_not_treated_as_no_orders(night_log, monkeypatch, capsys, payload, code):
+    monkeypatch.setattr(night, "call", lambda *args: SimpleNamespace(returncode=code, stdout=json.dumps(payload), stderr="denied"))
+    assert night_log.open() == 1
+    assert "cannot read night orders" in capsys.readouterr().err
+    assert night_log.comments == []
+
+
+def test_malformed_order_time_does_not_allow_a_duplicate_open(night_log, capsys):
+    assert night_log.open() == 0
+    night_log.comments[0]["body"] = night_log.comments[0]["body"].replace("2026-10-31T08:00:00Z", "tomorrow")
+    assert night_log.open() == 1
+    assert "cannot read night orders" in capsys.readouterr().err
+    assert len(night_log.comments) == 1
+
+
+@pytest.mark.parametrize("text", ['[night]\nheading = ""', '[night]\nclosed = "line\\nline"', '[night]\nunknown = "x"'])
+def test_night_config_is_checked(tmp_path, text):
+    with pytest.raises(ValueError, match=r"\[night\]"):
+        settings(tmp_path, text)
+
+
+def test_night_defaults_and_missing_log_issue(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    loaded = settings(tmp_path)
+    assert loaded.night.heading == "Orchestrator: user decision (night orders"
+    assert loaded.night.closed == "Orchestrator: night orders closed"
+    assert ding.main(["night", "show"]) == 1
+    assert "[log] issue" in capsys.readouterr().err
+
+
+def test_night_help_lists_all_commands(capsys):
+    with pytest.raises(SystemExit) as error:
+        ding.main(["night", "--help"])
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert all(word in help_text for word in ("open", "show", "close", "[log] issue", "calls no model"))
 
 
 def test_live_tmux_jobs_count_as_running_but_shells_and_dead_panes_do_not():

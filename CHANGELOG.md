@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.11
+
+- `ding night open|show|close` records time-limited night orders on the orchestrator log ticket, with configurable headings and explicit replacement of open orders.
+- User-invoked `goodnight` and `goodmorning` skills collect approvals for the offline window and report their use when the user returns.
+- Unattended-work templates require stations to check night orders before waiting on the user and name the order behind each automatic action in the log.
+
 ## 0.5.10
 
 - Watch name matching supports `[stations.aliases]` and width-normalized brackets/colons, with longest configured-name precedence.

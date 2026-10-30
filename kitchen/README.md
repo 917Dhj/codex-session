@@ -37,10 +37,11 @@ The rules and the `ding` commands share one vocabulary. The defaults are below. 
 | Nobody to wait on | `none` | `ding watch` |
 | Designer reply type | `Type: actionable`, `Type: proposal, awaiting user` | Orchestrator, executors |
 | Status labels | `status:awaiting-design`, `status:awaiting-user`, `status:blocked`, `status:done` | `ding watch`, `gh issue list` |
+| Night-order markers | `Orchestrator: user decision (night orders`, `Orchestrator: night orders closed` | `ding night`, all stations |
 
 ## Tools the rules call
 
 Two layers:
 
-- **`ding` commands** do the same thing in every repo and are installed with `pipx install dkitchen`: `ding relay`, `ding merge`, `ding log`, `ding watch`, `ding check-refs`, `ding rule`, and the messaging commands in [the ding guide](../docs/ding.md).
+- **`ding` commands** do the same thing in every repo and are installed with `pipx install dkitchen`: `ding relay`, `ding merge`, `ding log`, `ding night`, `ding watch`, `ding check-refs`, `ding rule`, and the messaging commands in [the ding guide](../docs/ding.md).
 - **Repo scripts** depend on the repo, so the setup skill writes them into the repo's `scripts/`, starting from reference versions: `review_pr.py` for PR review, and the checks some modules use.
