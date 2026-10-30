@@ -12,10 +12,14 @@ Every key is optional. The defaults match the English templates in kitchen/:
     user = "User"
     separator = ": "                     # written after a station name to sign a comment, e.g. "：" in Chinese
 
+    # [stations.aliases]
+    # "Training designer" = ["Training"]  # optional equivalent station names
+
     [status]
     fields = ["Status", "Waiting on", "Key numbers", "Next"]   # first: the state; second: who it waits on
     in_progress = "in progress"
     waiting_on_design = "waiting on design"
+    # paused = "paused"                 # optional; absent means no paused status word
     blocked = "blocked"
     done = "done"
     none = "none"                        # a Waiting on value naming nobody
@@ -48,10 +52,11 @@ Every key is optional. The defaults match the English templates in kitchen/:
 
     [watch]
     idle_minutes = 45                    # 0 disables idle-executor wakes
+    design_answer_minutes = 30           # 0 disables unanswered-design reminders
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from pathlib import Path
 import math
 import re
@@ -77,6 +82,7 @@ class Stations:
     executor: str = "Executor"
     user: str = "User"
     separator: str = ": "
+    aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def signature(self, name: str) -> str:
         return f"{name}{self.separator}"
@@ -87,6 +93,7 @@ class Status:
     fields: tuple[str, ...] = ding.status_fields(ding.STATUS_FIELDS)
     in_progress: str = "in progress"
     waiting_on_design: str = "waiting on design"
+    paused: str | None = None
     blocked: str = "blocked"
     done: str = "done"
     none: str = "none"
@@ -167,6 +174,7 @@ class Launch:
 @dataclass(frozen=True)
 class Watch:
     idle_minutes: float = 45
+    design_answer_minutes: float = 30
 
 
 SESSION_FIELDS = ("issue", "name", "repo")
@@ -249,10 +257,18 @@ def section(cls, values: object, name: str):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{FILE}: [launch] preflight_timeout must be a positive finite number of seconds")
-        elif key == "idle_minutes":
+        elif key in {"idle_minutes", "design_answer_minutes"}:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
-                raise ValueError(f"{FILE}: [watch] idle_minutes must be a nonnegative finite number of minutes")
+                raise ValueError(f"{FILE}: [watch] {key} must be a nonnegative finite number of minutes")
+        elif key == "aliases":
+            if (not isinstance(value, dict) or any(
+                    not isinstance(station, str) or not station.strip()
+                    or not isinstance(aliases, list) or not aliases
+                    or not all(isinstance(alias, str) and alias.strip() for alias in aliases)
+                    for station, aliases in value.items())):
+                raise ValueError(f"{FILE}: [stations.aliases] must map station names to nonempty lists of names")
+            value = {station.strip(): tuple(alias.strip() for alias in aliases) for station, aliases in value.items()}
         elif key == "notify":
             if not isinstance(value, str) or "{url}" not in value:
                 raise ValueError(f"{FILE}: [rule] notify must be a string holding {{url}}")

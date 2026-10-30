@@ -1776,10 +1776,15 @@ def main(argv=None) -> int:
     night_commands.add_parser("close", help="Post a closing line for the open orders; expired orders are already closed")
     sub = commands.add_parser("watch", help="Wait for GitHub activity the orchestrator must handle, then exit",
                                 description="Wait for GitHub activity the orchestrator must handle, print it, and exit. "
-                                            "With --for NAME, watch only executor comments waiting on that station. "
+                                            "With --for NAME, watch executor comments waiting on that station, design requests, and explicit handoffs. "
+                                            "[stations.aliases] adds equivalent names; bracket/colon width is normalized. "
+                                            "Configure [status] paused to suppress station wakes for paused executors. "
+                                            "Idle/stale checks ignore status labels older than the executor comment; "
+                                            "awaiting-user still suppresses them. The orchestrator checks unanswered design "
+                                            "requests after [watch] design_answer_minutes (default 30; 0 disables it). "
                                             "Read-only; calls no model.")
     sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME",
-                     help="Wake only on executor comments waiting on NAME; skip labels, PRs, stale/idle checks")
+                     help="Wake on requests or explicit mentions of NAME; skip labels, PRs, stale/idle checks and design-answer checks")
     sub.add_argument("--state", type=Path, help="JSON file holding the last reported time "
                                                   "(default: ~/.local/state/ding/watch/OWNER-REPO[.for-NAME].json)")
     sub.add_argument("--since", help="Start time for the first run (ISO, UTC; default: now)")
