@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.12
+
+- `ding waits` lists overdue unanswered waits on all configured stations and the user, with station/alias filtering, a minute threshold, and JSON output.
+- The orchestrator's watch also reminds once per executor comment about unanswered verifier waits, using the shared waits query.
+- `ding watch` refuses stdout redirected to `/dev/null` with exit 3 before polling or touching its state; pipes and files remain supported.
+
 ## 0.5.11
 
 - `ding night open|show|close` records time-limited night orders on the orchestrator log ticket, with configurable headings and explicit replacement of open orders.

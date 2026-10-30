@@ -1839,6 +1839,190 @@ def unanswered_ticket(idle_ticket, routed_settings):
     return ticket
 
 
+@pytest.fixture
+def verifier_wait(idle_ticket, routed_settings, monkeypatch):
+    ticket = idle_ticket
+    ticket.config = routed_settings
+    ticket.last.update(created_at="2026-10-28T11:15:00Z", updated_at="2026-10-28T11:15:00Z",
+                       body=executor("状态: 进行中\n在等: 核查\n关键数字: 1\n下一步: 等"))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    return ticket
+
+
+def test_waits_lists_verifier_wait_until_verifier_replies(verifier_wait, capsys):
+    ticket = verifier_wait
+    assert ding.main(["waits"]) == 0
+    output = capsys.readouterr().out
+    assert "#26 waiting on 核查 for 45 minutes" in output
+    assert "状态: 进行中; 在等: 核查" in output and ticket.last["html_url"] in output
+    ticket.comments.append({"id": 2602, "body": "核查：已核对"})
+    ticket.issues[0]["comments"] = 2
+    assert ding.main(["waits", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+@pytest.mark.parametrize("latest", ["状态: 进行中\n在等: 无", "状态: 暂停\n在等: 核查"])
+def test_waits_ignores_superseded_and_paused_waits(verifier_wait, capsys, latest):
+    ticket = verifier_wait
+    ticket.comments.append({**ticket.last, "id": 2602, "body": executor(latest), "created_at": "2026-10-28T11:20:00Z"})
+    ticket.issues[0]["comments"] = 2
+    assert ding.main(["waits"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("requested, reply", [
+    ("总编排", "总编排：已安排"), ("用户", "同意"), ("训练设计", "总设计(训练): 已答复"),
+])
+def test_waits_requires_a_reply_from_the_requested_station(verifier_wait, capsys, requested, reply):
+    ticket = verifier_wait
+    ticket.last["body"] = executor(f"状态: 进行中\n在等: {requested}\n关键数字: 1\n下一步: 等")
+    ticket.comments.append({"id": 2602, "body": "核查：其他工作已核对"})
+    ticket.issues[0]["comments"] = 2
+    assert ding.main(["waits", "--json"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+    ticket.comments.append({"id": 2603, "body": reply})
+    ticket.issues[0]["comments"] = 3
+    assert ding.main(["waits", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+@pytest.mark.parametrize("target, matches", [("总设计（训练）", True), ("总设计(训练)", True), ("训练设计", True), ("总设计", False)])
+def test_waits_for_uses_aliases_width_and_longest_name(verifier_wait, capsys, target, matches):
+    ticket = verifier_wait
+    ticket.last["body"] = executor("状态：进行中\n在等：训练设计师\n关键数字：1\n下一步：等")
+    ticket.comments.append({"id": 2602, "body": "总设计：另一个岗位的答复"})
+    ticket.issues[0]["comments"] = 2
+    assert ding.main(["waits", "--for", target, "--json"]) == 0
+    found = json.loads(capsys.readouterr().out)
+    assert bool(found) is matches
+    if matches:
+        assert found[0]["station"] == "总设计（训练）" and found[0]["minutes"] == 45
+
+
+def test_waits_reports_unanswered_targets_independently(verifier_wait, capsys):
+    ticket = verifier_wait
+    ticket.last["body"] = executor("状态: 进行中\n在等: 核查、总设计\n关键数字: 1\n下一步: 等")
+    ticket.comments.append({"id": 2602, "body": "核查：答复"})
+    ticket.issues[0]["comments"] = 2
+    assert ding.main(["waits", "--json"]) == 0
+    assert [item["station"] for item in json.loads(capsys.readouterr().out)] == ["总设计"]
+
+
+def test_designer_reply_does_not_hide_an_older_verifier_wait(verifier_wait, monkeypatch):
+    ticket = verifier_wait
+    ticket.issues[0]["comments"] = 201
+    original = watch.gh
+    pages = []
+    def gh(path):
+        if "/comments?" in path:
+            pages.append(path)
+            if path.endswith("page=3"):
+                return [{"id": 2602, "body": "总设计：其他工作已答复"}]
+            assert path.endswith("page=2")
+            return [ticket.last]
+        return original(path)
+    monkeypatch.setattr(watch, "gh", gh)
+    found = watch.unanswered_design(ticket.config, "o/r", set(), set())
+    assert len(found) == 1 and "waiting on 核查 for 45 minutes" in found[0][1]
+    assert len(pages) == 2
+
+
+def test_waits_default_zero_lists_waits_without_enabling_backstop(verifier_wait, capsys):
+    from dataclasses import replace
+    ticket = verifier_wait
+    ticket.config = replace(ticket.config, watch=config.Watch(design_answer_minutes=0))
+    assert ding.main(["waits", "--json"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
+
+
+def test_waits_query_failure_is_not_an_empty_success(verifier_wait, monkeypatch, capsys):
+    def failed(path):
+        raise RuntimeError("GitHub unavailable")
+    monkeypatch.setattr(watch, "gh", failed)
+    assert ding.main(["waits", "--json"]) == 1
+    output = capsys.readouterr()
+    assert output.out == "" and "GitHub unavailable" in output.err
+
+
+def test_waits_sorts_oldest_first_and_ignores_prs(verifier_wait, monkeypatch, capsys):
+    ticket = verifier_wait
+    older = {**ticket.last, "id": 2701, "created_at": "2026-10-28T11:00:00Z", "html_url": "https://github.com/o/r/issues/27#issuecomment-2701"}
+    ticket.issues += [{"number": 27, "comments": 1}, {"number": 28, "comments": 1, "pull_request": {}}]
+    original = watch.gh
+    monkeypatch.setattr(watch, "gh", lambda path: [older] if "/issues/27/comments?" in path else original(path))
+    assert ding.main(["waits", "--json"]) == 0
+    found = json.loads(capsys.readouterr().out)
+    assert [item["ticket"] for item in found] == [27, 26]
+    assert found[0] == {"ticket": 27, "station": "核查", "minutes": 60, "summary": "状态: 进行中; 在等: 核查",
+                        "url": older["html_url"], "comment_id": 2701, "created_at": older["created_at"]}
+
+
+@pytest.mark.parametrize("minutes, count", [(None, 1), ("45", 0), ("46", 0), ("0", 1)])
+def test_waits_threshold_and_default(verifier_wait, capsys, minutes, count):
+    options = ["--minutes", minutes] if minutes is not None else []
+    assert ding.main(["waits", "--json", *options]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == count
+
+
+@pytest.mark.parametrize("options", [["--minutes", "-1"], ["--minutes", "nan"], ["--minutes", "inf"], ["--for", " "]])
+def test_waits_rejects_invalid_options(capsys, options):
+    with pytest.raises(SystemExit) as error:
+        ding.main(["waits", *options])
+    assert error.value.code == 2
+
+
+def test_waits_help_documents_filters_and_read_only(capsys):
+    with pytest.raises(SystemExit) as error:
+        ding.main(["waits", "--help"])
+    assert error.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert all(word in output for word in ("--for", "--minutes", "--json", "Read-only", "design_answer_minutes"))
+
+
+@pytest.mark.parametrize("sink, exists", [("null", False), ("null", True), ("pipe", False), ("file", False)])
+def test_watch_refuses_null_stdout_before_polling_or_touching_state(tmp_path, sink, exists):
+    import subprocess
+    import sys
+    path = tmp_path / "state" / "watch.json"
+    initial = '{"since": "2026-10-28T10:00:00Z", "seen": [], "stale": []}'
+    if exists:
+        path.parent.mkdir()
+        path.write_text(initial)
+    script = '''
+from pathlib import Path
+import sys
+from dkitchen import config, ding, watch
+config.load = lambda: config.Config(root=Path.cwd(), repo="o/r")
+def collect(*args, **kwargs):
+    Path("polled").write_text("yes")
+    return [(watch.now(), "fixture wait", True)]
+watch.collect = collect
+watch.idle = lambda *args: ([], {})
+watch.stale = watch.unanswered_design = lambda *args: []
+sys.exit(ding.main(["watch", "--state", sys.argv[1], "--settle", "0"]))
+'''
+    output_path = tmp_path / "output.txt"
+    if sink == "pipe":
+        result = subprocess.run([sys.executable, "-c", script, str(path)], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+        output = result.stdout
+    else:
+        with (Path("/dev/null") if sink == "null" else output_path).open("w") as destination:
+            result = subprocess.run([sys.executable, "-c", script, str(path)], cwd=tmp_path, stdout=destination,
+                                    stderr=subprocess.PIPE, text=True, timeout=10)
+        output = output_path.read_text() if sink == "file" else ""
+    if sink == "null":
+        assert result.returncode == 3 and "stdout is /dev/null" in result.stderr
+        assert not (tmp_path / "polled").exists() and not path.with_suffix(".lock").exists()
+        if exists:
+            assert path.read_text() == initial
+        else:
+            assert not path.parent.exists()
+    else:
+        assert result.returncode == 0 and "fixture wait" in output
+        assert path.exists() and (tmp_path / "polled").exists()
+
+
 def test_unanswered_design_reports_default_and_alias_targets_once(unanswered_ticket):
     ticket = unanswered_ticket
     found = watch.unanswered_design(ticket.config, "o/r", set(), set())
@@ -1894,8 +2078,11 @@ def test_verifier_handoff_wakes_station_but_remains_reference_for_orchestrator(r
     assert orchestrator[0][2] is False and "for reference" in orchestrator[0][1]
 
 
-def test_backstop_persists_ids_and_does_not_repeat_after_restart(unanswered_ticket, monkeypatch, capsys):
+@pytest.mark.parametrize("target", [None, "核查"])
+def test_backstop_persists_ids_and_does_not_repeat_after_restart(unanswered_ticket, monkeypatch, capsys, target):
     ticket = unanswered_ticket
+    if target:
+        ticket.last["body"] = executor(f"状态: 进行中\n在等: {target}\n关键数字: 1\n下一步: 等")
     monkeypatch.setattr(config, "load", lambda: ticket.config)
     monkeypatch.setattr(watch, "collect", lambda *args: [])
     monkeypatch.setattr(watch, "stale", lambda *args: [])
@@ -1908,7 +2095,7 @@ def test_backstop_persists_ids_and_does_not_repeat_after_restart(unanswered_tick
     monkeypatch.setattr(watch, "collect", lambda *args: [(watch.now(), "other activity", True)])
     assert ding.main(args) == 0
     output = capsys.readouterr().out
-    assert output.count("no designer reply") == 1
+    assert output.count("no station reply" if target else "no designer reply") == 1
     assert "other activity" in output
 
 
@@ -1963,16 +2150,16 @@ def test_backstop_can_be_disabled_and_does_not_depend_on_idle_enabled(unanswered
     assert ding.main(["watch", "--state", str(ticket.config.root / "idle-off.json")]) == 0
 
 
-def test_backstop_reads_only_latest_page_when_it_contains_a_designer_reply(unanswered_ticket, monkeypatch):
+def test_backstop_reads_only_latest_page_when_all_watched_stations_replied(unanswered_ticket, monkeypatch):
     ticket = unanswered_ticket
-    ticket.issues[0]["comments"] = 201
+    ticket.issues[0]["comments"] = 202
     original = watch.gh
     pages = []
     def gh(path):
         if "/comments?" in path:
             pages.append(path)
             assert path.endswith("page=3")
-            return [{"id": 2602, "body": "总设计：已答复"}]
+            return [{"id": 2602, "body": "总设计：已答复"}, {"id": 2603, "body": "核查：已答复"}]
         return original(path)
     monkeypatch.setattr(watch, "gh", gh)
     assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []

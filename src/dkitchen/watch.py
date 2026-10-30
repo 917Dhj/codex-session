@@ -3,7 +3,7 @@
 Wakes on:
 - executor comments whose status is not "in progress", or whose "waiting on" names a station or the user;
 - idle executors still marked "in progress", after [watch] idle_minutes with no running job;
-- unanswered design requests older than [watch] design_answer_minutes, once per executor comment;
+- unanswered designer/verifier requests older than [watch] design_answer_minutes, once per executor comment;
 - comments from the user (no station signature);
 - status labels being added, and newly opened PRs;
 - stale tickets: no newer status label, last comment an executor "in progress" older than --stale-hours,
@@ -97,12 +97,18 @@ def station_variants(station: str, config: Config) -> set[str]:
     return result
 
 
+def station_names(config: Config) -> list[str]:
+    stations = config.stations
+    names = [stations.orchestrator, *designer_stations(config), stations.verifier, stations.executor,
+             stations.user, *stations.aliases]
+    return list({normalized(name): name for name in names}.values())
+
+
 def named(text: str, station: str, config: Config, *, markers: tuple[str, ...] = (), signature: bool = False) -> bool:
     text = normalized(text)
     targets = station_variants(station, config)
     stations = config.stations
-    names = {stations.orchestrator, stations.verifier, stations.executor, stations.user, *designer_stations(config),
-             *stations.aliases}
+    names = station_names(config)
     choices = targets | {variant for name in names for variant in station_variants(name, config)}
     pattern = "|".join(map(re.escape, sorted(choices, key=len, reverse=True)))
     for match in re.finditer(pattern, text):
@@ -328,30 +334,79 @@ def label_suppresses(config: Config, repo: str, issue: dict, comment: dict) -> b
     return any(added.get(name, "") > comment["created_at"] for name in labels)
 
 
-def unanswered_design(config: Config, repo: str, reported: set[int], skip: set[int]) -> list[tuple[str, str, int]]:
-    if config.watch.design_answer_minutes == 0:
-        return []
+def answered_by(body: str, station: str, config: Config) -> bool:
+    who = role(body, config)
+    first = normalized(next((line for line in body.splitlines() if line.strip()), ""))
+    first = re.sub(r"^[\s#*>]+", "", first)
+    if who == config.stations.designer:
+        for prefix in sorted(config.designer_signatures, key=len, reverse=True):
+            if first.startswith(normalized(prefix)):
+                return bool(station_variants(station, config) & station_variants(signature_name(prefix, config), config))
+    elif station_variants(station, config) & station_variants(who, config):
+        return True
+    return named(first, station, config, signature=True)
+
+
+def unanswered_waits(config: Config, repo: str, minutes: float, skip: set[int], *,
+                     stations: list[str] | None = None, design_fallback: bool = False) -> list[dict]:
+    names = station_names(config) if stations is None else stations
     moment = datetime.now(timezone.utc)
     found = []
     for issue in open_issues(repo):
         if "pull_request" in issue or issue["number"] in skip or not issue["comments"]:
             continue
+        answered = set()
         for comment in comments_backwards(repo, issue):
             who = role(comment["body"], config)
-            if who == config.stations.designer:
-                break
             if who != config.stations.executor:
+                answered.update(name for name in names if answered_by(comment["body"], name, config))
+                if design_fallback and who == config.stations.designer:
+                    # Existing watch reminders accept a reply from any designer station.
+                    answered.update(set(names) & set(designer_stations(config)))
+                if len(answered) == len(names):
+                    break
                 continue
-            if comment["id"] in reported:
+            if state_and_waiting(comment["body"], config)[0] == config.status.paused:
                 break
-            designers = design_request(comment["body"], config)
-            minutes = (moment - datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
-            if designers and minutes > config.watch.design_answer_minutes:
-                found.append((comment["created_at"], f"#{issue['number']} waiting on {', '.join(designers)} "
-                              f"for {minutes:.0f} minutes with no designer reply: {summary(comment['body'], config)} "
-                              f"{comment['html_url']}", comment["id"]))
+            implicit = design_request(comment["body"], config) if design_fallback else []
+            elapsed = (moment - datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
+            if elapsed > minutes:
+                for name in names:
+                    if name not in answered and (waiting_for(comment["body"], name, config) or name in implicit):
+                        found.append({"ticket": issue["number"], "station": name, "minutes": elapsed,
+                                      "summary": summary(comment["body"], config), "url": comment["html_url"],
+                                      "comment_id": comment["id"], "created_at": comment["created_at"]})
             break
-    return found
+    return sorted(found, key=lambda item: (item["created_at"], item["ticket"], item["station"]))
+
+
+def waits(args, config: Config) -> int:
+    names = station_names(config)
+    if args.station is not None:
+        names = [name for name in names if station_variants(name, config) & station_variants(args.station, config)]
+    minutes = config.watch.design_answer_minutes if args.minutes is None else args.minutes
+    found = unanswered_waits(config, config.repository(), minutes, set(), stations=names) if names else []
+    if args.json:
+        print(json.dumps(found, ensure_ascii=False))
+    else:
+        for item in found:
+            print(f"#{item['ticket']} waiting on {item['station']} for {item['minutes']:.0f} minutes: "
+                  f"{item['summary']} {item['url']}")
+    return 0
+
+
+def unanswered_design(config: Config, repo: str, reported: set[int], skip: set[int]) -> list[tuple[str, str, int]]:
+    if config.watch.design_answer_minutes == 0:
+        return []
+    designers = designer_stations(config)
+    found = {}
+    for item in unanswered_waits(config, repo, config.watch.design_answer_minutes, skip,
+                                 stations=[*designers, config.stations.verifier], design_fallback=True):
+        if item["comment_id"] not in reported:
+            found.setdefault(item["comment_id"], (item, []))[1].append(item["station"])
+    return [(item["created_at"], f"#{item['ticket']} waiting on {', '.join(names)} for {item['minutes']:.0f} minutes "
+             f"with no {'designer' if all(name in designers for name in names) else 'station'} reply: "
+             f"{item['summary']} {item['url']}", item["comment_id"]) for item, names in found.values()]
 
 
 def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set[int],
@@ -432,6 +487,13 @@ def default_state(repo: str, station: str | None = None) -> Path:
 
 
 def watch(args, config: Config) -> int:
+    try:
+        discarded = os.path.samestat(os.fstat(sys.stdout.fileno()), os.stat(os.devnull))
+    except (AttributeError, OSError, ValueError):
+        discarded = False
+    if discarded:
+        print("ding: watch stdout is /dev/null; use a pipe or a file so its batch is not lost", file=sys.stderr)
+        return 3
     repo = config.repository()
     station = getattr(args, "station", None)
     collect_options = {"station": station} if station is not None else {}

@@ -105,6 +105,7 @@ The stations' everyday steps are `ding` commands too, so they run the same caref
 - `ding relay` sends a message to a ticket's executor, and records it on the ticket only once delivery is confirmed.
 - `ding merge` merges a PR only at the HEAD that was reviewed, and only once the ticket's executor is waiting on the orchestrator to merge it.
 - `ding watch` waits in the orchestrator's background and wakes it when a ticket needs attention.
+- `ding waits` lists overdue unanswered waits, including ones still pending after a prior watch batch.
 - `ding log` keeps the orchestrator's log of what it did while you were away.
 - `ding night` opens, shows, and closes time-limited night orders on that log. Run `/goodnight` and `/goodmorning` in the orchestrator session to collect the orders and report their use.
 - `ding check-refs` checks every file, line, and digest the verifier cites.
