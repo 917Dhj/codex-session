@@ -19,7 +19,7 @@ When a session is replaced, edit only this table. Everywhere else, write the sta
 
 ## Who owns what
 
-**The user decides**: the research direction, how datasets are used, and what the paper claims<!-- module:run-budgets -->; model runs, paid calls, and service starts beyond a ticket's budget ([run-budgets.md](run-budgets.md))<!-- /module:run-budgets -->. On these, other stations propose and wait for the user. An approval counts only in the user's own words; no station can produce one.
+**The user decides**: the research direction, how datasets are used, and what the paper claims<!-- module:run-budgets -->; model runs, paid calls, and service starts beyond a ticket's budget ([run-budgets.md](run-budgets.md))<!-- /module:run-budgets -->. On these, other stations propose and wait for the user. An approval counts only in the user's own words; no station can produce one.<!-- module:unattended --> Night orders on the orchestrator log ticket count as the user's own words when they include the user's verbatim reply and the numbered list it answers, within that reply's scope and the orders' window ([unattended.md](unattended.md#night-orders)).<!-- /module:unattended -->
 
 Everything else goes to its owner below. Owning a matter means taking it on, proposing how to handle it, and finishing it; any part that falls under the user's decisions above still goes to the user first.
 

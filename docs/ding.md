@@ -375,6 +375,7 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 | `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. The message opens with the `[relay] superseding` line and is sent with `--steer --supersede`: it enters the executor's current turn and deletes the orchestrator's relays still queued for it. `--queue` queues it plainly instead; `--interrupt` also stops the current turn first. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
 | `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator or lists PR #57 as pending merge (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
+| `ding night open\|show\|close` | Orchestrator opens/closes; any station reads | Records night orders on `[log] issue`, shows the open orders and their link, or closes them. Orders expire at `--until`. Calls no model. |
 | `ding watch [--for NAME]` | A station, in the background | Waits for GitHub activity, prints it as one batch, and exits. `--for NAME` selects executor comments waiting on that station. See [While the user is away](../kitchen/modules/unattended.md). |
 | `ding check-refs draft.md` | Verifier | Checks every `file:line` in a draft comment, in backticks or not (a name written right next to it must appear on that line), and every `sha256`, against `origin/main` or `--root DIR`. It also asks GitHub that each `#N` ticket, `PR#N`, issue or PR link, and comment link exists, that a `PR#N` or `/pull/` link is a PR, and that a comment link's comment belongs to the ticket in the link (`--repo` for bare `#N`, `--offline` to skip). It prints how many references of each kind it checked, and lists every wrong one and every one it could not check, also in its JSON line. Exits 1 when something is wrong. Give several drafts to check them one by one: each line then names its file, the JSON lines carry a `draft` key, and the exit status is nonzero (1 for a wrong reference, 2 for an unreadable file) if any draft fails. |
 | `ding rule 42 draft.md [--reply-to LINK_OR_ID] [--notify SESSION] [--force]`<br>`ding rule 42 body.md --edit-body --base base.md` | Designer | Posts the designer's ruling on ticket #42. Nothing is sent unless the draft's line 1 starts with one of `[rule] signatures`, line 2 with the `[rule] type_label` and one of `[rule] types`, and `check-refs` finds nothing wrong (it takes `--ref`, `--root`, `--tolerance`, `--repo`, `--offline`). With `--reply-to`, it stops and lists the link and first line of every comment that came after the one answered; `--force` posts anyway. Without it, it shows the latest comment's time and first line as a hint. It posts with `gh issue comment` and prints only the comment URL on stdout. `--notify SESSION` then sends `[rule] notify` plus the draft's complete stripped first nonempty line to a Codex session with `ding send`; if that fails, the error says so and the comment stays. `ding` cannot message Claude Code sessions, so `--notify` refuses a `uds:` or `local_` address before posting; tell those with `SendMessage`, using the printed URL. `--edit-body` replaces the ticket body instead: it stops unless the current body equals the `--base` file (line endings and trailing newlines aside), edits with `gh issue edit`, then reads the body back and fails unless it matches the draft byte for byte, ignoring trailing newlines. The line 1 and 2 check applies to comments only. |
@@ -403,6 +404,22 @@ The default state file is `OWNER-REPO.for-NAME.json` under the watch state direc
 Terminal comment hints keep the first 100 characters and add `…` when shortened. Watch summaries keep the first 160 characters and PR titles the first 80, also adding `…` when shortened. Notification text, including `{first_line}`, carries the complete stripped first nonempty line.
 
 Run `ding watch --help` for the timing options.
+
+### Night orders: `night open`, `night show`, `night close`
+
+Night orders live on `[log] issue`. The orchestrator collects the user's approvals with `/goodnight` before the user leaves, and closes and reports them with `/goodmorning` when the user returns. Both skills are user-invoked and run in the orchestrator session; their station names and rules come from the current repo.
+
+```bash
+ding night open --until 2026-10-31T08:00:00Z --body-file orders.md
+ding night show
+ding night close
+```
+
+`open` takes a nonempty UTF-8 file containing the user's reply verbatim and the numbered list it answers. The CLI adds the first line, `[night] heading` followed by `, until <time>)`; put only the reply and list in the file. `--until` must be a future ISO time with an explicit timezone; it is recorded in UTC. Open orders block another `open`; `--replace` posts a closing line first, then the new orders. The posted comment URLs are printed. A failed close prevents the replacement; if posting the replacement fails after closing, the old orders remain closed.
+
+`show` prints the open orders unchanged, followed by their comment link. Orders are open only until their end time and while no later closing line exists. With no open orders, it prints exactly `no night orders open` and exits 0. Every station runs it before writing "waiting on the user", then acts only on orders that cover the case. The command reads only the log ticket's comments, newest first in pages of 100, stopping at the latest opening or closing marker. Usually this takes one request; older pages are read only when the latest page contains no marker. No local state is kept, and no model is called.
+
+`close` posts `[night] closed` followed by ` at <time UTC>` for the open orders. If they have expired or are already closed, it prints `no night orders open` and posts nothing. GitHub read failures return nonzero rather than treating the orders as absent. `[night] heading` and `closed` must be nonempty single-line strings; without `[night]`, the English defaults below apply. Changing these words also changes which existing markers can be recognized.
 
 ### .dkitchen.toml
 
@@ -435,6 +452,10 @@ awaiting_user = "status:awaiting-user"
 [log]
 issue = 1                            # the pinned orchestrator log ticket
 pending = "Waiting for the user"
+
+[night]
+heading = "Orchestrator: user decision (night orders"   # followed by ", until <time>)"
+closed = "Orchestrator: night orders closed"
 
 [sessions]
 name = "【#{issue}】{name}"           # session name for `ding new --issue N --name NAME`

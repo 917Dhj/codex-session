@@ -2,6 +2,16 @@
 
 When the user is away, an issue watcher wakes the orchestrator, which moves forward only what existing approvals already cover. The test for every step: **if anyone would do it the same way, do it. If there are several reasonable ways and the choice affects results, cost, or direction, stop and wait for the user.** Approvals come only from the user's own words; the watcher, the orchestrator, and the designer never produce one.
 
+## Night orders
+
+The user invokes `/goodnight` in the orchestrator session before leaving. The orchestrator asks every designer for its line's stops, reads the board and jobs, and traces the window until every running job and every ready ticket either keeps running past the window or reaches a named stop. Each stop is settled as an approval, an observable decision rule, or parked work. The list also gives the fill order for free cards and the hard stops. The user answers once; the orchestrator posts that reply verbatim with the numbered list using `ding night open --until <time> --body-file <file>` on the log ticket. The headings follow `[night]` in `.dkitchen.toml`; the time includes its timezone.
+
+When asked for night orders, each designer replies under its signature within 10 minutes. It gives approvals with their scope and limits, rules of the form "if <observable>, then <action>; otherwise <action>", or "park until morning", plus its hard stops. A line whose designer has not replied by the deadline is parked.
+
+Before writing "waiting on the user", **every station runs `ding night show`**. If an open order covers the case, it acts within that order's scope and limits. Otherwise it waits for the user. An order ends when closed or when its end time passes; it never expands standing approvals or overrides hard stops. During the night, every `ding log --item` the orchestrator writes names the order number it relied on, or the standing approval covering the action.
+
+When the user returns, they invoke `/goodmorning` in the orchestrator session. The orchestrator closes the orders with `ding night close`, then reports decisions for the user, stalls and their idle card-hours (marking estimates), orders used or unused, progress, and orders worth making standing. Standing rules change only on the user's approval.
+
 ## The watch
 
 The orchestrator runs the watch in the background of its main checkout, always with the same command. After handling each batch it starts the watch again; that is the last step of every round.

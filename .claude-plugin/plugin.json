@@ -1,6 +1,6 @@
 {
   "name": "dkitchen",
-  "version": "0.5.4",
+  "version": "0.5.11",
   "description": "Install the dkitchen multi-agent workflow into your repo: stations, house rules, and repo scripts, adapted by /setup-dkitchen.",
   "author": {
     "name": "917Dhj",
@@ -9,5 +9,5 @@
   "repository": "https://github.com/917Dhj/dkitchen",
   "license": "MIT",
   "keywords": ["multi-agent", "workflow", "research", "codex", "claude-code"],
-  "skills": ["./skills/setup-dkitchen"]
+  "skills": ["./skills/setup-dkitchen", "./skills/goodnight", "./skills/goodmorning"]
 }
