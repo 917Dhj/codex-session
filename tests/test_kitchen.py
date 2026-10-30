@@ -1843,7 +1843,7 @@ def test_backstop_reports_new_requests_after_a_previous_designer_reply(unanswere
     assert watch.unanswered_design(ticket.config, "o/r", set(), {26}) == []
 
 
-def test_label_history_uses_latest_addition_and_keeps_unknown_history_suppressed(idle_ticket, monkeypatch):
+def test_label_history_uses_latest_addition_and_requires_a_newer_event(idle_ticket, monkeypatch):
     ticket = idle_ticket
     issue = ticket.issues[0]
     issue["labels"] = [{"name": "status:blocked"}]
@@ -1853,4 +1853,4 @@ def test_label_history_uses_latest_addition_and_keeps_unknown_history_suppressed
     monkeypatch.setattr(watch, "gh", lambda path: events)
     assert watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)
     events.clear()
-    assert watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)
+    assert not watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)

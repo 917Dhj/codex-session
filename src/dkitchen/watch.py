@@ -325,7 +325,7 @@ def label_suppresses(config: Config, repo: str, issue: dict, comment: dict) -> b
         if len(events) < 100:
             break
         page += 1
-    return any(name not in added or added[name] > comment["created_at"] for name in labels)
+    return any(added.get(name, "") > comment["created_at"] for name in labels)
 
 
 def unanswered_design(config: Config, repo: str, reported: set[int], skip: set[int]) -> list[tuple[str, str, int]]:
