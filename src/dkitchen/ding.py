@@ -1774,14 +1774,23 @@ def main(argv=None) -> int:
     opening.add_argument("--replace", action="store_true", help="Close existing open orders before posting new ones")
     night_commands.add_parser("show", help="Print open orders and their link, or 'no night orders open' (exit 0)")
     night_commands.add_parser("close", help="Post a closing line for the open orders; expired orders are already closed")
+    sub = commands.add_parser("waits", help="List overdue waits on stations or the user, oldest first",
+                              description="List each open ticket's latest executor comment waiting on a configured "
+                                          "station or the user, with no later reply from that station. Uses watch's "
+                                          "aliases, width normalization, longest-name matching, and paused-state exclusion. "
+                                          "Read-only; calls no model; exits 0 even when empty.")
+    sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME", help="Keep only waits on NAME or its aliases")
+    sub.add_argument("--minutes", type=float, help="Nonnegative finite threshold (default: [watch] design_answer_minutes)")
+    sub.add_argument("--json", action="store_true", help="Print a JSON array instead of one line per wait")
     sub = commands.add_parser("watch", help="Wait for GitHub activity the orchestrator must handle, then exit",
                                 description="Wait for GitHub activity the orchestrator must handle, print it, and exit. "
                                             "With --for NAME, watch executor comments waiting on that station, design requests, and explicit handoffs. "
                                             "[stations.aliases] adds equivalent names; bracket/colon width is normalized. "
                                             "Configure [status] paused to suppress station wakes for paused executors. "
                                             "Idle/stale checks ignore status labels older than the executor comment; "
-                                            "awaiting-user still suppresses them. The orchestrator checks unanswered design "
+                                            "awaiting-user still suppresses them. The orchestrator checks unanswered designer/verifier "
                                             "requests after [watch] design_answer_minutes (default 30; 0 disables it). "
+                                            "Stdout /dev/null is refused with exit 3 before polling; pipes and files are allowed. "
                                             "Read-only; calls no model.")
     sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME",
                      help="Wake on requests or explicit mentions of NAME; skip labels, PRs, stale/idle checks and design-answer checks")
@@ -1867,8 +1876,10 @@ def main(argv=None) -> int:
             parser.error("--edit-body and --base go together")
         if args.force and not args.reply_to:
             parser.error("--force goes with --reply-to")
-    if args.action == "watch" and args.station is not None and not args.station:
+    if args.action in {"watch", "waits"} and args.station is not None and not args.station:
         parser.error("--for must contain non-whitespace text")
+    if args.action == "waits" and args.minutes is not None and (not math.isfinite(args.minutes) or args.minutes < 0):
+        parser.error("--minutes must be a nonnegative finite number")
     if args.action == "launch" and args.skip_preflight is not None and not args.skip_preflight.strip():
         parser.error("--skip-preflight requires a nonempty reason")
     if args.action in {"run", "launch"} and not command:
@@ -1900,10 +1911,10 @@ def main(argv=None) -> int:
         if args.action == "night":
             from dkitchen import config, night
             return night.night(args, config.load())
-        if args.action in {"relay", "merge", "log", "watch"}:
+        if args.action in {"relay", "merge", "log", "watch", "waits"}:
             from dkitchen import config, orchestrate, watch
             settings = config.load()
-            handler = watch.watch if args.action == "watch" else getattr(orchestrate, args.action)
+            handler = getattr(watch, args.action) if args.action in {"watch", "waits"} else getattr(orchestrate, args.action)
             return handler(args, settings)
         if args.action == "board":
             fields = args.status_fields
