@@ -1666,6 +1666,22 @@ def test_unanswered_design_does_not_report_paused_or_premature_request(unanswere
     assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
 
 
+@pytest.mark.parametrize("body, created_at, reported, expected", [
+    ("状态: 进行中\n在等: 无", "2026-10-28T11:29:00Z", set(), []),
+    ("状态: 暂停\n在等: 训练设计", "2026-10-28T11:29:00Z", set(), []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:40:00Z", set(), []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:29:00Z", {2602}, []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:29:00Z", set(), [2602]),
+])
+def test_backstop_only_considers_latest_executor_comment(unanswered_ticket, body, created_at, reported, expected):
+    ticket = unanswered_ticket
+    ticket.last["created_at"] = "2026-10-28T11:00:00Z"
+    ticket.comments.append({**ticket.last, "id": 2602, "body": executor(body), "created_at": created_at})
+    ticket.issues[0]["comments"] = 2
+    found = watch.unanswered_design(ticket.config, "o/r", reported, set())
+    assert [item[2] for item in found] == expected
+
+
 def test_verifier_handoff_wakes_station_but_remains_reference_for_orchestrator(routed_settings, monkeypatch):
     item = comment(32, "核查：结论\n交总设计决定")
     def gh(path):

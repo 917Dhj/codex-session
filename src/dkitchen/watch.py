@@ -340,14 +340,17 @@ def unanswered_design(config: Config, repo: str, reported: set[int], skip: set[i
             who = role(comment["body"], config)
             if who == config.stations.designer:
                 break
-            if who != config.stations.executor or comment["id"] in reported:
+            if who != config.stations.executor:
                 continue
+            if comment["id"] in reported:
+                break
             designers = design_request(comment["body"], config)
             minutes = (moment - datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
             if designers and minutes > config.watch.design_answer_minutes:
                 found.append((comment["created_at"], f"#{issue['number']} waiting on {', '.join(designers)} "
                               f"for {minutes:.0f} minutes with no designer reply: {summary(comment['body'], config)} "
                               f"{comment['html_url']}", comment["id"]))
+            break
     return found
 
 
