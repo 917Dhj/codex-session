@@ -3,17 +3,20 @@
 Wakes on:
 - executor comments whose status is not "in progress", or whose "waiting on" names a station or the user;
 - idle executors still marked "in progress", after [watch] idle_minutes with no running job;
+- unanswered design requests older than [watch] design_answer_minutes, once per executor comment;
 - comments from the user (no station signature);
 - status labels being added, and newly opened PRs;
-- stale tickets: no status label, last comment an executor "in progress" older than --stale-hours,
+- stale tickets: no newer status label, last comment an executor "in progress" older than --stale-hours,
   no running `ding run` for the ticket, and no live tmux job whose session name holds issue<N>.
 On tickets labelled awaiting-user, executor comments wake only for blocked, done, and waiting on design,
 or when their "waiting on" names the orchestrator, designer, or verifier.
-Verifier comments never wake on their own, since the verifier also messages the orchestrator;
+In orchestrator mode, verifier comments never wake on their own, since the verifier also messages it;
 they are listed in the next batch for reference.
 The state file keeps the time already reported, so rerunning the same command loses nothing.
 One watch runs per state file; a second one exits at once.
-With --for NAME, only executor comments waiting on that station wake; other triggers are not queried.
+With --for NAME, executor requests and explicit handoffs to that station wake; designer rulings do not.
+Aliases and width-normalized names share the longest-name match. Configured paused executors never wake --for.
+Awaiting-user labels always suppress idle/stale checks; other status labels suppress only when newer than the comment.
 Station names, status words, and labels come from .dkitchen.toml.
 """
 from __future__ import annotations
@@ -27,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from urllib.parse import quote
 
 from dkitchen import truncate
@@ -65,17 +69,72 @@ def issue_number(url: str) -> int:
     return int(url.rstrip("/").rsplit("/", 1)[1])
 
 
+def normalized(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+
+def signature_name(prefix: str, config: Config) -> str:
+    return prefix.rstrip().removesuffix(config.stations.separator.rstrip()).strip()
+
+
+def designer_stations(config: Config) -> list[str]:
+    names = [config.stations.designer]
+    names += [signature_name(signature, config) for signature in config.designer_signatures]
+    unique = {}
+    for name in names:
+        if name:
+            unique.setdefault(normalized(name), name)
+    return list(unique.values())
+
+
+def station_variants(station: str, config: Config) -> set[str]:
+    target = normalized(station)
+    result = {target}
+    for name, aliases in config.stations.aliases.items():
+        group = {normalized(name), *(normalized(alias) for alias in aliases)}
+        if target in group:
+            result.update(group)
+    return result
+
+
+def named(text: str, station: str, config: Config, *, markers: tuple[str, ...] = (), signature: bool = False) -> bool:
+    text = normalized(text)
+    targets = station_variants(station, config)
+    stations = config.stations
+    names = {stations.orchestrator, stations.verifier, stations.executor, stations.user, *designer_stations(config),
+             *stations.aliases}
+    choices = targets | {variant for name in names for variant in station_variants(name, config)}
+    pattern = "|".join(map(re.escape, sorted(choices, key=len, reverse=True)))
+    for match in re.finditer(pattern, text):
+        if match.group() not in targets:
+            continue
+        if not markers and not signature:
+            return True
+        before = text[:match.start()]
+        if markers and before.endswith(markers):
+            return True
+        if (signature and not before.rsplit("\n", 1)[-1].strip()
+                and text[match.end():].startswith(normalized(stations.separator).rstrip())):
+            return True
+    return False
+
+
 def role(body: str, config: Config) -> str:
     """The station named at the start of the first line; otherwise the executor by a line starting with its
     session signature (`Codex session:`, or `Claude session:` for an executor run in Claude Code); else the user.
     A session signature quoted inside a line signs nothing."""
     stations = config.stations
     first_line = next((line for line in body.splitlines() if line.strip()), "")
+    first_line = normalized(first_line)
     first = re.sub(r"^[\s#*>]+", "", first_line)
-    if first_line.startswith(config.designer_signatures) or first.startswith(config.designer_signatures):
+    if (any(first_line.startswith(normalized(prefix)) or first.startswith(normalized(prefix))
+            for prefix in config.designer_signatures)
+            or any(first.startswith(variant + normalized(stations.separator))
+                   for prefix in config.designer_signatures
+                   for variant in station_variants(signature_name(prefix, config), config))):
         return stations.designer
     signed = next((name for name in (stations.verifier, stations.orchestrator)
-                   if first.startswith(name)), None)
+                   if any(first.startswith(variant) for variant in station_variants(name, config))), None)
     if signed:
         return signed
     return stations.executor if re.search(r"(?m)^[ \t]*(?:Codex|Claude) session:", body) else stations.user
@@ -96,23 +155,45 @@ def state_and_waiting(body: str, config: Config) -> tuple[str, str]:
 def executor_wakes(body: str, waiting_user: bool, config: Config) -> bool:
     state, waiting = state_and_waiting(body, config)
     status, stations = config.status, config.stations
-    names = lambda *who: not waiting.startswith(status.none) and any(name in waiting for name in who)
-    kitchen = (stations.orchestrator, stations.designer, stations.verifier)
+    names = lambda *who: any(waiting_for(body, name, config) for name in who)
+    kitchen = (stations.orchestrator, *designer_stations(config), stations.verifier)
     if waiting_user:
         return state in {status.blocked, status.done, status.waiting_on_design} or names(*kitchen)
-    return state != status.in_progress or names(*kitchen, stations.user)
+    return state not in {status.in_progress, status.paused} or names(*kitchen, stations.user)
 
 
 def waiting_for(body: str, station: str, config: Config) -> bool:
     _, waiting = state_and_waiting(body, config)
     if waiting.startswith(config.status.none):
         return False
-    stations = config.stations
-    names = {stations.orchestrator, stations.designer, stations.verifier, stations.executor, stations.user}
-    names.update(signature.rstrip().removesuffix(stations.separator.rstrip()).strip()
-                 for signature in config.designer_signatures)
-    choices = sorted({station} | {name for name in names if station in name}, key=len, reverse=True)
-    return any(match.group() == station for match in re.finditer("|".join(map(re.escape, choices)), waiting))
+    return named(waiting, station, config)
+
+
+def design_request(body: str, config: Config) -> list[str]:
+    state, _ = state_and_waiting(body, config)
+    if state == config.status.paused:
+        return []
+    designers = [name for name in designer_stations(config) if waiting_for(body, name, config)]
+    return designers or ([config.stations.designer] if state == config.status.waiting_on_design else [])
+
+
+def station_wakes(body: str, station: str, config: Config) -> bool:
+    who = role(body, config)
+    if who == config.stations.designer:
+        return False
+    if who == config.stations.executor:
+        state, _ = state_and_waiting(body, config)
+        if state == config.status.paused:
+            return False
+        if waiting_for(body, station, config):
+            return True
+        if (state == config.status.waiting_on_design
+                and not any(waiting_for(body, name, config) for name in designer_stations(config))
+                and station_variants(station, config) & station_variants(config.stations.designer, config)):
+            return True
+        next_step = fields(body, config).get(config.status.fields[3], "") if len(config.status.fields) > 3 else ""
+        return named(next_step, station, config, markers=("交",))
+    return named(body, station, config, markers=("@", "交"), signature=True)
 
 
 def summary(body: str, config: Config) -> str:
@@ -137,14 +218,14 @@ def collect(config: Config, repo: str, since: str, labels_since: str, seen: set[
         if number in skip:
             continue
         if station is not None:
-            if who != executor or not waiting_for(body, station, config):
+            if not station_wakes(body, station, config):
                 continue
         elif not (who in {verifier, user} or (who == executor and executor_wakes(body, number in waiting, config))):
             continue
         kind = f"{who} comment" if comment["created_at"] >= since else f"{who} edited a comment"
-        note = f" ({verifier.lower()} reports separately; for reference)" if who == verifier else ""
+        note = f" ({verifier.lower()} reports separately; for reference)" if who == verifier and station is None else ""
         found.append((comment["updated_at"], f"#{number} {kind}{note}: {summary(body, config)} {comment['html_url']}",
-                      who != verifier))
+                      station is not None or who != verifier))
     if station is None:
         for event in newer(f"repos/{repo}/issues/events?", "created_at", labels_since):
             label = (event.get("label") or {}).get("name", "")
@@ -209,14 +290,78 @@ def tmux_panes() -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def open_issues(repo: str):
+    page, seen = 1, set()
+    while True:
+        issues = gh(f"repos/{repo}/issues?state=open&per_page=100&page={page}")
+        for issue in issues:
+            if issue["number"] not in seen:
+                seen.add(issue["number"])
+                yield issue
+        if len(issues) < 100:
+            return
+        page += 1
+
+
+def comments_backwards(repo: str, issue: dict):
+    for page in range((issue["comments"] + 99) // 100, 0, -1):
+        yield from reversed(gh(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100&page={page}"))
+
+
+def label_suppresses(config: Config, repo: str, issue: dict, comment: dict) -> bool:
+    labels = {label["name"] for label in issue["labels"] if label["name"].startswith(config.labels.prefix)}
+    if config.labels.awaiting_user in {label["name"] for label in issue["labels"]}:
+        return True
+    if not labels:
+        return False
+    added = {}
+    page = 1
+    while True:
+        events = gh(f"repos/{repo}/issues/{issue['number']}/events?per_page=100&page={page}")
+        for event in events:
+            name = (event.get("label") or {}).get("name")
+            if event["event"] == "labeled" and name in labels:
+                added[name] = max(added.get(name, ""), event["created_at"])
+        if len(events) < 100:
+            break
+        page += 1
+    return any(added.get(name, "") > comment["created_at"] for name in labels)
+
+
+def unanswered_design(config: Config, repo: str, reported: set[int], skip: set[int]) -> list[tuple[str, str, int]]:
+    if config.watch.design_answer_minutes == 0:
+        return []
+    moment = datetime.now(timezone.utc)
+    found = []
+    for issue in open_issues(repo):
+        if "pull_request" in issue or issue["number"] in skip or not issue["comments"]:
+            continue
+        for comment in comments_backwards(repo, issue):
+            who = role(comment["body"], config)
+            if who == config.stations.designer:
+                break
+            if who != config.stations.executor:
+                continue
+            if comment["id"] in reported:
+                break
+            designers = design_request(comment["body"], config)
+            minutes = (moment - datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
+            if designers and minutes > config.watch.design_answer_minutes:
+                found.append((comment["created_at"], f"#{issue['number']} waiting on {', '.join(designers)} "
+                              f"for {minutes:.0f} minutes with no designer reply: {summary(comment['body'], config)} "
+                              f"{comment['html_url']}", comment["id"]))
+            break
+    return found
+
+
 def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set[int],
           skip: set[int]) -> list[tuple[str, str, int]]:
     """(time, line, comment id) for in-progress tickets whose executor has gone quiet."""
     cutoff = stamp(datetime.now(timezone.utc) - timedelta(hours=hours))
-    candidates = [issue for issue in gh(f"repos/{repo}/issues?state=open&per_page=100")
+    candidates = [issue for issue in open_issues(repo)
                   if "pull_request" not in issue and issue["number"] not in skip and issue["comments"]
                   and issue["updated_at"] < cutoff
-                  and not any(label["name"].startswith(config.labels.prefix) for label in issue["labels"])]
+                  and not any(label["name"] == config.labels.awaiting_user for label in issue["labels"])]
     running = running_issues(checkout, config.sessions, repo) | tmux_issues(tmux_panes()) if candidates else set()
     found = []
     for issue in candidates:
@@ -224,7 +369,8 @@ def stale(config: Config, repo: str, checkout: Path, hours: float, reported: set
             continue
         last = gh(f"repos/{repo}/issues/{issue['number']}/comments?per_page=1&page={issue['comments']}")[-1]
         if (last["id"] not in reported and role(last["body"], config) == config.stations.executor
-                and state_and_waiting(last["body"], config)[0] == config.status.in_progress):
+                and state_and_waiting(last["body"], config)[0] == config.status.in_progress
+                and not label_suppresses(config, repo, issue, last)):
             found.append((last["created_at"], f"#{issue['number']} executor silent for over {hours:g} hours, with no "
                                               f"running ding run or tmux job: {summary(last['body'], config)} "
                                               f"{last['html_url']}", last["id"]))
@@ -236,9 +382,9 @@ def idle(config: Config, repo: str, checkout: Path, observed: dict, reported: se
     """Idle in-progress executors, and first-observation times when board has no session update time."""
     if config.watch.idle_minutes == 0:
         return [], {}
-    issues = [issue for issue in gh(f"repos/{repo}/issues?state=open&per_page=100")
+    issues = [issue for issue in open_issues(repo)
               if "pull_request" not in issue and issue["number"] not in skip and issue["comments"]
-              and not any(label["name"].startswith(config.labels.prefix) for label in issue["labels"])]
+              and not any(label["name"] == config.labels.awaiting_user for label in issue["labels"])]
     if not issues:
         return [], {}
     output = board_output(checkout)
@@ -258,15 +404,11 @@ def idle(config: Config, repo: str, checkout: Path, observed: dict, reported: se
         if (number in running or not sessions.get(number)
                 or any(status not in {"idle", "notLoaded"} for status in sessions[number])):
             continue
-        last = None
-        for page in range((issue["comments"] + 99) // 100, 0, -1):
-            comments = gh(f"repos/{repo}/issues/{number}/comments?per_page=100&page={page}")
-            last = next((comment for comment in reversed(comments)
-                         if role(comment["body"], config) == config.stations.executor), None)
-            if last:
-                break
+        last = next((comment for comment in comments_backwards(repo, issue)
+                     if role(comment["body"], config) == config.stations.executor), None)
         if (last is None or last["id"] in reported
-                or state_and_waiting(last["body"], config)[0] != config.status.in_progress):
+                or state_and_waiting(last["body"], config)[0] != config.status.in_progress
+                or label_suppresses(config, repo, issue, last)):
             continue
         previous = observed.get(str(number), {})
         since = previous.get("since") if previous.get("comment_id") == last["id"] else None
@@ -307,20 +449,22 @@ def watch(args, config: Config) -> int:
              else {"since": args.since or started, "seen": [], "stale": []})
     since, seen, reported = state["since"], set(state["seen"]), set(state.get("stale", []))
     observed, idle_reported = state.get("idle_observed", {}), set(state.get("idle_reported", []))
+    design_reported = set(state.get("design_reported", []))
     skip = set(args.skip_issue) | ({config.log.issue} if config.log.issue else set())
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
     labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
     detail = (f"comments and PRs since {since}, labels since {labels_since}" if station is None
-              else f"executor comments waiting on {station!r} since {since}")
+              else f"requests and handoffs to {station!r} since {since}")
     print(f"Watching {repo}: {detail}", file=sys.stderr)
     errors = 0
     next_stale = next_idle = 0.0 if station is None else float("inf")
-    idle_every = min(config.watch.idle_minutes * 20, 900) if station is None and config.watch.idle_minutes else float("inf")
+    threshold = config.watch.idle_minutes or config.watch.design_answer_minutes
+    idle_every = min(threshold * 20, 900) if station is None and threshold else float("inf")
     while True:
         polled = now()
         try:
             found = collect(config, repo, since, labels_since, seen, skip, **collect_options)
-            quiet, idle_found, pending, stale_ids = [], [], observed, set()
+            quiet, idle_found, design_found, pending, stale_ids = [], [], [], observed, set()
             checked_at = time.monotonic()
             checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
             if checked_stale:
@@ -328,7 +472,9 @@ def watch(args, config: Config) -> int:
                 stale_ids = {id_ for _, _, id_ in quiet}
             if checked_idle:
                 idle_found, pending = idle(config, repo, checkout, observed, idle_reported, skip)
+                design_found = unanswered_design(config, repo, design_reported, skip)
                 quiet += [item for item in idle_found if item[2] not in {entry[2] for entry in quiet}]
+                quiet += design_found
             if any(wakes for _, _, wakes in found) or quiet:
                 if found:
                     time.sleep(args.settle)
@@ -359,7 +505,8 @@ def watch(args, config: Config) -> int:
             state.pop("labels_since", None)
             state.update(since=polled, seen=[line for time_, line, _ in found if time_ >= polled],
                          stale=sorted(reported | stale_ids),
-                         idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}))
+                         idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}),
+                         design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}))
         if changed and not wakes:
             state["labels_since"] = labels_since
         if wakes or changed:

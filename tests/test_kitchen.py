@@ -1052,6 +1052,7 @@ def test_watch_bounds_errors_in_every_poll_phase(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr(watch, "collect", lambda *args: [item] if stage == "collect" else [])
     monkeypatch.setattr(watch, "stale", lambda *args: [])
     monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    monkeypatch.setattr(watch, "unanswered_design", lambda *args: [])
     attempts = []
 
     def fail_then_recover(*args):
@@ -1478,6 +1479,7 @@ def test_station_and_orchestrator_watches_run_concurrently_with_separate_default
     monkeypatch.setattr(watch, "collect", collect)
     monkeypatch.setattr(watch, "stale", lambda *args: [])
     monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    monkeypatch.setattr(watch, "unanswered_design", lambda *args: [])
     monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
     def run(station):
         args = SimpleNamespace(state=None, checkout=None, since=None, skip_issue=[], station=station,
@@ -1551,3 +1553,320 @@ def test_station_watch_ignores_non_executor_roles_even_when_waiting_on_target(st
     monkeypatch.setattr(watch, "gh", lambda path: [comment(30, body)])
     assert watch.collect(station_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z",
                          set(), set(), station="总设计") == []
+
+
+@pytest.fixture
+def routed_settings(tmp_path):
+    return settings(tmp_path, RULING.replace('[status]\n', '[status]\npaused = "暂停"\n') + '''
+signatures = ["总设计：", "总设计（训练）："]
+[stations.aliases]
+"总设计（训练）" = ["训练设计"]
+''')
+
+
+@pytest.mark.parametrize("body, training, general", [
+    (executor("状态: 进行中\n在等: 核查和训练设计裁定…\n关键数字: 1\n下一步: 等"), True, False),
+    (executor("状态: 进行中\n在等: 总设计(训练)\n关键数字: 1\n下一步: 等"), True, False),
+    (executor("状态: 暂停\n在等: 用户/训练设计重新排期\n关键数字: 1\n下一步: 交总设计"), False, False),
+    (executor("状态: 等设计\n在等: 裁定 X\n关键数字: 1\n下一步: 等"), False, True),
+    (executor("状态: 进行中\n在等: 无\n关键数字: 1\n下一步: 交总设计决定"), False, True),
+    ("核查：结论\n交总设计决定", False, True),
+    ("总编排：请求\n@总设计 请裁定", False, True),
+    ("用户请求\n总设计：请裁定", False, True),
+    ("用户请求\n@训练设计 请裁定", True, False),
+    ("总设计：自己的裁定\n交总设计", False, False),
+    ("总设计(训练):自己的裁定\n@训练设计", False, False),
+])
+def test_issue32_mention_replays(routed_settings, body, training, general):
+    assert watch.station_wakes(body, "总设计（训练）", routed_settings) is training
+    assert watch.station_wakes(body, "总设计", routed_settings) is general
+
+
+def test_alias_matching_is_shared_with_orchestrator_and_normalizes_width(routed_settings):
+    body = executor("状态: 进行中\n在等: 训练设计师\n关键数字: 1\n下一步: 等")
+    assert watch.waiting_for(body, "总设计（训练）", routed_settings)
+    assert watch.waiting_for(body, "训练设计", routed_settings)
+    assert not watch.waiting_for(body, "总设计", routed_settings)
+    assert watch.executor_wakes(body, False, routed_settings)
+    paused = body.replace("进行中", "暂停")
+    assert watch.executor_wakes(paused, False, routed_settings)  # Same waiting-name test as in progress.
+    assert not watch.executor_wakes(executor("状态: 暂停\n在等: 无"), False, routed_settings)
+
+
+@pytest.mark.parametrize("text", [
+    '[stations]\naliases = "wrong"',
+    '[stations.aliases]\nDesigner = []',
+    '[stations.aliases]\nDesigner = [1]',
+    '[stations.aliases]\nDesigner = [""]',
+    '[stations.aliases]\n"" = ["D"]',
+    '[watch]\ndesign_answer_minutes = -1',
+    '[watch]\ndesign_answer_minutes = true',
+    '[watch]\ndesign_answer_minutes = inf',
+])
+def test_issue32_config_validation(tmp_path, text):
+    with pytest.raises(ValueError, match="aliases|design_answer_minutes"):
+        settings(tmp_path, text)
+
+
+@pytest.mark.parametrize("kind", ["idle", "stale"])
+@pytest.mark.parametrize("after", [False, True])
+def test_status_label_only_suppresses_when_added_after_executor(idle_ticket, monkeypatch, kind, after):
+    ticket = idle_ticket
+    ticket.issues[0]["labels"] = [{"name": "status:blocked"}]
+    original = watch.gh
+    def gh(path):
+        if "/events?" in path:
+            return [{"event": "labeled", "label": {"name": "status:blocked"},
+                     "created_at": "2026-10-28T11:00:00Z" if after else "2026-10-28T09:00:00Z"}]
+        return original(path)
+    monkeypatch.setattr(watch, "gh", gh)
+    if kind == "idle":
+        _, observed = check_idle(ticket)
+        ticket.clock.moment += timedelta(hours=1)
+        result, _ = check_idle(ticket, observed)
+    else:
+        ticket.clock.moment += timedelta(hours=6)
+        result = watch.stale(ticket.config, "o/r", ticket.config.root, 6, set(), set())
+    assert bool(result) is not after
+
+
+@pytest.fixture
+def unanswered_ticket(idle_ticket, routed_settings):
+    ticket = idle_ticket
+    ticket.config = routed_settings
+    ticket.last.update(created_at="2026-10-28T11:29:00Z", updated_at="2026-10-28T11:29:00Z",
+                       body=executor("状态: 等设计\n在等: 裁定 X\n关键数字: 1\n下一步: 等"))
+    return ticket
+
+
+def test_unanswered_design_reports_default_and_alias_targets_once(unanswered_ticket):
+    ticket = unanswered_ticket
+    found = watch.unanswered_design(ticket.config, "o/r", set(), set())
+    assert len(found) == 1 and found[0][2] == 2601
+    assert "waiting on 总设计 for 31 minutes with no designer reply" in found[0][1]
+    assert watch.unanswered_design(ticket.config, "o/r", {2601}, set()) == []
+    ticket.last["body"] = executor("状态: 进行中\n在等: 训练设计\n关键数字: 1\n下一步: 等")
+    found = watch.unanswered_design(ticket.config, "o/r", set(), set())
+    assert "waiting on 总设计（训练）" in found[0][1]
+
+
+@pytest.mark.parametrize("reply", ["总设计：答复", "总设计（训练）：答复", "总设计(训练):答复", "训练设计：答复"])
+def test_designer_reply_prevents_backstop(unanswered_ticket, reply):
+    ticket = unanswered_ticket
+    ticket.comments.append({"id": 2602, "body": reply, "created_at": "2026-10-28T11:40:00Z"})
+    ticket.issues[0]["comments"] = 2
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
+
+
+def test_unanswered_design_does_not_report_paused_or_premature_request(unanswered_ticket):
+    ticket = unanswered_ticket
+    ticket.last["created_at"] = "2026-10-28T11:30:00Z"
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
+    ticket.last.update(created_at="2026-10-28T11:00:00Z", body=executor("状态: 暂停\n在等: 训练设计"))
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
+
+
+@pytest.mark.parametrize("body, created_at, reported, expected", [
+    ("状态: 进行中\n在等: 无", "2026-10-28T11:29:00Z", set(), []),
+    ("状态: 暂停\n在等: 训练设计", "2026-10-28T11:29:00Z", set(), []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:40:00Z", set(), []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:29:00Z", {2602}, []),
+    ("状态: 等设计\n在等: 裁定 X", "2026-10-28T11:29:00Z", set(), [2602]),
+])
+def test_backstop_only_considers_latest_executor_comment(unanswered_ticket, body, created_at, reported, expected):
+    ticket = unanswered_ticket
+    ticket.last["created_at"] = "2026-10-28T11:00:00Z"
+    ticket.comments.append({**ticket.last, "id": 2602, "body": executor(body), "created_at": created_at})
+    ticket.issues[0]["comments"] = 2
+    found = watch.unanswered_design(ticket.config, "o/r", reported, set())
+    assert [item[2] for item in found] == expected
+
+
+def test_verifier_handoff_wakes_station_but_remains_reference_for_orchestrator(routed_settings, monkeypatch):
+    item = comment(32, "核查：结论\n交总设计决定")
+    def gh(path):
+        return [item] if "/issues/comments?" in path else []
+    monkeypatch.setattr(watch, "gh", gh)
+    args = (routed_settings, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z", set(), set())
+    station = watch.collect(*args, station="总设计")
+    orchestrator = watch.collect(*args)
+    assert station[0][2] is True and "for reference" not in station[0][1]
+    assert orchestrator[0][2] is False and "for reference" in orchestrator[0][1]
+
+
+def test_backstop_persists_ids_and_does_not_repeat_after_restart(unanswered_ticket, monkeypatch, capsys):
+    ticket = unanswered_ticket
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    path = ticket.config.root / "backstop.json"
+    args = ["watch", "--state", str(path), "--since", "2026-10-28T10:00:00Z", "--settle", "0"]
+    assert ding.main(args) == 0
+    assert json.loads(path.read_text())["design_reported"] == [2601]
+    monkeypatch.setattr(watch, "collect", lambda *args: [(watch.now(), "other activity", True)])
+    assert ding.main(args) == 0
+    output = capsys.readouterr().out
+    assert output.count("no designer reply") == 1
+    assert "other activity" in output
+
+
+def test_backstop_runs_on_idle_cadence_instead_of_each_poll(unanswered_ticket, monkeypatch):
+    ticket = unanswered_ticket
+    ticket.last["created_at"] = "2026-10-28T12:00:00Z"
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    start = ticket.clock.moment
+    monkeypatch.setattr(watch.time, "monotonic", lambda: (ticket.clock.moment - start).total_seconds())
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: setattr(
+        ticket.clock, "moment", ticket.clock.moment + timedelta(seconds=seconds)))
+    check = watch.unanswered_design
+    checks = []
+    def traced(*args):
+        checks.append((ticket.clock.moment - start).total_seconds())
+        return check(*args)
+    monkeypatch.setattr(watch, "unanswered_design", traced)
+    assert ding.main(["watch", "--state", str(ticket.config.root / "cadence.json"),
+                      "--interval", "60", "--settle", "0"]) == 0
+    assert checks == [0, 900, 1800, 2700]
+
+
+def test_for_watch_never_runs_design_backstop(routed_settings, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "load", lambda: routed_settings)
+    monkeypatch.setattr(watch, "gh", lambda path: [comment(32, executor("状态: 进行中\n在等: 训练设计"))])
+    def forbidden(*args):
+        pytest.fail("--for must not consult periodic checks")
+    for name in ("unanswered_design", "idle", "stale", "board_output", "tmux_panes"):
+        monkeypatch.setattr(watch, name, forbidden)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    assert ding.main(["watch", "--for", "总设计（训练）", "--state", str(tmp_path / "station.json"),
+                      "--since", "2026-10-14T08:00:00Z", "--settle", "0"]) == 0
+
+
+def test_backstop_can_be_disabled_and_does_not_depend_on_idle_enabled(unanswered_ticket, monkeypatch):
+    from dataclasses import replace
+    ticket = unanswered_ticket
+    disabled = replace(ticket.config, watch=config.Watch(design_answer_minutes=0))
+    original = watch.gh
+    def forbidden(*args):
+        pytest.fail("disabled backstop must not query GitHub")
+    monkeypatch.setattr(watch, "gh", forbidden)
+    assert watch.unanswered_design(disabled, "o/r", set(), set()) == []
+    monkeypatch.setattr(watch, "gh", original)
+    ticket.config = replace(ticket.config, watch=config.Watch(idle_minutes=0))
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    assert ding.main(["watch", "--state", str(ticket.config.root / "idle-off.json")]) == 0
+
+
+def test_backstop_reads_only_latest_page_when_it_contains_a_designer_reply(unanswered_ticket, monkeypatch):
+    ticket = unanswered_ticket
+    ticket.issues[0]["comments"] = 201
+    original = watch.gh
+    pages = []
+    def gh(path):
+        if "/comments?" in path:
+            pages.append(path)
+            assert path.endswith("page=3")
+            return [{"id": 2602, "body": "总设计：已答复"}]
+        return original(path)
+    monkeypatch.setattr(watch, "gh", gh)
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set()) == []
+    assert len(pages) == 1
+
+
+@pytest.mark.parametrize("phase", ["idle", "stale"])
+def test_label_history_failure_retries_without_advancing_state(idle_ticket, monkeypatch, phase):
+    import subprocess
+    ticket = idle_ticket
+    ticket.clock.moment += timedelta(hours=6)
+    ticket.issues[0]["labels"] = [{"name": "status:blocked"}]
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    if phase == "idle":
+        monkeypatch.setattr(watch, "stale", lambda *args: [])
+    original = watch.gh
+    def gh(path):
+        if "/events?" in path:
+            raise subprocess.TimeoutExpired(["gh", "api", path], 60)
+        return original(path)
+    monkeypatch.setattr(watch, "gh", gh)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    path = ticket.config.root / "errors.json"
+    assert ding.main(["watch", "--state", str(path), "--max-errors", "2", "--interval", "0"]) == 2
+    assert not path.exists()
+
+
+def test_backstop_api_failure_uses_bounded_retry_and_preserves_state(unanswered_ticket, monkeypatch):
+    import subprocess
+    ticket = unanswered_ticket
+    monkeypatch.setattr(config, "load", lambda: ticket.config)
+    monkeypatch.setattr(watch, "collect", lambda *args: [])
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
+    original = watch.gh
+    def gh(path):
+        if "/comments?" in path:
+            raise subprocess.TimeoutExpired(["gh", "api", path], 60)
+        return original(path)
+    monkeypatch.setattr(watch, "gh", gh)
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    path = ticket.config.root / "backstop-errors.json"
+    initial = json.dumps({"since": "2026-10-28T10:00:00Z", "seen": [], "stale": [], "design_reported": []})
+    path.write_text(initial)
+    assert ding.main(["watch", "--state", str(path), "--max-errors", "2", "--interval", "0"]) == 2
+    assert path.read_text() == initial
+
+
+def test_open_issue_pagination_reaches_older_tickets_without_duplicates(monkeypatch):
+    paths = []
+    def gh(path):
+        paths.append(path)
+        return [{"number": number} for number in range(1, 101)] if path.endswith("page=1") else [{"number": 100}, {"number": 318}]
+    monkeypatch.setattr(watch, "gh", gh)
+    assert [issue["number"] for issue in watch.open_issues("o/r")] == [*range(1, 101), 318]
+    assert len(paths) == 2
+
+
+def test_optional_config_defaults_are_backward_compatible(tmp_path):
+    loaded = settings(tmp_path)
+    assert loaded.stations.aliases == {}
+    assert loaded.status.paused is None
+    assert loaded.watch.design_answer_minutes == 30
+    assert settings(tmp_path, '[watch]\ndesign_answer_minutes = 0').watch.design_answer_minutes == 0
+
+
+def test_issue32_watch_help_covers_new_rules(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(["watch", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "[stations.aliases]" in help_text
+    assert "[status] paused" in help_text
+    assert "design_answer_minutes" in help_text
+    assert "awaiting-user" in help_text and "status labels older" in help_text
+
+
+def test_backstop_reports_new_requests_after_a_previous_designer_reply(unanswered_ticket):
+    ticket = unanswered_ticket
+    older_reply = {"id": 2600, "body": "总设计：之前已答复", "created_at": "2026-10-28T11:00:00Z"}
+    ticket.comments.insert(0, older_reply)
+    ticket.issues[0]["comments"] = 2
+    assert watch.unanswered_design(ticket.config, "o/r", set(), set())[0][2] == 2601
+    assert watch.unanswered_design(ticket.config, "o/r", set(), {26}) == []
+
+
+def test_label_history_uses_latest_addition_and_requires_a_newer_event(idle_ticket, monkeypatch):
+    ticket = idle_ticket
+    issue = ticket.issues[0]
+    issue["labels"] = [{"name": "status:blocked"}]
+    events = [{"event": "labeled", "label": {"name": "status:blocked"}, "created_at": "2026-10-28T09:00:00Z"},
+              {"event": "unlabeled", "label": {"name": "status:blocked"}, "created_at": "2026-10-28T09:30:00Z"},
+              {"event": "labeled", "label": {"name": "status:blocked"}, "created_at": "2026-10-28T11:00:00Z"}]
+    monkeypatch.setattr(watch, "gh", lambda path: events)
+    assert watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)
+    events.clear()
+    assert not watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)

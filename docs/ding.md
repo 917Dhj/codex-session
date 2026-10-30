@@ -375,13 +375,13 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 | `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. The message opens with the `[relay] superseding` line and is sent with `--steer --supersede`: it enters the executor's current turn and deletes the orchestrator's relays still queued for it. `--queue` queues it plainly instead; `--interrupt` also stops the current turn first. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
 | `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator or lists PR #57 as pending merge (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
-| `ding watch [--for NAME]` | A station, in the background | Waits for GitHub activity, prints it as one batch, and exits. `--for NAME` selects executor comments waiting on that station. See [While the user is away](../kitchen/modules/unattended.md). |
+| `ding watch [--for NAME]` | A station, in the background | Waits for GitHub activity, prints it as one batch, and exits. `--for NAME` selects requests and explicit handoffs to that station. See [While the user is away](../kitchen/modules/unattended.md). |
 | `ding check-refs draft.md` | Verifier | Checks every `file:line` in a draft comment, in backticks or not (a name written right next to it must appear on that line), and every `sha256`, against `origin/main` or `--root DIR`. It also asks GitHub that each `#N` ticket, `PR#N`, issue or PR link, and comment link exists, that a `PR#N` or `/pull/` link is a PR, and that a comment link's comment belongs to the ticket in the link (`--repo` for bare `#N`, `--offline` to skip). It prints how many references of each kind it checked, and lists every wrong one and every one it could not check, also in its JSON line. Exits 1 when something is wrong. Give several drafts to check them one by one: each line then names its file, the JSON lines carry a `draft` key, and the exit status is nonzero (1 for a wrong reference, 2 for an unreadable file) if any draft fails. |
 | `ding rule 42 draft.md [--reply-to LINK_OR_ID] [--notify SESSION] [--force]`<br>`ding rule 42 body.md --edit-body --base base.md` | Designer | Posts the designer's ruling on ticket #42. Nothing is sent unless the draft's line 1 starts with one of `[rule] signatures`, line 2 with the `[rule] type_label` and one of `[rule] types`, and `check-refs` finds nothing wrong (it takes `--ref`, `--root`, `--tolerance`, `--repo`, `--offline`). With `--reply-to`, it stops and lists the link and first line of every comment that came after the one answered; `--force` posts anyway. Without it, it shows the latest comment's time and first line as a hint. It posts with `gh issue comment` and prints only the comment URL on stdout. `--notify SESSION` then sends `[rule] notify` plus the draft's complete stripped first nonempty line to a Codex session with `ding send`; if that fails, the error says so and the comment stays. `ding` cannot message Claude Code sessions, so `--notify` refuses a `uds:` or `local_` address before posting; tell those with `SendMessage`, using the printed URL. `--edit-body` replaces the ticket body instead: it stops unless the current body equals the `--base` file (line endings and trailing newlines aside), edits with `gh issue edit`, then reads the body back and fails unless it matches the draft byte for byte, ignoring trailing newlines. The line 1 and 2 check applies to comments only. |
 
 **Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. Executor comments are those signed `Codex session:` or `Claude session:`; when both kinds are on the ticket, the latest comment of either counts. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator, or its optional `[status] pending_merge` field (default *Pending merge*, for example `Pending merge: PR#57, PR#58`) lists this PR. The executor lists a PR there once it needs nothing more on it, so the merge does not wait for the executor to come back from its next task. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
-`ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. On an independent schedule, it also checks for executors still marked in progress whose attributed board sessions are all `idle` or `notLoaded`, with no running `ding run` or live `issue<N>` tmux job. After `[watch] idle_minutes` (default 45), it reports the ticket once per executor comment. The check interval is `idle_minutes / 3`, capped at 15 minutes; a longer `--interval` is shortened to meet that deadline. `--stale-every` controls only the existing stale check. Status-labelled tickets, `--skip-issue`, and the log ticket are excluded; a ticket without an attributed session uses only the existing stale check.
+`ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. On an independent schedule, it also checks for executors still marked in progress whose attributed board sessions are all `idle` or `notLoaded`, with no running `ding run` or live `issue<N>` tmux job. After `[watch] idle_minutes` (default 45), it reports the ticket once per executor comment. The check interval is `idle_minutes / 3`, capped at 15 minutes; a longer `--interval` is shortened to meet that deadline. `--stale-every` controls only the existing stale check. Awaiting-user tickets, `--skip-issue`, and the log ticket are excluded; another `status:` label suppresses idle/stale checks only when its latest addition is after the executor comment; a ticket without an attributed session uses only the existing stale check.
 
 `ding board` does not expose session update times. Watch therefore saves when it first observes all the idle conditions, and waits from the later of that observation and the executor comment's update. This observation survives restarts. A new executor comment or a failed idle condition resets the period. Setting `[watch] idle_minutes = 0` disables this wake; the stale check remains enabled.
 
@@ -394,11 +394,32 @@ ding watch --for Designer
 ding watch --for '总设计（训练）'
 ```
 
-Use the station's configured name. This mode wakes only for executor comments whose waiting-on field names that station, including on awaiting-user tickets. It does not consult verifier/user comments as triggers, labels, new PRs, stale/idle checks, board, or tmux. `--settle`, `--skip-issue`, the log-ticket exclusion, and bounded error retries still apply.
+Use the station's configured name. This mode wakes for executor comments whose waiting-on field names the station, including on awaiting-user tickets, or whose Next field contains `交NAME`. An executor marked `[status] waiting_on_design` with no designer named in its waiting field wakes the default `[stations] designer`.
 
-Matching excludes occurrences inside a longer name configured in `[stations]` or `[rule] signatures`, with the signature's trailing separator removed. For example, when `总设计（训练）：` is configured, `--for 总设计` does not wake for a comment waiting only on `总设计（训练）`; `--for '总设计（训练）'` does.
+Verifier, orchestrator, and user comments wake the station only when they contain `@NAME`, `交NAME`, or a line starting with `NAME` followed by the configured separator. Designer comments, including the station's own rulings, never trigger a station watch. A configured `[status] paused` executor never triggers `--for`; the orchestrator treats that status like in progress.
 
-The default state file is `OWNER-REPO.for-NAME.json` under the watch state directory, with `NAME` percent-encoded for filenames. It is separate from `OWNER-REPO.json`, so station and orchestrator watches can run concurrently. An explicit `--state` overrides this choice; the same file still permits only one watch. Without `--for`, the orchestrator's behavior and default state path are unchanged.
+A station watch does not query labels, new PRs, stale/idle checks, the unanswered-design backstop, board, or tmux. `--settle`, `--skip-issue`, the log-ticket exclusion, and bounded error retries still apply.
+
+Names are compared after width normalization, so `总设计(训练)` matches `总设计（训练）`. Matching includes `[stations.aliases]` and excludes occurrences inside longer configured names or aliases; trailing signature separators are removed before comparison. For example, when `总设计（训练）：` is configured, `--for 总设计` does not wake for a comment waiting only on `总设计（训练）`; `--for '总设计（训练）'` does.
+
+Aliases are optional and apply to both station watches and the orchestrator's waiting-field test:
+
+```toml
+[stations.aliases]
+"总设计（训练）" = ["训练设计"]
+
+[status]
+paused = "暂停"
+
+[watch]
+design_answer_minutes = 30
+```
+
+Each alias value must be a nonempty list of nonempty names. Thus `训练设计` also matches `训练设计师`, while a general `总设计` watch does not match a training-designer request.
+
+The orchestrator's watch checks each ticket's latest executor comment for an unanswered request on the idle-check cadence. After `[watch] design_answer_minutes` (default 30), it reports that comment if its state is waiting on design or its waiting field names a designer, unless a later designer comment exists. The line names the designer and links to the executor comment. Configured paused requests are excluded. Reported IDs are saved as `design_reported`, so restarting does not repeat them. Set this key to 0 to disable the backstop; it remains enabled when only idle wakes are disabled. Existing open requests can be reported even when older than `--since`.
+
+The default state file is `OWNER-REPO.for-NAME.json` under the watch state directory, with `NAME` percent-encoded for filenames. It is separate from `OWNER-REPO.json`, so station and orchestrator watches can run concurrently. An explicit `--state` overrides this choice; the same file still permits only one watch. Omitting `--for` selects the orchestrator watch and retains its default state path.
 
 Terminal comment hints keep the first 100 characters and add `…` when shortened. Watch summaries keep the first 160 characters and PR titles the first 80, also adding `…` when shortened. Notification text, including `{first_line}`, carries the complete stripped first nonempty line.
 
@@ -419,10 +440,14 @@ executor = "Executor"
 user = "User"
 separator = ": "                     # written after a station name to sign a comment
 
+# [stations.aliases]
+# "Training designer" = ["Training"]  # optional equivalent names
+
 [status]
 fields = ["Status", "Waiting on", "Key numbers", "Next"]   # first: the state; second: who it waits on
 in_progress = "in progress"
 waiting_on_design = "waiting on design"
+# paused = "paused"                 # optional; no paused word is assumed when absent
 blocked = "blocked"
 done = "done"
 none = "none"                        # a "Waiting on" value that names nobody
@@ -451,13 +476,14 @@ notify = "#{ticket} answered, see the ticket {url}"   # the `--notify` message; 
 
 [watch]
 idle_minutes = 45                    # 0 disables idle-executor wakes
+design_answer_minutes = 30           # 0 disables unanswered-design reminders
 ```
 
 `[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.
 
-`[watch] idle_minutes` must be a nonnegative finite number of minutes; unknown `[watch]` keys are errors.
+`[watch] idle_minutes` and `design_answer_minutes` must be nonnegative finite numbers of minutes; unknown `[watch]` keys are errors.
 
-`[rule] signatures` lists the full first-line prefixes accepted as designer signatures by both `ding rule` and `ding watch`. It must be a nonempty list of nonempty strings. Prefixes are matched verbatim, including spaces. When omitted, it defaults to `[stations] designer` plus `[stations] separator`.
+`[rule] signatures` lists the full first-line prefixes accepted as designer signatures by both `ding rule` and `ding watch`. It must be a nonempty list of nonempty strings. `ding rule` matches prefixes verbatim, including spaces; `ding watch` also recognizes width-normalized forms and configured aliases. When omitted, it defaults to `[stations] designer` plus `[stations] separator`.
 
 For example, a repository with two designers can set:
 
