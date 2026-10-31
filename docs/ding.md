@@ -383,6 +383,15 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 
 **Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. Executor comments are those signed `Codex session:` or `Claude session:`; when both kinds are on the ticket, the latest comment of either counts. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator, or its optional `[status] pending_merge` field (default *Pending merge*, for example `Pending merge: PR#57, PR#58`) lists this PR. The executor lists a PR there once it needs nothing more on it, so the merge does not wait for the executor to come back from its next task. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
+To require CI checks before merging, set this optional key in `.dkitchen.toml`:
+
+```toml
+[merge]
+required_checks = ["hca-check"]
+```
+
+The default is `[]`, which leaves the existing merge behavior unchanged and makes no check API calls. Names match exactly, including spaces and case; the value must be a list of nonempty strings. After the draft, reviewed-HEAD and ticket gates pass, `ding merge` reads all pages of the latest check runs and commit statuses on the full reviewed HEAD. Every configured name must have a result, and every matching result must be `success`. This includes same-name results from different apps or from both APIs. `neutral` and `skipped` refuse, as do failures, cancellations, timeouts and other non-success results. Missing or pending checks refuse with `check NAME has not finished on HEAD`. Refusals report every blocking name, its result and its URL when available. API/read errors also refuse. Checks for another SHA do not count. The command never waits or polls and has no bypass flag; `--no-ticket` skips only the ticket gate. The merge still uses `--match-head-commit` to reject a HEAD that moves after these reads.
+
 `ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. On an independent schedule, it also checks for executors still marked in progress whose attributed board sessions are all `idle` or `notLoaded`, with no running `ding run` or live `issue<N>` tmux job. After `[watch] idle_minutes` (default 45), it reports the ticket once per executor comment. The check interval is `idle_minutes / 3`, capped at 15 minutes; a longer `--interval` is shortened to meet that deadline. `--stale-every` controls only the existing stale check. Awaiting-user tickets, `--skip-issue`, and the log ticket are excluded; another `status:` label suppresses idle/stale checks only when its latest addition is after the executor comment; a ticket without an attributed session uses only the existing stale check.
 
 `ding board` does not expose session update times. Watch therefore saves when it first observes all the idle conditions, and waits from the later of that observation and the executor comment's update. This observation survives restarts. A new executor comment or a failed idle condition resets the period. Setting `[watch] idle_minutes = 0` disables this wake; the stale check remains enabled.
@@ -511,6 +520,9 @@ superseding = "New decision; it replaces earlier relays not yet carried out."   
 type_label = "Type"                  # line 2 reads `<type_label><separator><one of types>`
 types = ["actionable", "proposal, awaiting user", "record"]
 notify = "#{ticket} answered, see the ticket {url}"   # the `--notify` message; `{first_line}` is also available
+
+[merge]
+required_checks = []                # e.g. ["hca-check"]; only success permits merging
 
 [watch]
 idle_minutes = 45                    # 0 disables idle-executor wakes

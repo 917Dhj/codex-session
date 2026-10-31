@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.13
+
+- `ding merge` supports optional `[merge] required_checks`, defaulting to `[]`. Every required name must succeed on the reviewed HEAD across the latest check runs and commit statuses. Missing, pending, failed, neutral and skipped results refuse immediately with no bypass; API/read errors also refuse.
+
 ## 0.5.12
 
 - `ding waits` lists overdue unanswered waits on all configured stations and the user, with station/alias filtering, a minute threshold, and JSON output.
