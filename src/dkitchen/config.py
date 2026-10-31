@@ -53,6 +53,9 @@ Every key is optional. The defaults match the English templates in kitchen/:
     [watch]
     idle_minutes = 45                    # 0 disables idle-executor wakes
     design_answer_minutes = 30           # 0 disables unanswered-design reminders
+
+    [merge]
+    required_checks = []                # e.g. ["hca-check"]; only success permits merging
 """
 from __future__ import annotations
 
@@ -177,6 +180,11 @@ class Watch:
     design_answer_minutes: float = 30
 
 
+@dataclass(frozen=True)
+class Merge:
+    required_checks: tuple[str, ...] = ()
+
+
 SESSION_FIELDS = ("issue", "name", "repo")
 
 
@@ -215,6 +223,7 @@ class Config:
     rule: Rule = Rule()
     launch: Launch = Launch()
     watch: Watch = Watch()
+    merge: Merge = Merge()
 
     @property
     def designer_signatures(self) -> tuple[str, ...]:
@@ -247,6 +256,11 @@ def section(cls, values: object, name: str):
                 kind = {"fields": "field names", "types": "words", "signatures": "signatures"}[key]
                 raise ValueError(f"{FILE}: [{name}] {key} must be a nonempty list of {kind}")
             value = tuple(value) if key == "signatures" else tuple(item.strip() for item in value)
+        elif key == "required_checks":
+            if (not isinstance(value, list)
+                    or not all(isinstance(item, str) and item.strip() for item in value)):
+                raise ValueError(f"{FILE}: [merge] required_checks must be a list of nonempty check names")
+            value = tuple(value)
         elif key == "preflight":
             if (not isinstance(value, list) or not value
                     or not all(isinstance(item, str) and "\0" not in item for item in value)
@@ -313,7 +327,7 @@ def load(cwd: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
     sections = {"stations": Stations, "status": Status, "labels": Labels, "log": Log, "sessions": Sessions, "relay": Relay,
-                "rule": Rule, "launch": Launch, "watch": Watch, "night": Night}
+                "rule": Rule, "launch": Launch, "watch": Watch, "night": Night, "merge": Merge}
     unknown = sorted(set(data) - {"repo", *sections})
     if unknown:
         raise ValueError(f"{FILE}: unknown keys: {', '.join(unknown)}")

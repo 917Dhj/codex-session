@@ -277,6 +277,148 @@ def test_merge_checks_head_and_draft_before_reading_the_ticket(tmp_path, monkeyp
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("value", ['"hca-check"', '[1]', '[""]', '["   "]', 'false'])
+def test_merge_required_checks_rejects_bad_config(tmp_path, value):
+    with pytest.raises(ValueError, match="required_checks must be a list of nonempty check names"):
+        settings(tmp_path, f"[merge]\nrequired_checks = {value}")
+
+
+def test_merge_required_checks_defaults_and_exact_names(tmp_path):
+    assert settings(tmp_path).merge.required_checks == ()
+    assert settings(tmp_path, "[merge]\nrequired_checks = []").merge.required_checks == ()
+    assert settings(tmp_path, '[merge]\nrequired_checks = [" CI / test "]').merge.required_checks == (" CI / test ",)
+
+
+def check_run(state="success", sha="abc123", name="hca-check"):
+    return {"name": name, "head_sha": sha, "status": "in_progress" if state == "pending" else "completed",
+            "conclusion": None if state == "pending" else state, "html_url": "https://checks/1"}
+
+
+def commit_status(state="success", name="hca-check"):
+    return {"context": name, "state": state, "target_url": "https://statuses/1"}
+
+
+def check_responses(runs=(), statuses=(), sha="abc123"):
+    return [(0, json.dumps([{"check_runs": list(runs)}])),
+            (0, json.dumps([{"sha": sha, "statuses": list(statuses)}]))]
+
+
+@pytest.mark.parametrize("source, state", [
+    (source, state) for source, states in (
+        ("run", ("success", "failure", "pending", "cancelled", "timed_out", "action_required",
+                 "neutral", "skipped", "stale", "startup_failure", None)),
+        ("status", ("success", "failure", "pending", "error"))) for state in states
+])
+def test_merge_requires_success_on_reviewed_head(tmp_path, monkeypatch, capsys, source, state):
+    loaded = settings(tmp_path, CHINESE + '\n[merge]\nrequired_checks = ["hca-check"]')
+    calls = []
+    responses = [view(), thread_comments(WAITING)] + check_responses(
+        runs=[check_run(state)] if source == "run" else [],
+        statuses=[commit_status(state)] if source == "status" else [])
+    if state == "success":
+        responses += [(0, ""), view("MERGED")]
+    monkeypatch.setattr(orchestrate, "call", fake_call(responses, calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", ticket=236, no_ticket=False), loaded) == (
+        0 if state == "success" else 1)
+    assert calls[1][-1] == "repos/o/r/issues/236/comments?per_page=100"
+    assert calls[2] == ("gh", "api", "--paginate", "--slurp",
+                        "repos/o/r/commits/abc123/check-runs?filter=latest&per_page=100")
+    assert calls[3] == ("gh", "api", "--paginate", "--slurp", "repos/o/r/commits/abc123/status?per_page=100")
+    if state == "success":
+        assert calls[4][-2:] == ("--match-head-commit", "abc123")
+    else:
+        error = capsys.readouterr().err
+        assert "hca-check" in error and "abc123" in error
+        assert (state or "pending") in error
+        if state == "pending" or state is None:
+            assert "has not finished" in error
+        if source == "run":
+            assert "https://checks/1" in error
+        else:
+            assert "https://statuses/1" in error
+        assert len(calls) == 4
+    assert not responses
+
+
+@pytest.mark.parametrize("runs, statuses, sha", [
+    ([], [], "abc123"),
+    ([check_run(sha="fff999")], [], "abc123"),
+    ([], [commit_status()], "fff999"),
+    ([check_run(name="other")], [commit_status(name="other")], "abc123"),
+])
+def test_merge_missing_or_other_commit_checks_do_not_count(tmp_path, monkeypatch, capsys, runs, statuses, sha):
+    loaded = settings(tmp_path, 'repo = "o/r"\n[merge]\nrequired_checks = ["hca-check"]')
+    calls = []
+    monkeypatch.setattr(orchestrate, "call", fake_call([view()] + check_responses(runs, statuses, sha), calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", no_ticket=True), loaded) == 1
+    assert "check hca-check has not finished on abc123 (missing)" in capsys.readouterr().err
+    assert len(calls) == 3
+
+
+def test_merge_checks_all_pages_and_both_sources(tmp_path, monkeypatch):
+    loaded = settings(tmp_path, 'repo = "o/r"\n[merge]\nrequired_checks = ["hca-check", "deploy"]')
+    responses = [view(), (0, json.dumps([{"check_runs": []}, {"check_runs": [check_run()]}])),
+                 (0, json.dumps([{"sha": "abc123", "statuses": []},
+                                 {"sha": "abc123", "statuses": [commit_status(name="deploy")]}])),
+                 (0, ""), view("MERGED")]
+    monkeypatch.setattr(orchestrate, "call", fake_call(responses, []))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", no_ticket=True), loaded) == 0
+    assert not responses
+
+
+def test_merge_reports_every_failed_required_check_and_duplicate(tmp_path, monkeypatch, capsys):
+    loaded = settings(tmp_path, 'repo = "o/r"\n[merge]\nrequired_checks = ["hca-check", "deploy"]')
+    calls = []
+    responses = [view()] + check_responses([check_run(), check_run("failure")], [commit_status("error", "deploy")])
+    monkeypatch.setattr(orchestrate, "call", fake_call(responses, calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", no_ticket=True), loaded) == 1
+    error = capsys.readouterr().err
+    assert "hca-check is failure" in error and "deploy is error" in error
+    assert "https://checks/1" in error and "https://statuses/1" in error
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("responses", [
+    [(1, "")], [(0, "not json")], [(0, "[{}]")],
+    [(0, '{"check_runs": []}')],
+    [(0, '[{"check_runs": []}]'), (1, "")],
+])
+def test_merge_refuses_unreadable_check_data(tmp_path, monkeypatch, capsys, responses):
+    loaded = settings(tmp_path, 'repo = "o/r"\n[merge]\nrequired_checks = ["hca-check"]')
+    calls = []
+    monkeypatch.setattr(orchestrate, "call", fake_call([view()] + responses, calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", no_ticket=True), loaded) == 1
+    assert "cannot read" in capsys.readouterr().err
+    assert not any(call[:3] == ("gh", "pr", "merge") for call in calls)
+
+
+@pytest.mark.parametrize("pr, comment", [(view(draft=True), None), (view(head="fff999"), None),
+                                        (view(), WITHDRAWN)])
+def test_merge_existing_gates_run_before_required_checks(tmp_path, monkeypatch, pr, comment):
+    loaded = settings(tmp_path, CHINESE + '\n[merge]\nrequired_checks = ["hca-check"]')
+    calls = []
+    responses = [pr] + ([thread_comments(comment)] if comment else [])
+    monkeypatch.setattr(orchestrate, "call", fake_call(responses, calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", ticket=236), loaded) == 1
+    assert not any("/commits/" in argument for call in calls for argument in call)
+
+
+def test_merge_empty_required_checks_keeps_existing_behavior(tmp_path, monkeypatch):
+    loaded = settings(tmp_path, 'repo = "o/r"\n[merge]\nrequired_checks = []')
+    calls = []
+    monkeypatch.setattr(orchestrate, "call", fake_call([view(), (0, ""), view("MERGED")], calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha="abc", no_ticket=True), loaded) == 0
+    assert len(calls) == 3 and calls[1][:3] == ("gh", "pr", "merge")
+
+
+def test_merge_help_describes_required_checks(capsys):
+    with pytest.raises(SystemExit) as exc:
+        ding.main(["merge", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "required_checks" in help_text and "hca-check" in help_text and "no bypass" in help_text
+
+
 @pytest.mark.parametrize("argv, error", [
     (["merge", "7", "abc", "--ticket", "0"], "--ticket must be a positive issue number"),
     (["merge", "7", "abc", "--ticket", "3", "--no-ticket"], "not allowed with argument"),

@@ -80,6 +80,36 @@ def ticket_references(body: str, repo: str, pr: int) -> list[int]:
     return sorted(numbers - {pr})
 
 
+def required_check_failures(config: Config, repo: str, sha: str) -> list[str]:
+    """Read the latest check runs and statuses on the exact reviewed commit, without polling."""
+    if not config.merge.required_checks:
+        return []
+    checks = {}
+    for endpoint in ("check-runs?filter=latest&per_page=100", "status?per_page=100"):
+        result = call(config, "gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/{endpoint}")
+        if result.returncode:
+            raise RuntimeError(f"cannot read required checks on {sha}: {result.stderr.strip()}")
+        for page in json.loads(result.stdout):
+            if endpoint.startswith("check-runs"):
+                for run in page["check_runs"]:
+                    if run["head_sha"] == sha:
+                        conclusion = run["conclusion"] if run["status"] == "completed" else "pending"
+                        checks.setdefault(run["name"], []).append((conclusion, run["html_url"]))
+            elif page["sha"] == sha:
+                for status in page["statuses"]:
+                    checks.setdefault(status["context"], []).append((status["state"], status["target_url"]))
+    failures = []
+    for name in config.merge.required_checks:
+        results = checks.get(name, [("missing", None)])
+        for state, url in results:
+            if state in {"pending", "missing", None}:
+                failures.append(f"check {name} has not finished on {sha} ({state or 'pending'})"
+                                + (f": {url}" if url else ""))
+            elif state != "success":
+                failures.append(f"check {name} is {state} on {sha}" + (f": {url}" if url else ""))
+    return failures
+
+
 def merge(args, config: Config) -> int:
     repo = config.repository()
 
@@ -120,6 +150,9 @@ def merge(args, config: Config) -> int:
                 return fail(f"#{ticket}'s executor is not waiting on {config.stations.orchestrator} to merge, and its "
                             f"{config.status.pending_merge} field does not list PR #{args.pr}; read its latest "
                             "comment and wait until it asks for the merge. Nothing merged")
+        failures = required_check_failures(config, repo, pr["headRefOid"])
+        if failures:
+            return fail("required checks block merge:\n" + "\n".join(failures))
         result = call(config, "gh", "pr", "merge", str(args.pr), "--repo", repo, "--merge",
                       "--match-head-commit", pr["headRefOid"])
         if result.returncode:

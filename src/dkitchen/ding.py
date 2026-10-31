@@ -1751,7 +1751,12 @@ def main(argv=None) -> int:
     sub.add_argument("--interrupt", action="store_true",
                      help="First stop the executor's current turn; only when that work is known to be obsolete")
     sub.add_argument("--socket", help="Existing local App Server Unix socket path")
-    sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD")
+    sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD",
+                              description="Merge only at the reviewed HEAD after draft and ticket checks. "
+                                          "In .dkitchen.toml, [merge] required_checks = [\"hca-check\"] "
+                                          "requires success on that exact HEAD. Default: [] (no check gate). "
+                                          "Missing, pending, failed, neutral or skipped checks refuse immediately; "
+                                          "there is no bypass flag.")
     sub.add_argument("pr", type=int, help="PR number")
     sub.add_argument("sha", help="The HEAD that was reviewed (full or prefix)")
     ticket = sub.add_mutually_exclusive_group()
