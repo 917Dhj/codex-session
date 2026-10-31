@@ -103,7 +103,7 @@ You can address a session by its UUID, its name, or a GitHub issue such as `'#42
 The stations' everyday steps are `ding` commands too, so they run the same careful way every time:
 
 - `ding relay` sends a message to a ticket's executor, and records it on the ticket only once delivery is confirmed.
-- `ding merge` merges a PR only at the reviewed HEAD once the executor is ready, and requires successful checks when `[merge] required_checks` is configured. See [the merge guide](docs/ding.md).
+- `ding review` records a verdict on the current PR HEAD. With `[merge] review_check`, `ding merge`, `ding watch`, and `ding waits` share PR readiness checks; every merge requires the default target branch. See [the review and merge guide](docs/ding.md).
 - `ding watch` waits in the orchestrator's background and wakes it when a ticket needs attention.
 - `ding waits` lists overdue unanswered waits, including ones still pending after a prior watch batch.
 - `ding log` keeps the orchestrator's log of what it did while you were away.

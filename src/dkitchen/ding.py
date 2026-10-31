@@ -1751,8 +1751,14 @@ def main(argv=None) -> int:
     sub.add_argument("--interrupt", action="store_true",
                      help="First stop the executor's current turn; only when that work is known to be obsolete")
     sub.add_argument("--socket", help="Existing local App Server Unix socket path")
+    sub = commands.add_parser("review", help="Record a review verdict on the PR HEAD",
+                              description="Post a review comment and success/failure commit status using [merge] review_check.")
+    sub.add_argument("pr", type=int, help="PR number")
+    sub.add_argument("sha", help="Reviewed HEAD (full SHA or prefix)")
+    sub.add_argument("verdict", choices=("pass", "changes"))
+    sub.add_argument("--body-file", required=True, type=Path, help="UTF-8 review text")
     sub = commands.add_parser("merge", help="Merge a reviewed PR at the reviewed HEAD",
-                              description="Merge only at the reviewed HEAD after draft and ticket checks. "
+                              description="Merge only at the reviewed HEAD into the default branch. With [merge] review_check set, require that check and ignore --ticket/--no-ticket; otherwise retain the ticket gate. "
                                           "In .dkitchen.toml, [merge] required_checks = [\"hca-check\"] "
                                           "requires success on that exact HEAD. Default: [] (no check gate). "
                                           "Missing, pending, failed, neutral or skipped checks refuse immediately; "
@@ -1783,6 +1789,7 @@ def main(argv=None) -> int:
                               description="List each open ticket's latest executor comment waiting on a configured "
                                           "station or the user, with no later reply from that station. Uses watch's "
                                           "aliases, width normalization, longest-name matching, and paused-state exclusion. "
+                                          "With [merge] review_check, also list PR readiness and review:<NAME> waits. "
                                           "Read-only; calls no model; exits 0 even when empty.")
     sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME", help="Keep only waits on NAME or its aliases")
     sub.add_argument("--minutes", type=float, help="Nonnegative finite threshold (default: [watch] design_answer_minutes)")
@@ -1795,10 +1802,12 @@ def main(argv=None) -> int:
                                             "Idle/stale checks ignore status labels older than the executor comment; "
                                             "awaiting-user still suppresses them. The orchestrator checks unanswered designer/verifier "
                                             "requests after [watch] design_answer_minutes (default 30; 0 disables it). "
+                                            "With [merge] review_check, also watch PR readiness and review:<NAME> labels. "
+                                            "[watch] unrouted_wait_minutes (default 30; 0 disables) reminds of unknown-station waits. "
                                             "Stdout /dev/null is refused with exit 3 before polling; pipes and files are allowed. "
                                             "Read-only; calls no model.")
     sub.add_argument("--for", dest="station", type=str.strip, metavar="NAME",
-                     help="Wake on requests or explicit mentions of NAME; skip labels, PRs, stale/idle checks and design-answer checks")
+                     help="Wake on requests, explicit mentions or review:<NAME> labels, even for an unconfigured NAME; skip issue labels, newly opened PR events and stale/idle checks")
     sub.add_argument("--state", type=Path, help="JSON file holding the last reported time "
                                                   "(default: ~/.local/state/ding/watch/OWNER-REPO[.for-NAME].json)")
     sub.add_argument("--since", help="Start time for the first run (ISO, UTC; default: now)")
@@ -1916,7 +1925,7 @@ def main(argv=None) -> int:
         if args.action == "night":
             from dkitchen import config, night
             return night.night(args, config.load())
-        if args.action in {"relay", "merge", "log", "watch", "waits"}:
+        if args.action in {"relay", "merge", "review", "log", "watch", "waits"}:
             from dkitchen import config, orchestrate, watch
             settings = config.load()
             handler = getattr(watch, args.action) if args.action in {"watch", "waits"} else getattr(orchestrate, args.action)

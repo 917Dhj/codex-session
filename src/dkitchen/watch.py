@@ -132,6 +132,8 @@ def role(body: str, config: Config) -> str:
     stations = config.stations
     first_line = next((line for line in body.splitlines() if line.strip()), "")
     first_line = normalized(first_line)
+    if config.merge.review_check and re.fullmatch(r"审过 [0-9a-fA-F]{8}:(?:通过|有出入,见下)", first_line):
+        return stations.verifier
     first = re.sub(r"^[\s#*>]+", "", first_line)
     if (any(first_line.startswith(normalized(prefix)) or first.startswith(normalized(prefix))
             for prefix in config.designer_signatures)
@@ -380,17 +382,149 @@ def unanswered_waits(config: Config, repo: str, minutes: float, skip: set[int], 
     return sorted(found, key=lambda item: (item["created_at"], item["ticket"], item["station"]))
 
 
+def pr_waits(config: Config, repo: str, skip: set[int]) -> list[dict]:
+    if not config.merge.review_check:
+        return []
+    from dkitchen import orchestrate
+    owner, name = repo.split("/", 1)
+    query = """query($owner:String!, $name:String!, $endCursor:String) {
+      repository(owner:$owner, name:$name) {
+        defaultBranchRef { name }
+        pullRequests(states:OPEN, first:100, after:$endCursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { number state isDraft baseRefName headRefOid updatedAt url
+            labels(first:100) { nodes { name } pageInfo { hasNextPage } }
+            commits(last:1) { nodes { commit { oid statusCheckRollup {
+              contexts(first:100) { pageInfo { hasNextPage } nodes {
+                ... on CheckRun { name status conclusion detailsUrl }
+                ... on StatusContext { context state targetUrl }
+              } }
+            } } } }
+          }
+        }
+      }
+    }"""
+    response = orchestrate.call(config, "gh", "api", "graphql", "--paginate", "--slurp",
+                                "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}")
+    if response.returncode:
+        raise RuntimeError(f"cannot read PR readiness: {response.stderr.strip()}")
+    found = []
+    for page in json.loads(response.stdout):
+        if page.get("errors"):
+            raise RuntimeError(f"cannot read PR readiness: {page['errors']}")
+        repository = page["data"]["repository"]
+        branch = repository["defaultBranchRef"]["name"]
+        for pr in repository["pullRequests"]["nodes"]:
+            if pr["number"] in skip:
+                continue
+            commit = pr["commits"]["nodes"][-1]["commit"]
+            checks = {}
+            if commit["oid"] != pr["headRefOid"]:
+                raise RuntimeError(f"PR #{pr['number']} HEAD moved during readiness query")
+            rollup = commit["statusCheckRollup"]
+            contexts = rollup["contexts"] if rollup else {"nodes": [], "pageInfo": {"hasNextPage": False}}
+            if contexts["pageInfo"]["hasNextPage"]:
+                checks = orchestrate.head_checks(config, repo, pr["headRefOid"])
+            else:
+                for check in contexts["nodes"]:
+                    if "context" in check:
+                        key, state, url = check["context"], check["state"].lower(), check["targetUrl"]
+                    else:
+                        key, url = check["name"], check["detailsUrl"]
+                        state = (check["conclusion"] or "pending").lower() if check["status"] == "COMPLETED" else "pending"
+                    checks.setdefault(key, []).append((state, url))
+            result = orchestrate.readiness(config, repo, pr, branch, checks)
+            if pr["isDraft"] and result["review"] != "failure":
+                continue
+            if pr["labels"]["pageInfo"]["hasNextPage"]:
+                raise RuntimeError(f"PR #{pr['number']} has too many labels to route its review safely")
+            reviewers = [label["name"][7:].strip() for label in pr["labels"]["nodes"]
+                         if label["name"].startswith("review:") and label["name"][7:].strip()]
+            reviewer = reviewers[0] if reviewers else config.stations.verifier
+            kind = "blocked"
+            if result["ready"]:
+                kind = "ready"
+            elif result["review"] == "failure":
+                kind = "review-failed"
+            elif result["review"] in {"missing", "pending"}:
+                kind = "review-missing"
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))).total_seconds() / 60
+            found.append({"ticket": pr["number"], "head": pr["headRefOid"], "kind": kind,
+                          "station": reviewer if kind == "review-missing" else config.stations.orchestrator,
+                          "minutes": elapsed, "created_at": pr["updatedAt"], "url": pr["url"],
+                          "summary": kind + (": " + "; ".join(result["reasons"]) if result["reasons"] else ""),
+                          "pending_only": result["pending_only"], "reasons": result["reasons"]})
+    return found
+
+
+def pr_wakes(config: Config, repo: str, station: str | None, reported: set[str], observed: dict,
+             skip: set[int]) -> tuple[list[tuple[str, str, str]], dict]:
+    found, pending = [], {}
+    moment = now()
+    target = station or config.stations.orchestrator
+    orchestrator = bool(station_variants(target, config) & station_variants(config.stations.orchestrator, config))
+    for item in pr_waits(config, repo, skip):
+        kind = item["kind"]
+        key = f"{item['ticket']}:{item['head']}:{kind}"
+        since = observed.get(key, moment)
+        pending[key] = since
+        line = f"PR #{item['ticket']} {item['summary']}; waiting on {item['station']} {item['url']}"
+        if (not (kind == "blocked" and item["pending_only"]) and key not in reported and
+                station_variants(target, config) & station_variants(item["station"], config)):
+            found.append((moment, line, key))
+        elapsed = (datetime.fromisoformat(moment.replace("Z", "+00:00")) -
+                   datetime.fromisoformat(since.replace("Z", "+00:00"))).total_seconds() / 60
+        backstop = key + ":overdue"
+        if (orchestrator and kind in {"ready", "review-missing", "blocked"} and config.watch.design_answer_minutes
+                and elapsed > config.watch.design_answer_minutes and backstop not in reported):
+            found.append((moment, line + f"; overdue for {elapsed:.0f} minutes", backstop))
+    return found, pending
+
+
+def unrouted_waits(config: Config, repo: str, checkout: Path, reported: set[int],
+                   skip: set[int]) -> list[tuple[str, str, int]]:
+    if not config.watch.unrouted_wait_minutes:
+        return []
+    cutoff = stamp(datetime.now(timezone.utc) - timedelta(minutes=config.watch.unrouted_wait_minutes))
+    candidates = []
+    for issue in open_issues(repo):
+        if "pull_request" in issue or issue["number"] in skip or not issue["comments"]:
+            continue
+        latest = None
+        for comment in comments_backwards(repo, issue):
+            latest = latest or comment
+            if role(comment["body"], config) != config.stations.executor:
+                continue
+            state, waiting = state_and_waiting(comment["body"], config)
+            if (state == config.status.in_progress and waiting and not waiting.startswith(config.status.none)
+                    and not any(named(waiting, name, config) for name in station_names(config))
+                    and comment["id"] not in reported
+                    and max(latest.get("updated_at", latest["created_at"]),
+                            comment.get("updated_at", comment["created_at"])) < cutoff):
+                candidates.append((issue, comment))
+            break
+    running = running_issues(checkout, config.sessions, repo) | tmux_issues(tmux_panes()) if candidates else set()
+    return [(comment["created_at"], f"#{issue['number']} unrouted wait for over "
+             f"{config.watch.unrouted_wait_minutes:g} minutes, with no running ding run or tmux job: "
+             f"{summary(comment['body'], config)} {comment['html_url']}", comment["id"])
+            for issue, comment in candidates if issue["number"] not in running]
+
+
 def waits(args, config: Config) -> int:
     names = station_names(config)
     if args.station is not None:
         names = [name for name in names if station_variants(name, config) & station_variants(args.station, config)]
     minutes = config.watch.design_answer_minutes if args.minutes is None else args.minutes
     found = unanswered_waits(config, config.repository(), minutes, set(), stations=names) if names else []
+    found += [item for item in pr_waits(config, config.repository(), set())
+              if item["minutes"] > minutes and (args.station is None or
+                 station_variants(args.station, config) & station_variants(item["station"], config))]
+    found.sort(key=lambda item: (item["created_at"], item["ticket"], item["station"]))
     if args.json:
         print(json.dumps(found, ensure_ascii=False))
     else:
         for item in found:
-            print(f"#{item['ticket']} waiting on {item['station']} for {item['minutes']:.0f} minutes: "
+            print(f"{'PR ' if 'head' in item else ''}#{item['ticket']} waiting on {item['station']} for {item['minutes']:.0f} minutes: "
                   f"{item['summary']} {item['url']}")
     return 0
 
@@ -496,6 +630,8 @@ def watch(args, config: Config) -> int:
         return 3
     repo = config.repository()
     station = getattr(args, "station", None)
+    if station is not None and station_variants(station, config) & station_variants(config.stations.orchestrator, config):
+        station = None
     collect_options = {"station": station} if station is not None else {}
     path = args.state or default_state(repo, station)
     checkout = args.checkout or config.root
@@ -512,6 +648,8 @@ def watch(args, config: Config) -> int:
     since, seen, reported = state["since"], set(state["seen"]), set(state.get("stale", []))
     observed, idle_reported = state.get("idle_observed", {}), set(state.get("idle_reported", []))
     design_reported = set(state.get("design_reported", []))
+    unrouted_reported = set(state.get("unrouted_reported", []))
+    pr_reported, pr_observed = set(state.get("pr_reported", [])), state.get("pr_observed", {})
     skip = set(args.skip_issue) | ({config.log.issue} if config.log.issue else set())
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
     labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
@@ -520,13 +658,15 @@ def watch(args, config: Config) -> int:
     print(f"Watching {repo}: {detail}", file=sys.stderr)
     errors = 0
     next_stale = next_idle = 0.0 if station is None else float("inf")
-    threshold = config.watch.idle_minutes or config.watch.design_answer_minutes
+    threshold = config.watch.idle_minutes or config.watch.design_answer_minutes or config.watch.unrouted_wait_minutes
     idle_every = min(threshold * 20, 900) if station is None and threshold else float("inf")
     while True:
         polled = now()
         try:
             found = collect(config, repo, since, labels_since, seen, skip, **collect_options)
+            pr_found, pr_pending = pr_wakes(config, repo, station, pr_reported, pr_observed, skip)
             quiet, idle_found, design_found, pending, stale_ids = [], [], [], observed, set()
+            unrouted_found = []
             checked_at = time.monotonic()
             checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
             if checked_stale:
@@ -537,6 +677,9 @@ def watch(args, config: Config) -> int:
                 design_found = unanswered_design(config, repo, design_reported, skip)
                 quiet += [item for item in idle_found if item[2] not in {entry[2] for entry in quiet}]
                 quiet += design_found
+                unrouted_found = unrouted_waits(config, repo, checkout, unrouted_reported, skip)
+                quiet += unrouted_found
+            quiet += pr_found
             if any(wakes for _, _, wakes in found) or quiet:
                 if found:
                     time.sleep(args.settle)
@@ -557,8 +700,8 @@ def watch(args, config: Config) -> int:
         if checked_idle:
             next_idle = checked_at + idle_every
         wakes = any(wakes for _, _, wakes in found) or bool(quiet)
-        changed = pending != observed
-        observed = pending
+        changed = pending != observed or pr_pending != pr_observed
+        observed, pr_observed = pending, pr_pending
         if wakes:
             for _, line in sorted([(time_, line) for time_, line, _ in found] + [(time_, line) for time_, line, _ in quiet]):
                 print(line)
@@ -568,11 +711,14 @@ def watch(args, config: Config) -> int:
             state.update(since=polled, seen=[line for time_, line, _ in found if time_ >= polled],
                          stale=sorted(reported | stale_ids),
                          idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}),
-                         design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}))
+                         design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}),
+                         unrouted_reported=sorted(unrouted_reported | {id_ for _, _, id_ in unrouted_found}),
+                         pr_reported=sorted(pr_reported | {key for _, _, key in pr_found}))
         if changed and not wakes:
             state["labels_since"] = labels_since
         if wakes or changed:
             state["idle_observed"] = observed
+            state["pr_observed"] = pr_observed
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, ensure_ascii=False))
             tmp.replace(path)
