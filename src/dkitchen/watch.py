@@ -132,6 +132,8 @@ def role(body: str, config: Config) -> str:
     stations = config.stations
     first_line = next((line for line in body.splitlines() if line.strip()), "")
     first_line = normalized(first_line)
+    if config.merge.review_check and re.fullmatch(r"审过 [0-9a-fA-F]{8}:(?:通过|有出入,见下)", first_line):
+        return stations.verifier
     first = re.sub(r"^[\s#*>]+", "", first_line)
     if (any(first_line.startswith(normalized(prefix)) or first.startswith(normalized(prefix))
             for prefix in config.designer_signatures)
@@ -384,18 +386,59 @@ def pr_waits(config: Config, repo: str, skip: set[int]) -> list[dict]:
     if not config.merge.review_check:
         return []
     from dkitchen import orchestrate
-    branch = orchestrate.default_branch(config, repo)
+    owner, name = repo.split("/", 1)
+    query = """query($owner:String!, $name:String!, $endCursor:String) {
+      repository(owner:$owner, name:$name) {
+        defaultBranchRef { name }
+        pullRequests(states:OPEN, first:100, after:$endCursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { number state isDraft baseRefName headRefOid updatedAt url
+            labels(first:100) { nodes { name } pageInfo { hasNextPage } }
+            commits(last:1) { nodes { commit { oid statusCheckRollup {
+              contexts(first:100) { pageInfo { hasNextPage } nodes {
+                ... on CheckRun { name status conclusion detailsUrl }
+                ... on StatusContext { context state targetUrl }
+              } }
+            } } } }
+          }
+        }
+      }
+    }"""
+    response = orchestrate.call(config, "gh", "api", "graphql", "--paginate", "--slurp",
+                                "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}")
+    if response.returncode:
+        raise RuntimeError(f"cannot read PR readiness: {response.stderr.strip()}")
     found = []
-    page = 1
-    while True:
-        pulls = gh(f"repos/{repo}/pulls?state=open&per_page=100&page={page}")
-        for pull in pulls:
-            if pull["number"] in skip:
+    for page in json.loads(response.stdout):
+        if page.get("errors"):
+            raise RuntimeError(f"cannot read PR readiness: {page['errors']}")
+        repository = page["data"]["repository"]
+        branch = repository["defaultBranchRef"]["name"]
+        for pr in repository["pullRequests"]["nodes"]:
+            if pr["number"] in skip:
                 continue
-            pr = {"state": pull["state"].upper(), "isDraft": pull["draft"],
-                  "baseRefName": pull["base"]["ref"], "headRefOid": pull["head"]["sha"]}
-            result = orchestrate.readiness(config, repo, pr, branch)
-            reviewers = [label["name"][7:].strip() for label in pull["labels"]
+            commit = pr["commits"]["nodes"][-1]["commit"]
+            checks = {}
+            if commit["oid"] != pr["headRefOid"]:
+                raise RuntimeError(f"PR #{pr['number']} HEAD moved during readiness query")
+            rollup = commit["statusCheckRollup"]
+            contexts = rollup["contexts"] if rollup else {"nodes": [], "pageInfo": {"hasNextPage": False}}
+            if contexts["pageInfo"]["hasNextPage"]:
+                checks = orchestrate.head_checks(config, repo, pr["headRefOid"])
+            else:
+                for check in contexts["nodes"]:
+                    if "context" in check:
+                        key, state, url = check["context"], check["state"].lower(), check["targetUrl"]
+                    else:
+                        key, url = check["name"], check["detailsUrl"]
+                        state = (check["conclusion"] or "pending").lower() if check["status"] == "COMPLETED" else "pending"
+                    checks.setdefault(key, []).append((state, url))
+            result = orchestrate.readiness(config, repo, pr, branch, checks)
+            if pr["isDraft"] and result["review"] != "failure":
+                continue
+            if pr["labels"]["pageInfo"]["hasNextPage"]:
+                raise RuntimeError(f"PR #{pr['number']} has too many labels to route its review safely")
+            reviewers = [label["name"][7:].strip() for label in pr["labels"]["nodes"]
                          if label["name"].startswith("review:") and label["name"][7:].strip()]
             reviewer = reviewers[0] if reviewers else config.stations.verifier
             kind = "blocked"
@@ -403,17 +446,15 @@ def pr_waits(config: Config, repo: str, skip: set[int]) -> list[dict]:
                 kind = "ready"
             elif result["review"] == "failure":
                 kind = "review-failed"
-            elif result["review"] in {"missing", "pending"} and not pr["isDraft"]:
+            elif result["review"] in {"missing", "pending"}:
                 kind = "review-missing"
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(pull["updated_at"].replace("Z", "+00:00"))).total_seconds() / 60
-            found.append({"ticket": pull["number"], "head": pr["headRefOid"], "kind": kind,
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))).total_seconds() / 60
+            found.append({"ticket": pr["number"], "head": pr["headRefOid"], "kind": kind,
                           "station": reviewer if kind == "review-missing" else config.stations.orchestrator,
-                          "minutes": elapsed, "created_at": pull["updated_at"], "url": pull["html_url"],
+                          "minutes": elapsed, "created_at": pr["updatedAt"], "url": pr["url"],
                           "summary": kind + (": " + "; ".join(result["reasons"]) if result["reasons"] else ""),
-                          "reasons": result["reasons"]})
-        if len(pulls) < 100:
-            return found
-        page += 1
+                          "pending_only": result["pending_only"], "reasons": result["reasons"]})
+    return found
 
 
 def pr_wakes(config: Config, repo: str, station: str | None, reported: set[str], observed: dict,
@@ -424,19 +465,17 @@ def pr_wakes(config: Config, repo: str, station: str | None, reported: set[str],
     orchestrator = bool(station_variants(target, config) & station_variants(config.stations.orchestrator, config))
     for item in pr_waits(config, repo, skip):
         kind = item["kind"]
-        if kind == "blocked":
-            continue
         key = f"{item['ticket']}:{item['head']}:{kind}"
         since = observed.get(key, moment)
         pending[key] = since
         line = f"PR #{item['ticket']} {item['summary']}; waiting on {item['station']} {item['url']}"
-        if (key not in reported and
+        if (not (kind == "blocked" and item["pending_only"]) and key not in reported and
                 station_variants(target, config) & station_variants(item["station"], config)):
             found.append((moment, line, key))
         elapsed = (datetime.fromisoformat(moment.replace("Z", "+00:00")) -
                    datetime.fromisoformat(since.replace("Z", "+00:00"))).total_seconds() / 60
         backstop = key + ":overdue"
-        if (orchestrator and kind in {"ready", "review-missing"} and config.watch.design_answer_minutes
+        if (orchestrator and kind in {"ready", "review-missing", "blocked"} and config.watch.design_answer_minutes
                 and elapsed > config.watch.design_answer_minutes and backstop not in reported):
             found.append((moment, line + f"; overdue for {elapsed:.0f} minutes", backstop))
     return found, pending
@@ -591,6 +630,8 @@ def watch(args, config: Config) -> int:
         return 3
     repo = config.repository()
     station = getattr(args, "station", None)
+    if station is not None and station_variants(station, config) & station_variants(config.stations.orchestrator, config):
+        station = None
     collect_options = {"station": station} if station is not None else {}
     path = args.state or default_state(repo, station)
     checkout = args.checkout or config.root

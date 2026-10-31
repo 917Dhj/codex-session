@@ -2489,18 +2489,24 @@ def review_pr(idle_ticket, monkeypatch):
                    'html_url': 'https://github.com/o/r/pull/7'}
     ticket.review = None
     ticket.ci = 'success'
-    original = watch.gh
-    monkeypatch.setattr(watch, 'gh', lambda path: [ticket.pull] if '/pulls?' in path else original(path))
+    ticket.api_calls = []
     def call(settings, *args):
-        if args[-1] == 'repos/o/r':
-            data = {'default_branch': 'main'}
-        elif 'check-runs?' in args[-1]:
-            data = [{'check_runs': [check_run(ticket.ci, ticket.pull['head']['sha'], 'ci')]}]
-        elif '/status?' in args[-1]:
-            data = [{'sha': ticket.pull['head']['sha'], 'statuses':
-                     [] if ticket.review is None else [commit_status(ticket.review, 'review')]}]
-        else:
-            pytest.fail(str(args))
+        ticket.api_calls.append(args)
+        assert args[:3] == ('gh', 'api', 'graphql')
+        pull = ticket.pull
+        contexts = [{'name': 'ci', 'status': 'COMPLETED' if ticket.ci != 'pending' else 'IN_PROGRESS',
+                     'conclusion': ticket.ci.upper() if ticket.ci != 'pending' else None, 'detailsUrl': 'https://ci'}]
+        if ticket.review:
+            contexts.append({'context': 'review', 'state': ticket.review.upper(), 'targetUrl': 'https://review'})
+        pr = {'number': pull['number'], 'state': 'OPEN', 'isDraft': pull['draft'],
+              'baseRefName': pull['base']['ref'], 'headRefOid': pull['head']['sha'],
+              'updatedAt': pull['updated_at'], 'url': pull['html_url'],
+              'labels': {'nodes': pull['labels'], 'pageInfo': {'hasNextPage': False}},
+              'commits': {'nodes': [{'commit': {'oid': pull['head']['sha'], 'statusCheckRollup':
+                  {'contexts': {'nodes': contexts, 'pageInfo': {'hasNextPage': False}}}}}]}}
+        nodes = [dict(pr, number=n) for n in range(1, 17)] if getattr(ticket, 'sixteen', False) else [pr]
+        data = [{'data': {'repository': {'defaultBranchRef': {'name': 'main'},
+                'pullRequests': {'nodes': nodes, 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}]
         return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr='')
     monkeypatch.setattr(orchestrate, 'call', call)
     monkeypatch.setattr(config, 'load', lambda: ticket.config)
@@ -2685,3 +2691,61 @@ def test_review_help_lists_command_and_keys(capsys):
         ding.main(['review', '--help'])
     text = capsys.readouterr().out
     assert '--body-file' in text and 'review_check' in text
+
+
+@pytest.mark.parametrize('target', ['Orchestrator', 'Boss'])
+def test_orchestrator_for_runs_all_backstops_and_collects_as_bare(review_pr, monkeypatch, target):
+    from dataclasses import replace
+    ticket = review_pr
+    ticket.config = replace(ticket.config, stations=replace(ticket.config.stations, aliases={'Orchestrator': ('Boss',)}))
+    ticket.review = 'failure'
+    phases = []
+    def collect(*args, **kwargs):
+        assert not kwargs
+        return []
+    monkeypatch.setattr(watch, 'collect', collect)
+    for name in ('stale', 'unanswered_design', 'unrouted_waits'):
+        monkeypatch.setattr(watch, name, lambda *args, name=name: phases.append(name) or [])
+    monkeypatch.setattr(watch, 'idle', lambda *args: (phases.append('idle') or [], {}))
+    assert ding.main(['watch', '--for', target, '--state', str(ticket.config.root / 'boss.json')]) == 0
+    assert set(phases) == {'stale', 'idle', 'unanswered_design', 'unrouted_waits'}
+    assert '7:abc123:review-failed' in json.loads((ticket.config.root / 'boss.json').read_text())['pr_reported']
+
+
+@pytest.mark.parametrize('condition', ['failed', 'base', 'pending'])
+def test_reviewed_blocked_pr_wakes_or_waits_for_backstop(review_pr, condition):
+    ticket = review_pr
+    ticket.review = 'success'
+    ticket.ci = 'pending' if condition == 'pending' else 'failure' if condition == 'failed' else 'success'
+    if condition == 'base':
+        ticket.pull['base']['ref'] = 'stacked'
+    found, observed = watch.pr_wakes(ticket.config, 'o/r', None, set(), {}, set())
+    assert bool(found) == (condition != 'pending')
+    reported = {key for _, _, key in found}
+    assert watch.pr_wakes(ticket.config, 'o/r', None, reported, observed, set())[0] == []
+    ticket.clock.moment += timedelta(minutes=31)
+    overdue, _ = watch.pr_wakes(ticket.config, 'o/r', None, reported, observed, set())
+    assert len(overdue) == 1
+    if condition == 'base':
+        assert 'stacked' in overdue[0][1]
+
+
+def test_sixteen_pr_poll_uses_at_most_three_gh_calls(review_pr):
+    review_pr.sixteen = True
+    assert len(watch.pr_waits(review_pr.config, 'o/r', set())) == 16
+    assert len(review_pr.api_calls) <= 3
+    assert '--paginate' in review_pr.api_calls[0]
+
+
+@pytest.mark.parametrize('review', [None, 'success', 'failure'])
+def test_waits_excludes_drafts_except_failed_review(review_pr, capsys, review):
+    review_pr.pull['draft'] = True
+    review_pr.review = review
+    assert ding.main(['waits', '--json']) == 0
+    assert bool(json.loads(capsys.readouterr().out)) == (review == 'failure')
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_review_comment_is_verifier_only_with_review_check(tmp_path, enabled):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check=' + ('"review"' if enabled else '""'))
+    assert watch.role('审过 e7870cd7：通过\n\nchecked', loaded) == (loaded.stations.verifier if enabled else loaded.stations.user)

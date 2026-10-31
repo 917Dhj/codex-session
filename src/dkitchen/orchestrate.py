@@ -111,7 +111,7 @@ def default_branch(config: Config, repo: str) -> str:
     return branch
 
 
-def readiness(config: Config, repo: str, pr: dict, branch: str) -> dict:
+def readiness(config: Config, repo: str, pr: dict, branch: str, checks: dict | None = None) -> dict:
     """GitHub facts on this HEAD, shared by merge, watch and waits."""
     reasons = []
     if pr["state"] != "OPEN":
@@ -120,8 +120,9 @@ def readiness(config: Config, repo: str, pr: dict, branch: str) -> dict:
         reasons.append("PR is a draft")
     if pr["baseRefName"] != branch:
         reasons.append(f"PR base is {pr['baseRefName']}, not repository default branch {branch}")
+    pending_only = not reasons
     sha = pr["headRefOid"]
-    checks = head_checks(config, repo, sha)
+    checks = head_checks(config, repo, sha) if checks is None else checks
     required = config.merge.required_checks + ((config.merge.review_check,) if config.merge.review_check else ())
     for name in dict.fromkeys(required):
         for state, url in checks.get(name, [("missing", None)]):
@@ -129,6 +130,7 @@ def readiness(config: Config, repo: str, pr: dict, branch: str) -> dict:
                 reasons.append(f"check {name} has not finished on {sha} ({state or 'pending'})"
                                + (f": {url}" if url else ""))
             elif state != "success":
+                pending_only = False
                 reasons.append(f"check {name} is {state} on {sha}" + (f": {url}" if url else ""))
     review = [state for state, _ in checks.get(config.merge.review_check, [])]
     review_state = "missing"
@@ -136,7 +138,8 @@ def readiness(config: Config, repo: str, pr: dict, branch: str) -> dict:
         review_state = "success" if all(state == "success" for state in review) else "pending"
         if "failure" in review:
             review_state = "failure"
-    return {"ready": not reasons, "reasons": reasons, "review": review_state}
+    return {"ready": not reasons, "reasons": reasons, "review": review_state,
+            "pending_only": bool(reasons) and pending_only}
 
 
 def review(args, config: Config) -> int:
