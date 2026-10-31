@@ -373,7 +373,8 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 | Command | Who runs it | What it does |
 | --- | --- | --- |
 | `ding relay 42 --message TEXT [--comment TEXT]` | Orchestrator | Sends the message to ticket #42's executor and, only once delivery is confirmed, leaves it (or `--comment`) on the ticket, signed. The message opens with the `[relay] superseding` line and is sent with `--steer --supersede`: it enters the executor's current turn and deletes the orchestrator's relays still queued for it. `--queue` queues it plainly instead; `--interrupt` also stops the current turn first. `--to SESSION` picks the executor when the ticket has no owner line; `--no-comment` only sends. |
-| `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is not a draft, and the ticket's executor is waiting on the orchestrator or lists PR #57 as pending merge (see below). Then it confirms the merge and prints the merge commit. |
+| `ding review 57 a1b2c3d pass --body-file review.md` | Reviewer | Posts the review comment and a commit status on the full PR HEAD, using `[merge] review_check`. Use `changes` for a failed review. |
+| `ding merge 57 a1b2c3d [--ticket 42]` | Orchestrator | Merges PR #57 only if its HEAD is still the reviewed `a1b2c3d`, it is open and not a draft, its base is the default branch, and required checks pass. Without `review_check`, the executor ticket gate also applies (see below). Then it confirms the merge and prints the merge commit. |
 | `ding log --item TEXT [--pending TEXT]` | Orchestrator | Posts a signed, UTC-stamped entry to the orchestrator log ticket: one line per `--item`, then the matters waiting for the user. |
 | `ding night open\|show\|close` | Orchestrator opens/closes; any station reads | Records night orders on `[log] issue`, shows the open orders and their link, or closes them. Orders expire at `--until`. Calls no model. |
 | `ding watch [--for NAME]` | A station, in the background | Waits for GitHub activity, prints it as one batch, and exits. `--for NAME` selects requests and explicit handoffs to that station. See [While the user is away](../kitchen/modules/unattended.md). |
@@ -383,6 +384,8 @@ These commands carry out the kitchen's routine steps, as the house rules in [kit
 
 **Before merging, `ding merge` reads the executor's latest status block.** The ticket is `--ticket N`. Without it, `ding` takes the one ticket mentioned in the PR body (as `#N` or a link) that has executor comments, and refuses when there are none or several. Executor comments are those signed `Codex session:` or `Claude session:`; when both kinds are on the ticket, the latest comment of either counts. It prints that ticket's latest executor status block, and merges only when its second field (*Waiting on*) names the orchestrator, or its optional `[status] pending_merge` field (default *Pending merge*, for example `Pending merge: PR#57, PR#58`) lists this PR. The executor lists a PR there once it needs nothing more on it, so the merge does not wait for the executor to come back from its next task. An executor that has since said it is still changing the PR, or that waits on nobody, blocks the merge, even if the review already passed. Use `--no-ticket` for a PR that belongs to no ticket. There is no override: when the executor cannot answer, the user merges by hand.
 
+Every merge checks the repository's current default branch against the PR base. A stacked PR targeting another branch is refused with both branch names; there is no bypass.
+
 To require CI checks before merging, set this optional key in `.dkitchen.toml`:
 
 ```toml
@@ -390,7 +393,26 @@ To require CI checks before merging, set this optional key in `.dkitchen.toml`:
 required_checks = ["hca-check"]
 ```
 
-The default is `[]`, which leaves the existing merge behavior unchanged and makes no check API calls. Names match exactly, including spaces and case; the value must be a list of nonempty strings. After the draft, reviewed-HEAD and ticket gates pass, `ding merge` reads all pages of the latest check runs and commit statuses on the full reviewed HEAD. Every configured name must have a result, and every matching result must be `success`. This includes same-name results from different apps or from both APIs. `neutral` and `skipped` refuse, as do failures, cancellations, timeouts and other non-success results. Missing or pending checks refuse with `check NAME has not finished on HEAD`. Refusals report every blocking name, its result and its URL when available. API/read errors also refuse. Checks for another SHA do not count. The command never waits or polls and has no bypass flag; `--no-ticket` skips only the ticket gate. The merge still uses `--match-head-commit` to reject a HEAD that moves after these reads.
+The default is `[]`. With no `review_check` either, there are no check API calls; the base and legacy ticket gates still apply. Names match exactly, including spaces and case; the value must be a list of nonempty strings. After the draft, reviewed-HEAD and ticket gates pass, `ding merge` reads all pages of the latest check runs and commit statuses on the full reviewed HEAD. Every configured name must have a result, and every matching result must be `success`. This includes same-name results from different apps or from both APIs. `neutral` and `skipped` refuse, as do failures, cancellations, timeouts and other non-success results. Missing or pending checks refuse with `check NAME has not finished on HEAD`. Refusals report every blocking name, its result and its URL when available. API/read errors also refuse. Checks for another SHA do not count. The command never waits or polls and has no bypass flag; `--no-ticket` skips only the ticket gate. The merge still uses `--match-head-commit` to reject a HEAD that moves after these reads.
+
+### Commit-bound review and PR readiness
+
+```toml
+[merge]
+required_checks = ["hca-check"]
+review_check = "review"
+```
+
+```bash
+ding review 57 a1b2c3d pass --body-file review.md
+ding review 57 a1b2c3d changes --body-file findings.md
+```
+
+`review_check` defaults to `""` (disabled); a configured value must be a nonempty check name. `ding review` requires it, resolves the supplied SHA or prefix against the current PR HEAD, and refuses a mismatch before posting. The comment starts with `审过 <sha8>：通过` or `审过 <sha8>：有出入，见下`, followed by the UTF-8 file. It then writes `success` or `failure` to the full SHA under that context, linking the status to the comment. Failure exits nonzero and identifies the failed call; if the status write fails, the comment remains and its URL is printed. A new HEAD has no inherited verdict.
+
+With `review_check` configured, `merge`, `watch` and `waits` share the same readiness function: the PR must be open, non-draft, target the repository's default branch, and have every configured check plus the review check succeed on its exact HEAD. `merge` does not read executor comments in this mode, regardless of executor type. `--ticket` and `--no-ticket` print an ignored-option note. To hold a PR, mark it draft.
+
+PR watches report `ready` and `review-failed` to the orchestrator, and `review-missing` (including a pending review check) to the reviewer. The reviewer is the first nonempty `review:<NAME>` label, or the verifier station when absent. `ding watch --for NAME` accepts that name even when it is not a configured station. Each event is reported once per PR, HEAD and event kind, persisted in `pr_reported`; a new HEAD can wake again. An unreviewed PR or a ready but unmerged PR also wakes the orchestrator once after `[watch] design_answer_minutes`. These timers start when that watch first observes the condition, persist in `pr_observed`, and do not reset on unrelated PR comments. Setting the threshold to 0 disables these delayed reminders, not the immediate PR events. Without `review_check`, PR status polling is disabled.
 
 `ding watch` keeps its place in `~/.local/state/ding/watch/OWNER-REPO.json`, so rerunning the same command after handling a batch loses nothing. Only one watch runs per state file. It always skips the orchestrator log ticket; add `--skip-issue N` for others. On an independent schedule, it also checks for executors still marked in progress whose attributed board sessions are all `idle` or `notLoaded`, with no running `ding run` or live `issue<N>` tmux job. After `[watch] idle_minutes` (default 45), it reports the ticket once per executor comment. The check interval is `idle_minutes / 3`, capped at 15 minutes; a longer `--interval` is shortened to meet that deadline. `--stale-every` controls only the existing stale check. Awaiting-user tickets, `--skip-issue`, and the log ticket are excluded; another `status:` label suppresses idle/stale checks only when its latest addition is after the executor comment; a ticket without an attributed session uses only the existing stale check.
 
@@ -405,11 +427,11 @@ ding watch --for Designer
 ding watch --for '总设计（训练）'
 ```
 
-Use the station's configured name. This mode wakes for executor comments whose waiting-on field names the station, including on awaiting-user tickets, or whose Next field contains `交NAME`. An executor marked `[status] waiting_on_design` with no designer named in its waiting field wakes the default `[stations] designer`.
+Use the station's name or a `review:<NAME>` label target. This mode wakes for executor comments whose waiting-on field names the station, including on awaiting-user tickets, or whose Next field contains `交NAME`. An executor marked `[status] waiting_on_design` with no designer named in its waiting field wakes the default `[stations] designer`.
 
 Verifier, orchestrator, and user comments wake the station only when they contain `@NAME`, `交NAME`, or a line starting with `NAME` followed by the configured separator. Designer comments, including the station's own rulings, never trigger a station watch. A configured `[status] paused` executor never triggers `--for`; the orchestrator treats that status like in progress.
 
-A station watch does not query labels, new PRs, stale/idle checks, the unanswered-design backstop, board, or tmux. `--settle`, `--skip-issue`, the log-ticket exclusion, and bounded error retries still apply.
+A station watch skips issue-label events, newly opened PR events, stale/idle checks, ticket backstops, board, and tmux. With `review_check` configured it also polls PR readiness and reviewer labels. `--settle`, `--skip-issue`, the log-ticket exclusion, and bounded error retries still apply.
 
 Names are compared after width normalization, so `总设计(训练)` matches `总设计（训练）`. Matching includes `[stations.aliases]` and excludes occurrences inside longer configured names or aliases; trailing signature separators are removed before comparison. For example, when `总设计（训练）：` is configured, `--for 总设计` does not wake for a comment waiting only on `总设计（训练）`; `--for '总设计（训练）'` does.
 
@@ -430,6 +452,8 @@ Each alias value must be a nonempty list of nonempty names. Thus `训练设计` 
 
 The orchestrator's watch checks each ticket's latest executor comment for unanswered designer or verifier requests on the idle-check cadence, using the same query as `ding waits`. After `[watch] design_answer_minutes` (default 30), it reports that comment if its state is waiting on design or its waiting field names a designer or verifier. Verifier requests clear when a verifier comment follows; existing designer reminders still clear on a reply from any designer station. The line names the unanswered stations and links to the executor comment. Configured paused requests are excluded. Reported comment IDs remain in `design_reported`, including verifier requests, so restarting does not repeat them. Set the threshold to 0 to disable the backstop; it remains enabled when only idle wakes are disabled. Existing open requests can be reported even when older than `--since`.
 
+The orchestrator also reports an unknown-station wait once per executor comment after `[watch] unrouted_wait_minutes` (default 30; 0 disables it), on the idle-check cadence. The latest executor status must be in progress, its waiting field nonempty and not `none`, and no configured station or alias may match. Any newer comment restarts the silence interval; a live `ding run` or tmux job suppresses the reminder, using the same job test as stale checks. Reported IDs persist in `unrouted_reported`.
+
 `ding watch` refuses to start with stdout redirected to `/dev/null`: it prints an error on stderr and exits 3 before polling, creating locks/directories, or reading/writing the state file. Pipes and regular files are allowed, including the files used by background tasks. Keep the printed batch until every item is handled; `ding waits` can recover unanswered waits after a prior batch has already advanced the watch cursor.
 
 The default state file is `OWNER-REPO.for-NAME.json` under the watch state directory, with `NAME` percent-encoded for filenames. It is separate from `OWNER-REPO.json`, so station and orchestrator watches can run concurrently. An explicit `--state` overrides this choice; the same file still permits only one watch. Omitting `--for` selects the orchestrator watch and retains its default state path.
@@ -446,11 +470,13 @@ ding waits --for '总设计（训练）' --minutes 45
 ding waits --json
 ```
 
-For each open ticket, `ding waits` considers only the latest executor comment. It lists each station named by that comment's waiting field when more than N minutes have passed without a subsequent comment from that station. Names include the configured orchestrator, designers, verifier, executor, user, and `[stations.aliases]` keys. Matching shares watch's aliases, width normalization, and longest-name precedence. A user reply is a comment whose role is user; designer replies are matched to the named designer/signature or alias. Configured paused states and PRs are excluded. No labels or running-job checks hide waits, and no watch cursor or reported-ID state is read or changed.
+For each open ticket, `ding waits` considers only the latest executor comment. It lists each station named by that comment's waiting field when more than N minutes have passed without a subsequent comment from that station. Names include the configured orchestrator, designers, verifier, executor, user, and `[stations.aliases]` keys. Matching shares watch's aliases, width normalization, and longest-name precedence. A user reply is a comment whose role is user; designer replies are matched to the named designer/signature or alias. Configured paused states are excluded from ticket waits. PRs use the separate readiness query when `review_check` is set. No labels or running-job checks hide waits, and no watch cursor or reported-ID state is read or changed.
 
 The threshold defaults to `[watch] design_answer_minutes`; `--minutes` accepts a nonnegative finite number. For `waits`, 0 lists any positive-duration wait, including when the periodic backstop is disabled. `--for NAME` keeps only waits on that station or its aliases. A design-state comment with no station named in its waiting field belongs only to the existing watch fallback, not this list.
 
 Text output is one line per unanswered station, with ticket, station, minutes, summary, and comment URL, oldest first. Empty text output is blank; both empty and nonempty lists exit 0. `--json` emits an array (empty: `[]`) whose objects contain `ticket`, `station`, `minutes`, `summary`, `url`, `comment_id`, and `created_at`. GitHub/query errors exit nonzero rather than returning an empty list.
+
+With `review_check`, PR rows use the same `ready`, `review-failed`, `review-missing`, or `blocked` terms and reasons as the watch and merge checks. `--for` also accepts reviewer-label names. PR JSON rows include `head`, `kind`, and `reasons` instead of `comment_id`. Their `minutes` and `created_at` describe time since the PR's last GitHub update; unlike watch's persistent backstop timers, this read-only listing does not measure continuous observed readiness. The minute filter applies to both ticket and PR rows.
 
 ### Night orders: `night open`, `night show`, `night close`
 
@@ -523,15 +549,17 @@ notify = "#{ticket} answered, see the ticket {url}"   # the `--notify` message; 
 
 [merge]
 required_checks = []                # e.g. ["hca-check"]; only success permits merging
+review_check = ""                   # e.g. "review"; replaces the legacy ticket gate
 
 [watch]
 idle_minutes = 45                    # 0 disables idle-executor wakes
-design_answer_minutes = 30           # 0 disables unanswered-design reminders
+design_answer_minutes = 30           # 0 disables unanswered-station and PR backstops
+unrouted_wait_minutes = 30           # 0 disables unknown-station wait reminders
 ```
 
 `[sessions] name` may use `{issue}`, `{name}` (the `--name` text), and `{repo}` (`OWNER/REPO`), with an optional format spec such as `{issue:04d}`. Any other field is an error when the file is read. The `--name` text is filled in as is, so braces in it are kept. `ding new` without `--issue` and `ding rename` use `--name` unchanged.
 
-`[watch] idle_minutes` and `design_answer_minutes` must be nonnegative finite numbers of minutes; unknown `[watch]` keys are errors.
+`[watch] idle_minutes`, `design_answer_minutes`, and `unrouted_wait_minutes` must be nonnegative finite numbers of minutes; unknown `[watch]` keys are errors.
 
 `[rule] signatures` lists the full first-line prefixes accepted as designer signatures by both `ding rule` and `ding watch`. It must be a nonempty list of nonempty strings. `ding rule` matches prefixes verbatim, including spaces; `ding watch` also recognizes width-normalized forms and configured aliases. When omitted, it defaults to `[stations] designer` plus `[stations] separator`.
 

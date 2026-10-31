@@ -122,6 +122,8 @@ def test_log_entry_is_signed_with_utc_time_and_pending_line(tmp_path):
 
 def fake_call(responses, calls):
     def call(settings, *args):
+        if args == ("gh", "api", f"repos/{settings.repository()}"):
+            return SimpleNamespace(returncode=0, stdout='{"default_branch":"main"}', stderr="")
         calls.append(args)
         returncode, stdout = responses.pop(0)
         return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="boom" if returncode else "")
@@ -174,7 +176,7 @@ def test_merge_accepts_a_pr_the_executor_lists_as_pending_merge(tmp_path, monkey
 
 def view(state="OPEN", head="abc123", draft=False, body=""):
     return 0, json.dumps({"isDraft": draft, "state": state, "headRefOid": head, "mergeCommit": {"oid": "m1"},
-                          "body": body})
+                          "body": body, "baseRefName": "main"})
 
 
 @pytest.mark.parametrize("responses, code, message", [
@@ -1395,6 +1397,7 @@ def test_watch_bounds_errors_in_every_poll_phase(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr(watch, "stale", lambda *args: [])
     monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
     monkeypatch.setattr(watch, "unanswered_design", lambda *args: [])
+    monkeypatch.setattr(watch, "unrouted_waits", lambda *args: [])
     attempts = []
 
     def fail_then_recover(*args):
@@ -1822,6 +1825,7 @@ def test_station_and_orchestrator_watches_run_concurrently_with_separate_default
     monkeypatch.setattr(watch, "stale", lambda *args: [])
     monkeypatch.setattr(watch, "idle", lambda *args: ([], {}))
     monkeypatch.setattr(watch, "unanswered_design", lambda *args: [])
+    monkeypatch.setattr(watch, "unrouted_waits", lambda *args: [])
     monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
     def run(station):
         args = SimpleNamespace(state=None, checkout=None, since=None, skip_issue=[], station=station,
@@ -1865,7 +1869,7 @@ def test_station_watch_help_describes_its_scope(capsys):
     text = capsys.readouterr().out
     assert "--for NAME" in text
     assert "executor comments waiting on" in text
-    assert "labels, PRs, stale/idle checks" in text
+    assert "review:<NAME>" in text and "stale/idle" in text
 
 
 def test_station_watch_retries_post_settle_timeout_without_duplicate_output(station_settings, monkeypatch, tmp_path, capsys):
@@ -2141,7 +2145,7 @@ def collect(*args, **kwargs):
     return [(watch.now(), "fixture wait", True)]
 watch.collect = collect
 watch.idle = lambda *args: ([], {})
-watch.stale = watch.unanswered_design = lambda *args: []
+watch.stale = watch.unanswered_design = watch.unrouted_waits = lambda *args: []
 sys.exit(ding.main(["watch", "--state", sys.argv[1], "--settle", "0"]))
 '''
     output_path = tmp_path / "output.txt"
@@ -2399,3 +2403,285 @@ def test_label_history_uses_latest_addition_and_requires_a_newer_event(idle_tick
     assert watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)
     events.clear()
     assert not watch.label_suppresses(ticket.config, "o/r", issue, ticket.last)
+
+
+@pytest.mark.parametrize('verdict, expected', [('pass', 'success'), ('changes', 'failure')])
+def test_review_posts_comment_and_status_on_full_head(tmp_path, monkeypatch, capsys, verdict, expected):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check="review"')
+    monkeypatch.setattr(config, 'load', lambda: loaded)
+    body = tmp_path / 'review.md'
+    body.write_text('Reviewed tests.')
+    calls = []
+    sha = 'abcdef0123456789'
+    monkeypatch.setattr(orchestrate, 'call', fake_call([
+        (0, json.dumps({'headRefOid': sha})), (0, '{"html_url":"https://review"}'), (0, '{}')], calls))
+    assert ding.main(['review', '7', sha[:8], verdict, '--body-file', str(body)]) == 0
+    assert f'审过 {sha[:8]}：' in calls[1][-1] and 'Reviewed tests.' in calls[1][-1]
+    assert calls[2] == ('gh', 'api', f'repos/o/r/statuses/{sha}', '-f', f'state={expected}',
+                        '-f', 'context=review', '-f', 'target_url=https://review')
+
+
+@pytest.mark.parametrize('stage, message, count', [('head', 'HEAD is now', 1),
+    ('comment', 'review comment failed', 2), ('status', 'review status failed', 3)])
+def test_review_refuses_stale_sha_and_reports_partial_failure(tmp_path, monkeypatch, capsys, stage, message, count):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check="review"')
+    body = tmp_path / 'review.md'
+    body.write_text('details')
+    calls = []
+    responses = [(0, '{"headRefOid":"abc123"}'),
+                 (1, '') if stage == 'comment' else (0, '{"html_url":"https://review"}'), (1, '')]
+    monkeypatch.setattr(orchestrate, 'call', fake_call(responses, calls))
+    assert orchestrate.review(SimpleNamespace(pr=7, sha='old' if stage == 'head' else 'abc',
+                                             verdict='pass', body_file=body), loaded) == 1
+    assert message in capsys.readouterr().err
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize('change, state, missing, reason', [
+    ({'isDraft': True}, 'success', False, 'draft'),
+    ({'state': 'CLOSED'}, 'success', False, 'CLOSED'),
+    ({'baseRefName': 'stacked'}, 'success', False, 'stacked, not repository default branch main'),
+    ({}, 'failure', False, 'failure'), ({}, 'pending', False, 'pending'),
+    ({}, 'success', True, 'missing'), ({}, 'success', False, ''),
+])
+def test_shared_readiness_reasons(tmp_path, monkeypatch, change, state, missing, reason):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check="review"')
+    pr = json.loads(view()[1]) | change
+    monkeypatch.setattr(orchestrate, 'call', fake_call(check_responses(
+        statuses=[] if missing else [commit_status(state, 'review')]), []))
+    result = orchestrate.readiness(loaded, 'o/r', pr, 'main')
+    assert result['ready'] == (not reason)
+    assert reason in '; '.join(result['reasons'])
+
+
+@pytest.mark.parametrize('ticket_body', ['', 'Claude session: worker'])
+@pytest.mark.parametrize('head', ['abc123', 'new123'])
+def test_review_gate_needs_no_executor_comment_and_expires_on_push(tmp_path, monkeypatch, capsys, ticket_body, head):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check="review"')
+    calls = []
+    responses = [view(head=head, body=ticket_body)] + check_responses(
+        statuses=[commit_status('success', 'review')], sha='abc123')
+    if head == 'abc123':
+        responses += [(0, ''), view('MERGED')]
+    monkeypatch.setattr(orchestrate, 'call', fake_call(responses, calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha=head, ticket=42, no_ticket=False), loaded) == (head != 'abc123')
+    assert not any('/issues/' in str(call) for call in calls)
+    assert 'ignored' in capsys.readouterr().out
+
+
+def test_merge_refuses_wrong_base_without_review_check(tmp_path, monkeypatch, capsys):
+    loaded = settings(tmp_path, 'repo="o/r"')
+    pr = json.loads(view()[1]) | {'baseRefName': 'stacked'}
+    calls = []
+    monkeypatch.setattr(orchestrate, 'call', fake_call([(0, json.dumps(pr))], calls))
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha='abc', no_ticket=True), loaded) == 1
+    assert 'stacked, not repository default branch main' in capsys.readouterr().err
+    assert len(calls) == 1
+
+
+@pytest.fixture
+def review_pr(idle_ticket, monkeypatch):
+    from dataclasses import replace
+    ticket = idle_ticket
+    ticket.config = replace(ticket.config, merge=config.Merge(required_checks=('ci',), review_check='review'))
+    ticket.pull = {'number': 7, 'state': 'open', 'draft': False, 'base': {'ref': 'main'},
+                   'head': {'sha': 'abc123'}, 'labels': [], 'updated_at': '2026-10-28T10:00:00Z',
+                   'html_url': 'https://github.com/o/r/pull/7'}
+    ticket.review = None
+    ticket.ci = 'success'
+    original = watch.gh
+    monkeypatch.setattr(watch, 'gh', lambda path: [ticket.pull] if '/pulls?' in path else original(path))
+    def call(settings, *args):
+        if args[-1] == 'repos/o/r':
+            data = {'default_branch': 'main'}
+        elif 'check-runs?' in args[-1]:
+            data = [{'check_runs': [check_run(ticket.ci, ticket.pull['head']['sha'], 'ci')]}]
+        elif '/status?' in args[-1]:
+            data = [{'sha': ticket.pull['head']['sha'], 'statuses':
+                     [] if ticket.review is None else [commit_status(ticket.review, 'review')]}]
+        else:
+            pytest.fail(str(args))
+        return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr='')
+    monkeypatch.setattr(orchestrate, 'call', call)
+    monkeypatch.setattr(config, 'load', lambda: ticket.config)
+    return ticket
+
+
+@pytest.mark.parametrize('review, label, target, expected', [
+    (None, None, 'Verifier', 'review-missing'), (None, 'Guest reviewer', 'Guest reviewer', 'review-missing'),
+    ('failure', None, None, 'review-failed'), ('success', None, None, 'ready')])
+def test_pr_watch_persists_deduplication_and_new_head_wakes(review_pr, monkeypatch, capsys, review, label, target, expected):
+    ticket = review_pr
+    ticket.review = review
+    if label:
+        ticket.pull['labels'] = [{'name': f'review:{label}'}]
+    monkeypatch.setattr(watch, 'collect', lambda *args, **kwargs: [])
+    monkeypatch.setattr(watch, 'stale', lambda *args: [])
+    monkeypatch.setattr(watch, 'idle', lambda *args: ([], {}))
+    monkeypatch.setattr(watch.time, 'sleep', lambda seconds: None)
+    path = ticket.config.root / 'prs.json'
+    args = ['watch', '--state', str(path), '--settle', '0'] + (['--for', target] if target else [])
+    assert ding.main(args) == 0
+    assert json.loads(path.read_text())['pr_reported'] == [f'7:abc123:{expected}']
+    monkeypatch.setattr(watch, 'collect', lambda *args, **kwargs: [(watch.now(), 'other event', True)])
+    assert ding.main(args) == 0
+    assert capsys.readouterr().out.count(f'PR #7 {expected}') == 1
+    ticket.pull['head']['sha'] = 'new123'
+    assert ding.main(args) == 0
+    assert f'7:new123:{expected}' in json.loads(path.read_text())['pr_reported']
+
+
+@pytest.mark.parametrize('review', [None, 'success'])
+def test_pr_backstop_survives_restart_and_metadata_changes(review_pr, monkeypatch, review):
+    ticket = review_pr
+    ticket.review = review
+    ticket.pull['labels'] = [{'name': 'review:Unknown session'}]
+    first, pending = watch.pr_wakes(ticket.config, 'o/r', None, set(), {}, set())
+    reported = {key for _, _, key in first}
+    ticket.clock.moment += timedelta(minutes=31)
+    ticket.pull['updated_at'] = watch.now()
+    found, _ = watch.pr_wakes(ticket.config, 'o/r', None, reported, json.loads(json.dumps(pending)), set())
+    assert len(found) == 1 and 'overdue for 31 minutes' in found[0][1]
+    assert watch.pr_wakes(ticket.config, 'o/r', None, reported | {found[0][2]}, pending, set())[0] == []
+
+
+def test_waits_uses_readiness_and_routes_unconfigured_label(review_pr, capsys):
+    review_pr.pull['labels'] = [{'name': 'review:Guest'}]
+    assert ding.main(['waits', '--for', 'Guest', '--json']) == 0
+    item, = json.loads(capsys.readouterr().out)
+    assert item['kind'] == 'review-missing' and item['head'] == 'abc123'
+    assert item['station'] == 'Guest' and 'missing' in item['summary']
+    review_pr.review = 'success'
+    review_pr.ci = 'failure'
+    assert ding.main(['waits', '--json']) == 0
+    item, = json.loads(capsys.readouterr().out)
+    assert item['kind'] == 'blocked' and 'ci is failure' in item['summary']
+
+
+@pytest.mark.parametrize('condition', ['quiet', 'running', 'tmux', 'newer', 'early', 'known', 'none', 'done', 'skip'])
+def test_unrouted_wait_backstop(idle_ticket, condition):
+    ticket = idle_ticket
+    ticket.last['body'] = executor('Status: in progress\nWaiting on: Guest session\nKey numbers: 0\nNext: wait')
+    if condition == 'running':
+        ticket.board = ticket.board.rstrip('\n') + 'running\n'
+    elif condition == 'tmux':
+        ticket.panes = 'issue26|0|python'
+    elif condition == 'newer':
+        ticket.comments.append({'body': 'User: looking', 'created_at': '2026-10-28T11:45:00Z'})
+        ticket.issues[0]['comments'] = 2
+    elif condition == 'early':
+        ticket.last['updated_at'] = '2026-10-28T11:45:00Z'
+    elif condition in {'known', 'none'}:
+        ticket.last['body'] = ticket.last['body'].replace('Guest session', 'Verifier' if condition == 'known' else 'none')
+    elif condition == 'done':
+        ticket.last['body'] = ticket.last['body'].replace('in progress', 'done')
+    skip = {26} if condition == 'skip' else set()
+    found = watch.unrouted_waits(ticket.config, 'o/r', ticket.config.root, set(), skip)
+    assert bool(found) == (condition == 'quiet')
+    if found:
+        assert watch.unrouted_waits(ticket.config, 'o/r', ticket.config.root, {2601}, skip) == []
+
+
+def test_unrouted_watch_persists_once_per_comment(idle_ticket, monkeypatch, capsys):
+    ticket = idle_ticket
+    ticket.last['body'] = executor('Status: in progress\nWaiting on: Guest session\nKey numbers: 0\nNext: wait')
+    monkeypatch.setattr(config, 'load', lambda: ticket.config)
+    monkeypatch.setattr(watch, 'collect', lambda *args: [])
+    monkeypatch.setattr(watch, 'stale', lambda *args: [])
+    monkeypatch.setattr(watch, 'idle', lambda *args: ([], {}))
+    monkeypatch.setattr(watch.time, 'sleep', lambda seconds: None)
+    path = ticket.config.root / 'unrouted.json'
+    args = ['watch', '--state', str(path), '--settle', '0']
+    assert ding.main(args) == 0
+    assert json.loads(path.read_text())['unrouted_reported'] == [2601]
+    monkeypatch.setattr(watch, 'collect', lambda *args: [(watch.now(), 'other', True)])
+    assert ding.main(args) == 0
+    assert capsys.readouterr().out.count('unrouted wait') == 1
+    ticket.last['id'] = 2602
+    assert ding.main(args) == 0
+    assert json.loads(path.read_text())['unrouted_reported'] == [2601, 2602]
+
+
+@pytest.mark.parametrize('key, value', [('review_check', 'true'), ('review_check', '" "'),
+    ('unrouted_wait_minutes', '-1'), ('unrouted_wait_minutes', 'nan'), ('unrouted_wait_minutes', 'true')])
+def test_new_config_validation(tmp_path, key, value):
+    section = 'merge' if key == 'review_check' else 'watch'
+    with pytest.raises(ValueError, match=key):
+        settings(tmp_path, f'[{section}]\n{key}={value}')
+
+
+def test_pr_backstop_timer_is_saved_without_advancing_comment_cursor(review_pr, monkeypatch):
+    ticket = review_pr
+    monkeypatch.setattr(watch, 'stale', lambda *args: [])
+    monkeypatch.setattr(watch, 'idle', lambda *args: ([], {}))
+    monkeypatch.setattr(watch.time, 'sleep', lambda seconds: None)
+    calls = []
+    def collect(*args):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError('offline')
+        return []
+    monkeypatch.setattr(watch, 'collect', collect)
+    path = ticket.config.root / 'timer.json'
+    args = ['watch', '--state', str(path), '--since', '2026-10-28T09:00:00Z', '--max-errors', '1', '--settle', '0']
+    assert ding.main(args) == 2
+    state = json.loads(path.read_text())
+    assert state['since'] == '2026-10-28T09:00:00Z'
+    assert state['pr_observed'] == {'7:abc123:review-missing': '2026-10-28T12:00:00Z'}
+    ticket.clock.moment += timedelta(minutes=31)
+    monkeypatch.setattr(watch, 'collect', lambda *args: [])
+    assert ding.main(args) == 0
+    assert json.loads(path.read_text())['pr_reported'] == ['7:abc123:review-missing:overdue']
+
+
+def test_pr_poll_failure_does_not_consume_events_or_state(review_pr, monkeypatch, capsys):
+    path = review_pr.config.root / 'error.json'
+    initial = json.dumps({'since': '2026-10-28T09:00:00Z', 'seen': [], 'pr_reported': []})
+    path.write_text(initial)
+    monkeypatch.setattr(watch, 'collect', lambda *args: [(watch.now(), 'do not consume', True)])
+    monkeypatch.setattr(orchestrate, 'call', lambda *args: SimpleNamespace(returncode=1, stderr='offline', stdout=''))
+    assert ding.main(['watch', '--state', str(path), '--max-errors', '1']) == 2
+    assert path.read_text() == initial
+    assert 'do not consume' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('payload', ['{}', 'not json', '{"default_branch":""}'])
+def test_merge_refuses_missing_default_branch(tmp_path, monkeypatch, payload):
+    loaded = settings(tmp_path, 'repo="o/r"')
+    responses = [view()[1], payload]
+    calls = []
+    def call(config, *args):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout=responses.pop(0), stderr='')
+    monkeypatch.setattr(orchestrate, 'call', call)
+    assert orchestrate.merge(SimpleNamespace(pr=7, sha='abc', no_ticket=True), loaded) == 1
+    assert calls[-1] == ('gh', 'api', 'repos/o/r')
+
+
+@pytest.mark.parametrize('stage', ['head', 'comment'])
+def test_review_rejects_malformed_api_response(tmp_path, monkeypatch, capsys, stage):
+    loaded = settings(tmp_path, 'repo="o/r"\n[merge]\nreview_check="review"')
+    body = tmp_path / 'review.md'
+    body.write_text('details')
+    calls = []
+    responses = [(0, '{}')] if stage == 'head' else [(0, '{"headRefOid":"abc123"}'), (0, '{}')]
+    monkeypatch.setattr(orchestrate, 'call', fake_call(responses, calls))
+    assert orchestrate.review(SimpleNamespace(pr=7, sha='abc', verdict='pass', body_file=body), loaded) == 1
+    assert 'cannot read' in capsys.readouterr().err
+    assert not any('/statuses/' in str(call) for call in calls)
+
+
+def test_review_requires_config_before_any_call(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(orchestrate, 'call', lambda *args: pytest.fail('no gh call without review_check'))
+    assert orchestrate.review(SimpleNamespace(), settings(tmp_path)) == 1
+    assert 'requires [merge] review_check' in capsys.readouterr().err
+
+
+def test_review_help_lists_command_and_keys(capsys):
+    with pytest.raises(SystemExit):
+        ding.main(['--help'])
+    assert 'review' in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        ding.main(['review', '--help'])
+    text = capsys.readouterr().out
+    assert '--body-file' in text and 'review_check' in text

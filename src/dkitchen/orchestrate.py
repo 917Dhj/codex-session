@@ -1,16 +1,16 @@
 """The orchestrator's routine GitHub writes, each checked step by step.
 
 - merge: merge a reviewed PR at the reviewed HEAD and print the merge commit; refuses drafts, moved HEADs,
-  and tickets whose executor's latest status block neither waits on the orchestrator nor lists the PR as
-  pending merge.
+  wrong bases, and unsuccessful required checks; legacy ticket gates apply without review_check.
 - relay: send a message to a ticket's executor with `ding send`, then leave the matching ticket comment. By default
   the message goes into the executor's current turn and replaces the orchestrator's relays still queued for it.
 - log: post one entry to the orchestrator log, stamped with the current UTC time.
-Every comment is signed with the orchestrator's station name, so `ding watch` can tell who wrote it.
+Relay and log comments carry the orchestrator signature; review comments identify the reviewed commit.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 import json
 import re
 import subprocess
@@ -80,10 +80,10 @@ def ticket_references(body: str, repo: str, pr: int) -> list[int]:
     return sorted(numbers - {pr})
 
 
-def required_check_failures(config: Config, repo: str, sha: str) -> list[str]:
+def head_checks(config: Config, repo: str, sha: str) -> dict:
     """Read the latest check runs and statuses on the exact reviewed commit, without polling."""
-    if not config.merge.required_checks:
-        return []
+    if not (config.merge.required_checks or config.merge.review_check):
+        return {}
     checks = {}
     for endpoint in ("check-runs?filter=latest&per_page=100", "status?per_page=100"):
         result = call(config, "gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/{endpoint}")
@@ -98,23 +98,87 @@ def required_check_failures(config: Config, repo: str, sha: str) -> list[str]:
             elif page["sha"] == sha:
                 for status in page["statuses"]:
                     checks.setdefault(status["context"], []).append((status["state"], status["target_url"]))
-    failures = []
-    for name in config.merge.required_checks:
-        results = checks.get(name, [("missing", None)])
-        for state, url in results:
+    return checks
+
+
+def default_branch(config: Config, repo: str) -> str:
+    result = call(config, "gh", "api", f"repos/{repo}")
+    if result.returncode:
+        raise RuntimeError(f"cannot read default branch: {result.stderr.strip()}")
+    branch = json.loads(result.stdout)["default_branch"]
+    if not isinstance(branch, str) or not branch:
+        raise ValueError("repository has no default branch")
+    return branch
+
+
+def readiness(config: Config, repo: str, pr: dict, branch: str) -> dict:
+    """GitHub facts on this HEAD, shared by merge, watch and waits."""
+    reasons = []
+    if pr["state"] != "OPEN":
+        reasons.append(f"PR is {pr['state']}")
+    if pr["isDraft"]:
+        reasons.append("PR is a draft")
+    if pr["baseRefName"] != branch:
+        reasons.append(f"PR base is {pr['baseRefName']}, not repository default branch {branch}")
+    sha = pr["headRefOid"]
+    checks = head_checks(config, repo, sha)
+    required = config.merge.required_checks + ((config.merge.review_check,) if config.merge.review_check else ())
+    for name in dict.fromkeys(required):
+        for state, url in checks.get(name, [("missing", None)]):
             if state in {"pending", "missing", None}:
-                failures.append(f"check {name} has not finished on {sha} ({state or 'pending'})"
-                                + (f": {url}" if url else ""))
+                reasons.append(f"check {name} has not finished on {sha} ({state or 'pending'})"
+                               + (f": {url}" if url else ""))
             elif state != "success":
-                failures.append(f"check {name} is {state} on {sha}" + (f": {url}" if url else ""))
-    return failures
+                reasons.append(f"check {name} is {state} on {sha}" + (f": {url}" if url else ""))
+    review = [state for state, _ in checks.get(config.merge.review_check, [])]
+    review_state = "missing"
+    if review:
+        review_state = "success" if all(state == "success" for state in review) else "pending"
+        if "failure" in review:
+            review_state = "failure"
+    return {"ready": not reasons, "reasons": reasons, "review": review_state}
+
+
+def review(args, config: Config) -> int:
+    if not config.merge.review_check:
+        return fail("ding review requires [merge] review_check")
+    repo = config.repository()
+    result = call(config, "gh", "pr", "view", str(args.pr), "--repo", repo, "--json", "headRefOid")
+    if result.returncode:
+        return fail(f"cannot read PR HEAD: {result.stderr.strip()}")
+    try:
+        sha = json.loads(result.stdout)["headRefOid"]
+        if not isinstance(sha, str) or not sha:
+            raise ValueError("missing HEAD")
+    except (ValueError, KeyError, TypeError) as error:
+        return fail(f"cannot read PR HEAD: {error}")
+    if not args.sha or not sha.startswith(args.sha):
+        return fail(f"PR #{args.pr} HEAD is now {sha}, not the reviewed {args.sha}; review it again")
+    verdict = "通过" if args.verdict == "pass" else "有出入，见下"
+    body = f"审过 {sha[:8]}：{verdict}\n\n{Path(args.body_file).read_text(encoding='utf-8')}"
+    result = call(config, "gh", "api", f"repos/{repo}/issues/{args.pr}/comments", "-f", f"body={body}")
+    if result.returncode:
+        return fail(f"review comment failed: {result.stderr.strip()}; no status written")
+    try:
+        url = json.loads(result.stdout)["html_url"]
+        if not isinstance(url, str) or not url:
+            raise ValueError("missing comment URL")
+    except (ValueError, KeyError, TypeError) as error:
+        return fail(f"cannot read review comment response: {error}; inspect PR #{args.pr} before retrying; no status written")
+    result = call(config, "gh", "api", f"repos/{repo}/statuses/{sha}",
+                  "-f", f"state={'success' if args.verdict == 'pass' else 'failure'}",
+                  "-f", f"context={config.merge.review_check}", "-f", f"target_url={url}")
+    if result.returncode:
+        return fail(f"review status failed: {result.stderr.strip()}; comment exists at {url}")
+    print(f"{url}\n{config.merge.review_check}: {args.verdict} on {sha}")
+    return 0
 
 
 def merge(args, config: Config) -> int:
     repo = config.repository()
 
     def view() -> dict:
-        result = call(config, "gh", "pr", "view", str(args.pr), "--repo", repo, "--json", "isDraft,state,headRefOid,mergeCommit,body")
+        result = call(config, "gh", "pr", "view", str(args.pr), "--repo", repo, "--json", "isDraft,state,headRefOid,mergeCommit,body,baseRefName")
         if result.returncode:
             raise RuntimeError(result.stderr.strip())
         return json.loads(result.stdout)
@@ -123,11 +187,18 @@ def merge(args, config: Config) -> int:
         pr = view()
         if pr["state"] == "MERGED":
             return fail(f"PR #{args.pr} was already merged as {pr['mergeCommit']['oid']}; nothing done")
-        if not pr["headRefOid"].startswith(args.sha):
+        if not args.sha or not pr["headRefOid"].startswith(args.sha):
             return fail(f"PR #{args.pr} HEAD is now {pr['headRefOid']}, not the reviewed {args.sha}; review it again")
         if pr["isDraft"]:
             return fail(f"PR #{args.pr} is a draft and cannot be merged; its author marks it ready with gh pr ready first")
-        if not getattr(args, "no_ticket", False):
+        if pr["state"] != "OPEN":
+            return fail(f"PR #{args.pr} is {pr['state']} and cannot be merged")
+        branch = default_branch(config, repo)
+        if pr["baseRefName"] != branch:
+            return fail(f"PR base is {pr['baseRefName']}, not repository default branch {branch}")
+        if config.merge.review_check and (getattr(args, "ticket", None) is not None or getattr(args, "no_ticket", False)):
+            print("ding: --ticket/--no-ticket ignored because [merge] review_check is set")
+        if not config.merge.review_check and not getattr(args, "no_ticket", False):
             ticket, status = getattr(args, "ticket", None), None
             if ticket is None:
                 found = {}
@@ -150,9 +221,9 @@ def merge(args, config: Config) -> int:
                 return fail(f"#{ticket}'s executor is not waiting on {config.stations.orchestrator} to merge, and its "
                             f"{config.status.pending_merge} field does not list PR #{args.pr}; read its latest "
                             "comment and wait until it asks for the merge. Nothing merged")
-        failures = required_check_failures(config, repo, pr["headRefOid"])
+        failures = readiness(config, repo, pr, branch)["reasons"]
         if failures:
-            return fail("required checks block merge:\n" + "\n".join(failures))
+            return fail("PR readiness blocks merge:\n" + "\n".join(failures))
         result = call(config, "gh", "pr", "merge", str(args.pr), "--repo", repo, "--merge",
                       "--match-head-commit", pr["headRefOid"])
         if result.returncode:

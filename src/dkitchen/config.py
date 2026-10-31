@@ -52,10 +52,12 @@ Every key is optional. The defaults match the English templates in kitchen/:
 
     [watch]
     idle_minutes = 45                    # 0 disables idle-executor wakes
-    design_answer_minutes = 30           # 0 disables unanswered-design reminders
+    design_answer_minutes = 30           # 0 disables unanswered-station and PR backstops
+    unrouted_wait_minutes = 30           # 0 disables unknown-station wait reminders
 
     [merge]
     required_checks = []                # e.g. ["hca-check"]; only success permits merging
+    review_check = ""                   # e.g. "review"; replaces the legacy ticket gate
 """
 from __future__ import annotations
 
@@ -178,11 +180,13 @@ class Launch:
 class Watch:
     idle_minutes: float = 45
     design_answer_minutes: float = 30
+    unrouted_wait_minutes: float = 30
 
 
 @dataclass(frozen=True)
 class Merge:
     required_checks: tuple[str, ...] = ()
+    review_check: str = ""
 
 
 SESSION_FIELDS = ("issue", "name", "repo")
@@ -261,6 +265,9 @@ def section(cls, values: object, name: str):
                     or not all(isinstance(item, str) and item.strip() for item in value)):
                 raise ValueError(f"{FILE}: [merge] required_checks must be a list of nonempty check names")
             value = tuple(value)
+        elif key == "review_check":
+            if not isinstance(value, str) or (value and not value.strip()):
+                raise ValueError(f"{FILE}: [merge] review_check must be a check name or an empty string")
         elif key == "preflight":
             if (not isinstance(value, list) or not value
                     or not all(isinstance(item, str) and "\0" not in item for item in value)
@@ -271,7 +278,7 @@ def section(cls, values: object, name: str):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{FILE}: [launch] preflight_timeout must be a positive finite number of seconds")
-        elif key in {"idle_minutes", "design_answer_minutes"}:
+        elif key in {"idle_minutes", "design_answer_minutes", "unrouted_wait_minutes"}:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
                 raise ValueError(f"{FILE}: [watch] {key} must be a nonnegative finite number of minutes")

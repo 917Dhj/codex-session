@@ -380,17 +380,112 @@ def unanswered_waits(config: Config, repo: str, minutes: float, skip: set[int], 
     return sorted(found, key=lambda item: (item["created_at"], item["ticket"], item["station"]))
 
 
+def pr_waits(config: Config, repo: str, skip: set[int]) -> list[dict]:
+    if not config.merge.review_check:
+        return []
+    from dkitchen import orchestrate
+    branch = orchestrate.default_branch(config, repo)
+    found = []
+    page = 1
+    while True:
+        pulls = gh(f"repos/{repo}/pulls?state=open&per_page=100&page={page}")
+        for pull in pulls:
+            if pull["number"] in skip:
+                continue
+            pr = {"state": pull["state"].upper(), "isDraft": pull["draft"],
+                  "baseRefName": pull["base"]["ref"], "headRefOid": pull["head"]["sha"]}
+            result = orchestrate.readiness(config, repo, pr, branch)
+            reviewers = [label["name"][7:].strip() for label in pull["labels"]
+                         if label["name"].startswith("review:") and label["name"][7:].strip()]
+            reviewer = reviewers[0] if reviewers else config.stations.verifier
+            kind = "blocked"
+            if result["ready"]:
+                kind = "ready"
+            elif result["review"] == "failure":
+                kind = "review-failed"
+            elif result["review"] in {"missing", "pending"} and not pr["isDraft"]:
+                kind = "review-missing"
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(pull["updated_at"].replace("Z", "+00:00"))).total_seconds() / 60
+            found.append({"ticket": pull["number"], "head": pr["headRefOid"], "kind": kind,
+                          "station": reviewer if kind == "review-missing" else config.stations.orchestrator,
+                          "minutes": elapsed, "created_at": pull["updated_at"], "url": pull["html_url"],
+                          "summary": kind + (": " + "; ".join(result["reasons"]) if result["reasons"] else ""),
+                          "reasons": result["reasons"]})
+        if len(pulls) < 100:
+            return found
+        page += 1
+
+
+def pr_wakes(config: Config, repo: str, station: str | None, reported: set[str], observed: dict,
+             skip: set[int]) -> tuple[list[tuple[str, str, str]], dict]:
+    found, pending = [], {}
+    moment = now()
+    target = station or config.stations.orchestrator
+    orchestrator = bool(station_variants(target, config) & station_variants(config.stations.orchestrator, config))
+    for item in pr_waits(config, repo, skip):
+        kind = item["kind"]
+        if kind == "blocked":
+            continue
+        key = f"{item['ticket']}:{item['head']}:{kind}"
+        since = observed.get(key, moment)
+        pending[key] = since
+        line = f"PR #{item['ticket']} {item['summary']}; waiting on {item['station']} {item['url']}"
+        if (key not in reported and
+                station_variants(target, config) & station_variants(item["station"], config)):
+            found.append((moment, line, key))
+        elapsed = (datetime.fromisoformat(moment.replace("Z", "+00:00")) -
+                   datetime.fromisoformat(since.replace("Z", "+00:00"))).total_seconds() / 60
+        backstop = key + ":overdue"
+        if (orchestrator and kind in {"ready", "review-missing"} and config.watch.design_answer_minutes
+                and elapsed > config.watch.design_answer_minutes and backstop not in reported):
+            found.append((moment, line + f"; overdue for {elapsed:.0f} minutes", backstop))
+    return found, pending
+
+
+def unrouted_waits(config: Config, repo: str, checkout: Path, reported: set[int],
+                   skip: set[int]) -> list[tuple[str, str, int]]:
+    if not config.watch.unrouted_wait_minutes:
+        return []
+    cutoff = stamp(datetime.now(timezone.utc) - timedelta(minutes=config.watch.unrouted_wait_minutes))
+    candidates = []
+    for issue in open_issues(repo):
+        if "pull_request" in issue or issue["number"] in skip or not issue["comments"]:
+            continue
+        latest = None
+        for comment in comments_backwards(repo, issue):
+            latest = latest or comment
+            if role(comment["body"], config) != config.stations.executor:
+                continue
+            state, waiting = state_and_waiting(comment["body"], config)
+            if (state == config.status.in_progress and waiting and not waiting.startswith(config.status.none)
+                    and not any(named(waiting, name, config) for name in station_names(config))
+                    and comment["id"] not in reported
+                    and max(latest.get("updated_at", latest["created_at"]),
+                            comment.get("updated_at", comment["created_at"])) < cutoff):
+                candidates.append((issue, comment))
+            break
+    running = running_issues(checkout, config.sessions, repo) | tmux_issues(tmux_panes()) if candidates else set()
+    return [(comment["created_at"], f"#{issue['number']} unrouted wait for over "
+             f"{config.watch.unrouted_wait_minutes:g} minutes, with no running ding run or tmux job: "
+             f"{summary(comment['body'], config)} {comment['html_url']}", comment["id"])
+            for issue, comment in candidates if issue["number"] not in running]
+
+
 def waits(args, config: Config) -> int:
     names = station_names(config)
     if args.station is not None:
         names = [name for name in names if station_variants(name, config) & station_variants(args.station, config)]
     minutes = config.watch.design_answer_minutes if args.minutes is None else args.minutes
     found = unanswered_waits(config, config.repository(), minutes, set(), stations=names) if names else []
+    found += [item for item in pr_waits(config, config.repository(), set())
+              if item["minutes"] > minutes and (args.station is None or
+                 station_variants(args.station, config) & station_variants(item["station"], config))]
+    found.sort(key=lambda item: (item["created_at"], item["ticket"], item["station"]))
     if args.json:
         print(json.dumps(found, ensure_ascii=False))
     else:
         for item in found:
-            print(f"#{item['ticket']} waiting on {item['station']} for {item['minutes']:.0f} minutes: "
+            print(f"{'PR ' if 'head' in item else ''}#{item['ticket']} waiting on {item['station']} for {item['minutes']:.0f} minutes: "
                   f"{item['summary']} {item['url']}")
     return 0
 
@@ -512,6 +607,8 @@ def watch(args, config: Config) -> int:
     since, seen, reported = state["since"], set(state["seen"]), set(state.get("stale", []))
     observed, idle_reported = state.get("idle_observed", {}), set(state.get("idle_reported", []))
     design_reported = set(state.get("design_reported", []))
+    unrouted_reported = set(state.get("unrouted_reported", []))
+    pr_reported, pr_observed = set(state.get("pr_reported", [])), state.get("pr_observed", {})
     skip = set(args.skip_issue) | ({config.log.issue} if config.log.issue else set())
     # Label changes made while the orchestrator was handling the last batch are its own; skip them.
     labels_since = state.get("labels_since", max(since, started) if path.exists() else since)
@@ -520,13 +617,15 @@ def watch(args, config: Config) -> int:
     print(f"Watching {repo}: {detail}", file=sys.stderr)
     errors = 0
     next_stale = next_idle = 0.0 if station is None else float("inf")
-    threshold = config.watch.idle_minutes or config.watch.design_answer_minutes
+    threshold = config.watch.idle_minutes or config.watch.design_answer_minutes or config.watch.unrouted_wait_minutes
     idle_every = min(threshold * 20, 900) if station is None and threshold else float("inf")
     while True:
         polled = now()
         try:
             found = collect(config, repo, since, labels_since, seen, skip, **collect_options)
+            pr_found, pr_pending = pr_wakes(config, repo, station, pr_reported, pr_observed, skip)
             quiet, idle_found, design_found, pending, stale_ids = [], [], [], observed, set()
+            unrouted_found = []
             checked_at = time.monotonic()
             checked_stale, checked_idle = checked_at >= next_stale, checked_at >= next_idle
             if checked_stale:
@@ -537,6 +636,9 @@ def watch(args, config: Config) -> int:
                 design_found = unanswered_design(config, repo, design_reported, skip)
                 quiet += [item for item in idle_found if item[2] not in {entry[2] for entry in quiet}]
                 quiet += design_found
+                unrouted_found = unrouted_waits(config, repo, checkout, unrouted_reported, skip)
+                quiet += unrouted_found
+            quiet += pr_found
             if any(wakes for _, _, wakes in found) or quiet:
                 if found:
                     time.sleep(args.settle)
@@ -557,8 +659,8 @@ def watch(args, config: Config) -> int:
         if checked_idle:
             next_idle = checked_at + idle_every
         wakes = any(wakes for _, _, wakes in found) or bool(quiet)
-        changed = pending != observed
-        observed = pending
+        changed = pending != observed or pr_pending != pr_observed
+        observed, pr_observed = pending, pr_pending
         if wakes:
             for _, line in sorted([(time_, line) for time_, line, _ in found] + [(time_, line) for time_, line, _ in quiet]):
                 print(line)
@@ -568,11 +670,14 @@ def watch(args, config: Config) -> int:
             state.update(since=polled, seen=[line for time_, line, _ in found if time_ >= polled],
                          stale=sorted(reported | stale_ids),
                          idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}),
-                         design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}))
+                         design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}),
+                         unrouted_reported=sorted(unrouted_reported | {id_ for _, _, id_ in unrouted_found}),
+                         pr_reported=sorted(pr_reported | {key for _, _, key in pr_found}))
         if changed and not wakes:
             state["labels_since"] = labels_since
         if wakes or changed:
             state["idle_observed"] = observed
+            state["pr_observed"] = pr_observed
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, ensure_ascii=False))
             tmp.replace(path)
