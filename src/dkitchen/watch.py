@@ -645,7 +645,8 @@ def watch(args, config: Config) -> int:
     started = now()
     state = (json.loads(path.read_text()) if path.exists()
              else {"since": args.since or started, "seen": [], "stale": []})
-    since, seen, reported = state["since"], set(state["seen"]), set(state.get("stale", []))
+    since, seen, reported = state["since"], state["seen"], set(state.get("stale", []))
+    seen = seen if isinstance(seen, dict) else dict.fromkeys(seen, since)
     observed, idle_reported = state.get("idle_observed", {}), set(state.get("idle_reported", []))
     design_reported = set(state.get("design_reported", []))
     unrouted_reported = set(state.get("unrouted_reported", []))
@@ -708,7 +709,9 @@ def watch(args, config: Config) -> int:
             print(f"{len(found) + len(quiet)} items ({since} to {polled}). "
                   "After handling them, start the watch again with the same command.")
             state.pop("labels_since", None)
-            state.update(since=polled, seen=[line for time_, line, _ in found if time_ >= polled],
+            # A line stamped after the poll stays in the next query window, so it stays seen until the clock passes it.
+            lines = {**seen, **{line: time_ for time_, line, _ in found}}
+            state.update(since=polled, seen={line: time_ for line, time_ in lines.items() if time_ >= polled},
                          stale=sorted(reported | stale_ids),
                          idle_reported=sorted(idle_reported | {id_ for _, _, id_ in idle_found}),
                          design_reported=sorted(design_reported | {id_ for _, _, id_ in design_found}),
