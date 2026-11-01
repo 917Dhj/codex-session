@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.15
+
+- `ding watch` keeps every reported line whose GitHub time is at or after the new `since`, so items stamped ahead of the clock are reported once. The state file now stores `seen` as line-to-time; older list states still load.
+
 ## 0.5.13
 
 - `ding merge` supports optional `[merge] required_checks`, defaulting to `[]`. Every required name must succeed on the reviewed HEAD across the latest check runs and commit statuses. Missing, pending, failed, neutral and skipped results refuse immediately with no bypass; API/read errors also refuse.

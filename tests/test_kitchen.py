@@ -1164,6 +1164,43 @@ def test_watch_does_not_report_a_configured_designer_as_user(tmp_path, monkeypat
     assert "#25 用户 comment" in found[0][1] and found[0][2] is True
 
 
+def test_watch_reports_future_stamped_items_once_across_batches(tmp_path, monkeypatch, capsys):
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    monkeypatch.setattr(config, "load", lambda: loaded)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    state = tmp_path / "watch.json"
+    state.write_text(json.dumps({"since": "2026-10-14T08:00:00Z", "seen": [], "stale": []}))
+    comments = []
+    monkeypatch.setattr(watch, "gh", lambda path: comments if "/issues/comments?" in path else [])
+
+    def batch(number):
+        comments.append({**comment(number, f"User question {number}"), "created_at": "2999-01-01T00:00:00Z",
+                         "updated_at": "2999-01-01T00:00:00Z"})
+        assert ding.main(["watch", "--state", str(state), "--interval", "0", "--settle", "0"]) == 0
+        return capsys.readouterr().out
+
+    assert "#26 User comment" in batch(26)
+    assert "#26 User comment" not in batch(27)
+    third = batch(28)
+    assert "#28 User comment" in third and "#26 User comment" not in third and "#27 User comment" not in third
+
+
+def test_watch_reads_seen_list_from_older_state(tmp_path, monkeypatch, capsys):
+    loaded = config.Config(root=tmp_path, repo="o/r")
+    monkeypatch.setattr(config, "load", lambda: loaded)
+    monkeypatch.setattr(watch, "stale", lambda *args: [])
+    monkeypatch.setattr(watch.time, "sleep", lambda seconds: None)
+    old, new = comment(26, "User question"), comment(27, "User question")
+    monkeypatch.setattr(watch, "gh", lambda path: [old, new] if "/issues/comments?" in path else [])
+    line = watch.collect(loaded, "o/r", "2026-10-14T08:00:00Z", "2026-10-14T08:00:00Z", set(), set())[0][1]
+    state = tmp_path / "watch.json"
+    state.write_text(json.dumps({"since": "2026-10-14T08:00:00Z", "seen": [line], "stale": []}))
+    assert ding.main(["watch", "--state", str(state), "--interval", "0", "--settle", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "#27 User comment" in out and "#26 User comment" not in out
+
+
 @pytest.mark.parametrize("recover", [True, False])
 def test_watch_post_settle_timeout_is_retried_without_losing_batch(tmp_path, monkeypatch, capsys, recover):
     import subprocess
